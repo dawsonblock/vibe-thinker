@@ -216,6 +216,10 @@ class HybridReasoningOrchestrator:
         use_embedding_router: bool = True,
         embedding_model: str = "all-MiniLM-L6-v2",
         router_cache_size: int = 512,
+        use_clr_cache: bool = True,
+        clr_cache_path: str = "clr_result_cache.json",
+        clr_cache_similarity: float = 0.92,
+        clr_cache_min_score: float = 0.7,
     ):
         self.vibe_endpoint = vibe_endpoint.rstrip("/")
         self.generalist_endpoint = generalist_endpoint.rstrip("/")
@@ -236,6 +240,24 @@ class HybridReasoningOrchestrator:
             except Exception as e:
                 print(f"[Warning] Could not load embedding router: {e}")
                 self.use_embedding_router = False
+
+        # Semantic CLR result cache (skip re-running high-score CLR for
+        # similar/recent problems). Only available with embedding deps.
+        self.use_clr_cache = use_clr_cache and EMBEDDINGS_AVAILABLE and use_clr
+        if self.use_clr_cache:
+            try:
+                self.clr_cache = CLRResultCache(
+                    path=clr_cache_path,
+                    model_name=embedding_model,
+                    similarity_threshold=clr_cache_similarity,
+                    min_score=clr_cache_min_score,
+                )
+            except Exception as e:
+                print(f"[Warning] Could not load CLR result cache: {e}")
+                self.use_clr_cache = False
+                self.clr_cache = None
+        else:
+            self.clr_cache = None
 
         # Keyword fallback
         self.verifiable_keywords = {
@@ -267,27 +289,52 @@ class HybridReasoningOrchestrator:
     # ------------------------------------------------------------------ #
     # Generalist call
     # ------------------------------------------------------------------ #
-    async def _call_generalist(self, query: str) -> str:
-        """Call your generalist model endpoint."""
+    async def _call_generalist(self, query: str, max_tokens: int = 4096) -> str:
+        """Call the generalist model via the OpenAI-compatible
+        /v1/chat/completions endpoint so llama-server applies the model's
+        own baked-in chat template (Llama 3.2 uses <|start_header_id|>, not
+        ChatML). Falls back to /completion with ChatML if the chat endpoint
+        fails."""
         async with aiohttp.ClientSession() as session:
-            payload = {
-                "prompt": f"<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n",
-                "n_predict": 4096,
+            chat_payload = {
+                "messages": [{"role": "user", "content": query}],
+                "max_tokens": max_tokens,
                 "temperature": 0.7,
                 "top_p": 0.95,
-                "stop": ["<|im_end|>"],
             }
             try:
                 async with session.post(
-                    f"{self.generalist_endpoint}/completion",
-                    json=payload,
+                    f"{self.generalist_endpoint}/v1/chat/completions",
+                    json=chat_payload,
                     timeout=aiohttp.ClientTimeout(total=600),
                 ) as resp:
                     resp.raise_for_status()
                     data = await resp.json()
-                    return data.get("content", "Generalist failed to respond.")
+                    return (
+                        data["choices"][0]["message"]["content"]
+                        or "Generalist returned empty response."
+                    )
             except Exception as e:
-                return f"Generalist call failed: {e}"
+                # Fallback to raw /completion with ChatML
+                print(f"[Generalist] chat endpoint failed ({e}), falling back to /completion")
+                payload = {
+                    "prompt": f"<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n",
+                    "n_predict": max_tokens,
+                    "temperature": 0.7,
+                    "top_p": 0.95,
+                    "stop": ["<|im_end|>"],
+                }
+                try:
+                    async with session.post(
+                        f"{self.generalist_endpoint}/completion",
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=600),
+                    ) as resp:
+                        resp.raise_for_status()
+                        data = await resp.json()
+                        return data.get("content", "Generalist failed to respond.")
+                except Exception as e2:
+                    return f"Generalist call failed: {e2}"
 
     # ------------------------------------------------------------------ #
     # Specialist (plain, no CLR) — fixed
@@ -296,6 +343,49 @@ class HybridReasoningOrchestrator:
         """Plain VibeThinker generation without CLR. Uses a real session."""
         async with aiohttp.ClientSession() as session:
             return await self.reasoner.generate_plain(session, query, max_tokens)
+
+    # ------------------------------------------------------------------ #
+    # CLR with semantic cache
+    # ------------------------------------------------------------------ #
+    async def _run_clr_with_cache(self, query: str) -> Tuple[CLRResult, bool]:
+        """Run CLR, but return a cached result if a similar high-score
+        problem was solved before. Returns (result, cache_hit)."""
+        if self.use_clr_cache and self.clr_cache is not None:
+            cached = self.clr_cache.lookup(query)
+            if cached is not None:
+                print(
+                    f"[CLRCache] HIT (sim={cached['similarity']:.3f}, "
+                    f"score={cached['best_score']:.3f}) — skipping CLR run"
+                )
+                return (
+                    CLRResult(
+                        best_answer=cached["best_answer"],
+                        best_score=cached["best_score"],
+                        best_raw_trace="<cached>",
+                        all_trajectories=[],
+                        k=cached.get("k") or self.reasoner.k,
+                    ),
+                    True,
+                )
+
+        clr_result = await self.reasoner.run(query)
+
+        # Insert into cache if the score is high enough to be worth reusing
+        if (
+            self.use_clr_cache
+            and self.clr_cache is not None
+            and clr_result.best_score >= self.clr_cache.min_score
+        ):
+            self.clr_cache.insert(
+                problem=query,
+                best_answer=clr_result.best_answer,
+                best_score=clr_result.best_score,
+                k=clr_result.k,
+                trajectory_count=len(clr_result.all_trajectories),
+            )
+            print(f"[CLRCache] Stored result (score={clr_result.best_score:.3f})")
+
+        return clr_result, False
 
     # ------------------------------------------------------------------ #
     # Main entry point
@@ -310,14 +400,14 @@ class HybridReasoningOrchestrator:
 
         if route == "specialist":
             if self.use_clr:
-                clr_result: CLRResult = await self.reasoner.run(query)
+                clr_result, cache_hit = await self._run_clr_with_cache(query)
                 return OrchestratorResult(
                     final_answer=clr_result.best_answer,
-                    route_taken="specialist_clr",
+                    route_taken="specialist_clr_cached" if cache_hit else "specialist_clr",
                     specialist_used="VibeThinker-3B + CLR",
                     clr_score=clr_result.best_score,
                     routing_confidence=confidence,
-                    raw_traces={"clr_result": self._trim_clr(clr_result)},
+                    raw_traces={"clr_result": self._trim_clr(clr_result), "cache_hit": cache_hit},
                 )
             # Plain specialist (fixed: real session via helper)
             answer = await self._call_specialist_plain(query)
@@ -346,10 +436,11 @@ class HybridReasoningOrchestrator:
             )
 
             if self.use_clr:
-                specialist_result: CLRResult = await self.reasoner.run(query)
+                specialist_result, cache_hit = await self._run_clr_with_cache(query)
                 specialist_answer = specialist_result.best_answer
                 specialist_score = specialist_result.best_score
                 specialist_trace = self._trim_clr(specialist_result)
+                specialist_trace["cache_hit"] = cache_hit
             else:
                 specialist_answer = await self._call_specialist_plain(query)
                 specialist_score = None
