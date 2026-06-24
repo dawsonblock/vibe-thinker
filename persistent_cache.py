@@ -149,9 +149,12 @@ class PersistentRouteCache:
         k = self._normalize(key)
         emb_list = embedding.tolist() if hasattr(embedding, "tolist") else list(embedding)
         if k in self.embedding_cache:
+            # Update existing key — do NOT evict (updating doesn't grow occupancy)
             self.embedding_cache.move_to_end(k)
-        if len(self.embedding_cache) >= self.cache_size:
-            self.embedding_cache.popitem(last=False)
+        else:
+            # New key — evict oldest if at capacity
+            if len(self.embedding_cache) >= self.cache_size:
+                self.embedding_cache.popitem(last=False)
         self.embedding_cache[k] = emb_list
         if self.autosave:
             self.save()
@@ -166,9 +169,12 @@ class PersistentRouteCache:
     def put_route(self, key: str, route: str, confidence: float) -> None:
         k = self._normalize(key)
         if k in self.route_cache:
+            # Update existing key — do NOT evict
             self.route_cache.move_to_end(k)
-        if len(self.route_cache) >= self.cache_size:
-            self.route_cache.popitem(last=False)
+        else:
+            # New key — evict oldest if at capacity
+            if len(self.route_cache) >= self.cache_size:
+                self.route_cache.popitem(last=False)
         self.route_cache[k] = (route, float(confidence))
         if self.autosave:
             self.save()

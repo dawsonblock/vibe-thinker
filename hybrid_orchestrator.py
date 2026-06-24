@@ -294,7 +294,8 @@ class HybridReasoningOrchestrator:
         /v1/chat/completions endpoint so llama-server applies the model's
         own baked-in chat template (Llama 3.2 uses <|start_header_id|>, not
         ChatML). Falls back to /completion with ChatML if the chat endpoint
-        fails."""
+        fails. Raises RuntimeError if both endpoints fail — callers must
+        handle the exception, not silently proceed with an error string."""
         async with aiohttp.ClientSession() as session:
             chat_payload = {
                 "messages": [{"role": "user", "content": query}],
@@ -310,10 +311,12 @@ class HybridReasoningOrchestrator:
                 ) as resp:
                     resp.raise_for_status()
                     data = await resp.json()
-                    return (
-                        data["choices"][0]["message"]["content"]
-                        or "Generalist returned empty response."
-                    )
+                    content = data["choices"][0]["message"]["content"]
+                    if not content:
+                        raise RuntimeError("Generalist returned empty response")
+                    return content
+            except RuntimeError:
+                raise
             except Exception as e:
                 # Fallback to raw /completion with ChatML
                 print(f"[Generalist] chat endpoint failed ({e}), falling back to /completion")
@@ -332,9 +335,16 @@ class HybridReasoningOrchestrator:
                     ) as resp:
                         resp.raise_for_status()
                         data = await resp.json()
-                        return data.get("content", "Generalist failed to respond.")
+                        content = data.get("content", "")
+                        if not content:
+                            raise RuntimeError("Generalist returned empty response on fallback")
+                        return content
+                except RuntimeError:
+                    raise
                 except Exception as e2:
-                    return f"Generalist call failed: {e2}"
+                    raise RuntimeError(
+                        f"Generalist call failed (both endpoints): {e2}"
+                    ) from e2
 
     # ------------------------------------------------------------------ #
     # Specialist (plain, no CLR) — fixed
@@ -347,35 +357,67 @@ class HybridReasoningOrchestrator:
     # ------------------------------------------------------------------ #
     # CLR with semantic cache
     # ------------------------------------------------------------------ #
+    # Answers that must NEVER be cached, regardless of score.
+    _UNCACHEABLE_ANSWERS = frozenset({
+        "no clear answer found",
+        "all trajectories failed",
+        "",
+        "none",
+        "null",
+        "n/a",
+    })
+
+    def _is_cacheable(self, clr_result: CLRResult) -> bool:
+        """Return True only if a CLR result is safe to cache.
+
+        Rejects:
+          - No answer or sentinel failure strings
+          - Score below the cache's min_score threshold
+          - Zero trajectories (nothing was actually run)
+        """
+        answer = (clr_result.best_answer or "").strip().lower()
+        if answer in self._UNCACHEABLE_ANSWERS:
+            return False
+        if not clr_result.best_answer:
+            return False
+        if clr_result.best_score <= 0:
+            return False
+        if not clr_result.all_trajectories:
+            return False
+        if self.clr_cache is not None and clr_result.best_score < self.clr_cache.min_score:
+            return False
+        return True
+
     async def _run_clr_with_cache(self, query: str) -> Tuple[CLRResult, bool]:
         """Run CLR, but return a cached result if a similar high-score
         problem was solved before. Returns (result, cache_hit)."""
         if self.use_clr_cache and self.clr_cache is not None:
             cached = self.clr_cache.lookup(query)
             if cached is not None:
-                print(
-                    f"[CLRCache] HIT (sim={cached['similarity']:.3f}, "
-                    f"score={cached['best_score']:.3f}) — skipping CLR run"
-                )
-                return (
-                    CLRResult(
-                        best_answer=cached["best_answer"],
-                        best_score=cached["best_score"],
-                        best_raw_trace="<cached>",
-                        all_trajectories=[],
-                        k=cached.get("k") or self.reasoner.k,
-                    ),
-                    True,
-                )
+                # Double-check the cached answer isn't a known-bad sentinel.
+                # (Defensive: old cache files may contain bad entries.)
+                if (cached["best_answer"] or "").strip().lower() in self._UNCACHEABLE_ANSWERS:
+                    print(f"[CLRCache] HIT but answer is uncacheable sentinel — ignoring cache")
+                else:
+                    print(
+                        f"[CLRCache] HIT (sim={cached['similarity']:.3f}, "
+                        f"score={cached['best_score']:.3f}) — skipping CLR run"
+                    )
+                    return (
+                        CLRResult(
+                            best_answer=cached["best_answer"],
+                            best_score=cached["best_score"],
+                            best_raw_trace="<cached>",
+                            all_trajectories=[],
+                            k=cached.get("k") or self.reasoner.k,
+                        ),
+                        True,
+                    )
 
         clr_result = await self.reasoner.run(query)
 
-        # Insert into cache if the score is high enough to be worth reusing
-        if (
-            self.use_clr_cache
-            and self.clr_cache is not None
-            and clr_result.best_score >= self.clr_cache.min_score
-        ):
+        # Insert into cache ONLY if the result is cacheable
+        if self.use_clr_cache and self.clr_cache is not None and self._is_cacheable(clr_result):
             self.clr_cache.insert(
                 problem=query,
                 best_answer=clr_result.best_answer,
@@ -384,6 +426,11 @@ class HybridReasoningOrchestrator:
                 trajectory_count=len(clr_result.all_trajectories),
             )
             print(f"[CLRCache] Stored result (score={clr_result.best_score:.3f})")
+        elif self.use_clr_cache and self.clr_cache is not None:
+            print(
+                f"[CLRCache] NOT caching (score={clr_result.best_score:.3f}, "
+                f"answer={clr_result.best_answer[:40]!r}...)"
+            )
 
         return clr_result, False
 

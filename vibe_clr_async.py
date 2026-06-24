@@ -61,7 +61,10 @@ class VibeThinkerCLRAsync:
         temperature: float = 1.0,
         stop: Optional[List[str]] = None,
     ) -> str:
-        """Async call to llama-server /completion endpoint."""
+        """Async call to llama-server /completion endpoint.
+
+Raises RuntimeError on any failure — callers must handle the exception
+rather than silently proceeding with an empty string."""
         payload = {
             "prompt": prompt,
             "n_predict": max_tokens,
@@ -79,10 +82,18 @@ class VibeThinkerCLRAsync:
                 ) as resp:
                     resp.raise_for_status()
                     data = await resp.json()
-                    return data.get("content", "")
+                    content = data.get("content", "")
+                    if not content:
+                        raise RuntimeError(
+                            f"Model at {self.server_url} returned empty content"
+                        )
+                    return content
+            except aiohttp.ClientError as e:
+                raise RuntimeError(f"Model call to {self.server_url} failed: {e}") from e
+            except RuntimeError:
+                raise
             except Exception as e:
-                print(f"Async model call failed: {e}")
-                return ""
+                raise RuntimeError(f"Unexpected error calling {self.server_url}: {e}") from e
 
     async def generate_plain(
         self, session: aiohttp.ClientSession, problem: str, max_tokens: int = 8192
@@ -190,9 +201,71 @@ class VibeThinkerCLRAsync:
     # ------------------------------------------------------------------ #
     # Scoring
     # ------------------------------------------------------------------ #
-    def _calculate_reliability(self, verdicts: List[int]) -> float:
+    # Minimum number of meaningful claims required for a non-zero score.
+    # A trajectory with fewer claims cannot be considered "reliable" —
+    # verifying one trivial fragment is not enough.
+    MIN_CLAIMS_FOR_SCORING = 3
+
+    # Claims shorter than this (after stripping) are too trivial to count.
+    MIN_CLAIM_LENGTH = 15
+
+    # Known garbage / prompt-fragment patterns that should never count as claims.
+    # Matches both exact strings and strings that START with these fragments
+    # (e.g. "by step reasoning. So we can elaborate." starts with "by step reasoning.")
+    _GARBAGE_PATTERNS = re.compile(
+        r"^(by step\.?|by step reasoning\.?|step by step\.?|"
+        r"so we can elaborate\.?|the final answer\.?|"
+        r"none|n/?a|null|undefined)",
+        re.IGNORECASE,
+    )
+
+    def _is_meaningful_claim(self, claim: str) -> bool:
+        """Return True if a claim is substantive enough to score."""
+        s = claim.strip()
+        if len(s) < self.MIN_CLAIM_LENGTH:
+            return False
+        if self._GARBAGE_PATTERNS.match(s):
+            return False
+        # Reject claims that are just punctuation or fragments
+        if not re.search(r"[a-zA-Z]{3,}", s):
+            return False
+        return True
+
+    def _calculate_reliability(
+        self, verdicts: List[int], claims: Optional[List[str]] = None
+    ) -> float:
+        """Calculate a reliability score for a trajectory.
+
+        Scoring rules (fail-closed):
+          - No verdicts or empty claims -> 0.0
+          - Fewer than MIN_CLAIMS_FOR_SCORING meaningful claims -> 0.0
+          - Any unverified claim (verdict 0) heavily penalizes the score
+          - The score is mean^5 but only over *meaningful* claims, and
+            is further penalized if some claims were filtered as garbage.
+
+        Args:
+            verdicts: list of 0/1 verdicts from the verifier.
+            claims: optional list of claim strings, used to filter garbage.
+        """
         if not verdicts:
             return 0.0
+
+        # If claims are provided, filter to meaningful ones and their verdicts
+        if claims is not None:
+            meaningful = [
+                (c, v) for c, v in zip(claims, verdicts) if self._is_meaningful_claim(c)
+            ]
+            if len(meaningful) < self.MIN_CLAIMS_FOR_SCORING:
+                return 0.0
+            verdicts = [v for _, v in meaningful]
+
+        # Any failed verdict means the trajectory has errors — penalize hard
+        failed = sum(1 for v in verdicts if v == 0)
+        if failed > 0:
+            # A trajectory with even one wrong claim cannot be "perfect"
+            # Score is proportional to how many claims passed, but capped low
+            return (len(verdicts) - failed) / len(verdicts) * 0.3
+
         mean = sum(verdicts) / len(verdicts)
         return mean ** 5
 
@@ -216,7 +289,7 @@ class VibeThinkerCLRAsync:
 
         parsed = await self._extract_claims_and_answer(session, raw_trace)
         verdicts = await self._verify_claims(session, parsed["claims"])
-        score = self._calculate_reliability(verdicts)
+        score = self._calculate_reliability(verdicts, claims=parsed["claims"])
 
         return {
             "score": score,
@@ -224,6 +297,7 @@ class VibeThinkerCLRAsync:
             "claims": parsed["claims"],
             "verdicts": verdicts,
             "raw_trace": raw_trace,
+            "answer_present": parsed["final_answer"] is not None,
         }
 
     # ------------------------------------------------------------------ #
@@ -242,21 +316,35 @@ class VibeThinkerCLRAsync:
             ]
             trajectories = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Filter out any failed trajectories
+        # Filter out any failed trajectories (exceptions from gather)
         valid_trajectories = [t for t in trajectories if isinstance(t, dict)]
 
         if not valid_trajectories:
             return CLRResult(
-                best_answer="All trajectories failed",
+                best_answer="No clear answer found",
                 best_score=0.0,
                 best_raw_trace="",
+                all_trajectories=[],
                 k=self.k,
             )
 
-        best = max(valid_trajectories, key=lambda x: x["score"])
+        # Only consider trajectories that actually produced a final answer.
+        # A trajectory with no answer is worthless regardless of claim scores.
+        answered = [t for t in valid_trajectories if t.get("answer_present") and t.get("answer")]
+
+        if not answered:
+            return CLRResult(
+                best_answer="No clear answer found",
+                best_score=0.0,
+                best_raw_trace="",
+                all_trajectories=valid_trajectories,
+                k=self.k,
+            )
+
+        best = max(answered, key=lambda x: x["score"])
 
         result = CLRResult(
-            best_answer=best["answer"] or "No clear answer found",
+            best_answer=best["answer"],
             best_score=best["score"],
             best_raw_trace=best["raw_trace"],
             all_trajectories=valid_trajectories,

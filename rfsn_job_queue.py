@@ -118,6 +118,7 @@ class JobQueue:
         self._running = False
         self._dispatcher_task: Optional[asyncio.Task] = None
         self._wakeup = asyncio.Event()
+        self._job_tasks: set = set()  # tracks in-flight job tasks for clean shutdown
 
     # ----------------------- audit log ----------------------- #
     def _log(self, job: Job, event: str, extra: Optional[Dict] = None) -> None:
@@ -146,6 +147,10 @@ class JobQueue:
         self._wakeup.set()
         if self._dispatcher_task:
             await self._dispatcher_task
+        # Wait for any in-flight job tasks to finish so they aren't
+        # silently cancelled when the event loop closes.
+        if self._job_tasks:
+            await asyncio.gather(*self._job_tasks, return_exceptions=True)
         print("[JobQueue] Stopped")
 
     def submit(
@@ -246,7 +251,9 @@ class JobQueue:
 
             job = self._pending.pop(0)
             # Launch the job, respecting the concurrency limit
-            asyncio.create_task(self._run_job(job))
+            task = asyncio.create_task(self._run_job(job))
+            self._job_tasks.add(task)
+            task.add_done_callback(self._job_tasks.discard)
 
     async def _run_job(self, job: Job) -> None:
         async with self._semaphore:

@@ -110,25 +110,53 @@ class BiTemporalAuditLog:
         return entry
 
     # ----------------------- reading ----------------------- #
+    @staticmethod
+    def _validate_axis(axis: str) -> str:
+        if axis not in ("valid", "transaction"):
+            raise ValueError(f"axis must be 'valid' or 'transaction', got: {axis!r}")
+        return axis
+
     def read_all(self) -> List[Dict[str, Any]]:
-        """Read every entry, in file order."""
+        """Read every entry, in file order. Malformed lines are skipped
+        with a warning rather than crashing the entire read."""
         if not os.path.exists(self.path):
             return []
         entries = []
         with open(self.path, "r") as f:
-            for line in f:
+            for lineno, line in enumerate(f, 1):
                 line = line.strip()
-                if line:
+                if not line:
+                    continue
+                try:
                     entries.append(json.loads(line))
+                except json.JSONDecodeError as e:
+                    print(f"[BiTemporalLog] skipping malformed line {lineno}: {e}")
         return entries
+
+    def _superseded_record_ids(self) -> set:
+        """Return the set of record_ids that have been superseded by a
+        correction entry (via correction_of). These should be ignored
+        when reconstructing current state."""
+        return {
+            e["correction_of"]
+            for e in self.read_all()
+            if e.get("correction_of") is not None
+        }
 
     def history(self, job_id: str, axis: str = "valid") -> List[Dict[str, Any]]:
         """All events for ``job_id`` ordered along the chosen time axis.
 
         axis="valid"       -> order by valid_time     (true-world order)
         axis="transaction" -> order by transaction_time (what we knew, in order)
+
+        Superseded entries (referenced by a correction_of) are excluded.
         """
-        rows = [e for e in self.read_all() if e["job_id"] == job_id]
+        self._validate_axis(axis)
+        superseded = self._superseded_record_ids()
+        rows = [
+            e for e in self.read_all()
+            if e["job_id"] == job_id and e.get("record_id") not in superseded
+        ]
         key = "valid_time" if axis == "valid" else "transaction_time"
         return sorted(rows, key=lambda e: e[key])
 
@@ -140,9 +168,18 @@ class BiTemporalAuditLog:
         axis="valid"       : the true state of the job at that real-world time.
         axis="transaction" : what the system knew at that recording time.
         Returns the most recent event entry <= as_of, or None.
+
+        Superseded entries (referenced by a correction_of) are excluded.
         """
+        self._validate_axis(axis)
         key = "valid_time" if axis == "valid" else "transaction_time"
-        rows = [e for e in self.read_all() if e["job_id"] == job_id and e[key] <= as_of]
+        superseded = self._superseded_record_ids()
+        rows = [
+            e for e in self.read_all()
+            if e["job_id"] == job_id
+            and e[key] <= as_of
+            and e.get("record_id") not in superseded
+        ]
         if not rows:
             return None
         return max(rows, key=lambda e: e[key])
@@ -151,10 +188,16 @@ class BiTemporalAuditLog:
         """Reconstruct the current state of every job from the log.
 
         Returns {job_id: latest_event_entry}.
+
+        Superseded entries (referenced by a correction_of) are excluded.
         """
+        self._validate_axis(axis)
         key = "valid_time" if axis == "valid" else "transaction_time"
+        superseded = self._superseded_record_ids()
         latest: Dict[str, Dict[str, Any]] = {}
         for e in self.read_all():
+            if e.get("record_id") in superseded:
+                continue
             cur = latest.get(e["job_id"])
             if cur is None or e[key] >= cur[key]:
                 latest[e["job_id"]] = e
