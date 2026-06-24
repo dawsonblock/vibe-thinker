@@ -121,6 +121,8 @@ class JobQueueREPL:
 
     async def _dispatch(self, line: str) -> None:
         tokens = shlex.split(line)
+        if not tokens:
+            return
         cmd = tokens[0].lower()
         args = tokens[1:]
 
