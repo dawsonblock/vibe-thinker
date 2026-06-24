@@ -26,7 +26,7 @@ import json
 import os
 import tempfile
 from collections import OrderedDict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 # Optional deps for semantic CLR cache
@@ -302,7 +302,7 @@ class CLRResultCache:
             "best_answer": best_answer,
             "best_score": float(best_score),
             "k": int(k),
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "trajectory_count": int(trajectory_count),
         }
         self.entries.append(entry)

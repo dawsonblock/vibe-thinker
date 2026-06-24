@@ -33,9 +33,11 @@ import asyncio
 import json
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
+
+from bitemporal_log import BiTemporalAuditLog
 
 
 # ====================================================================== #
@@ -61,7 +63,7 @@ class Job:
     status: JobStatus = JobStatus.PENDING
     result: Optional[Any] = None  # OrchestratorResult when done
     error: Optional[str] = None
-    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
     callback: Optional[Callable[[Any], Any]] = None
@@ -98,11 +100,16 @@ class JobQueue:
         self,
         orchestrator,
         max_concurrent: int = 2,
-        audit_log: Optional[str] = "rfsn_jobs.jsonl",
+        audit_log: Optional[str] = "rfsn_jobs_bitemporal.jsonl",
     ):
         self.orchestrator = orchestrator
         self.max_concurrent = max_concurrent
         self.audit_log = audit_log
+        # Bi-temporal log: records both valid_time (event time) and
+        # transaction_time (record time) for every state transition.
+        self.bitemporal: Optional[BiTemporalAuditLog] = (
+            BiTemporalAuditLog(audit_log) if audit_log else None
+        )
 
         self._pending: List[Job] = []  # kept sorted by priority desc
         self._jobs: Dict[str, Job] = {}
@@ -114,23 +121,15 @@ class JobQueue:
 
     # ----------------------- audit log ----------------------- #
     def _log(self, job: Job, event: str, extra: Optional[Dict] = None) -> None:
-        if not self.audit_log:
+        """Record a bi-temporal state-transition entry for ``job``.
+
+        valid_time is captured *here* (the real-world moment of the
+        transition); transaction_time is captured inside the log writer at
+        the moment of the write.
+        """
+        if self.bitemporal is None:
             return
-        entry = {
-            "timestamp": datetime.utcnow().isoformat(),
-            "job_id": job.job_id,
-            "event": event,
-            "status": job.status.value,
-            "query": job.query,
-            "priority": job.priority,
-        }
-        if extra:
-            entry.update(extra)
-        try:
-            with open(self.audit_log, "a") as f:
-                f.write(json.dumps(entry) + "\n")
-        except (OSError, TypeError) as e:
-            print(f"[JobQueue] audit log write failed: {e}")
+        self.bitemporal.record(job, event=event, extra=extra)
 
     # ----------------------- public API ----------------------- #
     async def start(self) -> None:
@@ -192,6 +191,18 @@ class JobQueue:
     def list_jobs(self) -> List[Dict[str, Any]]:
         return [j.to_dict() for j in self._jobs.values()]
 
+    # ------------------- bi-temporal queries ------------------- #
+    def job_history(self, job_id: str, axis: str = "valid") -> List[Dict[str, Any]]:
+        """Bi-temporal history of a job (delegates to the audit log)."""
+        if self.bitemporal is None:
+            return []
+        return self.bitemporal.history(job_id, axis=axis)
+
+    def state_as_of(self, job_id: str, as_of: str, axis: str = "valid"):
+        if self.bitemporal is None:
+            return None
+        return self.bitemporal.state_as_of(job_id, as_of, axis=axis)
+
     async def wait_for(self, job_id: str, timeout: Optional[float] = None) -> Any:
         """Block until the job completes/fails/cancels, then return its result
         (an OrchestratorResult) or raise its error."""
@@ -218,7 +229,7 @@ class JobQueue:
         if job in self._pending:
             self._pending.remove(job)
         job.status = JobStatus.CANCELLED
-        job.finished_at = datetime.utcnow().isoformat()
+        job.finished_at = datetime.now(timezone.utc).isoformat()
         self._events[job.job_id].set()
         self._log(job, "cancelled")
         return True
@@ -242,7 +253,7 @@ class JobQueue:
             if job.status == JobStatus.CANCELLED:
                 return
             job.status = JobStatus.RUNNING
-            job.started_at = datetime.utcnow().isoformat()
+            job.started_at = datetime.now(timezone.utc).isoformat()
             self._log(job, "started")
 
             try:
@@ -271,7 +282,7 @@ class JobQueue:
                 job.status = JobStatus.FAILED
                 self._log(job, "failed", extra={"error": str(e)})
             finally:
-                job.finished_at = datetime.utcnow().isoformat()
+                job.finished_at = datetime.now(timezone.utc).isoformat()
                 self._events[job.job_id].set()
 
 

@@ -30,7 +30,7 @@ import asyncio
 import json
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
@@ -59,7 +59,7 @@ class OrchestratorResult:
     specialist_used: str
     clr_score: Optional[float] = None
     raw_traces: Dict[str, Any] = field(default_factory=dict)
-    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     routing_confidence: float = 0.0
 
 
