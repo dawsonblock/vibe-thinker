@@ -47,11 +47,58 @@ except ImportError:
 BAD_ANSWERS = frozenset({
     "no clear answer found",
     "all trajectories failed",
+    "generalist call failed",
+    "specialist call failed",
     "",
     "none",
     "null",
     "n/a",
 })
+
+# Current cache entry schema version. Entries with a lower version are
+# rejected on lookup — old v0.1/v0.2/v0.3 cache entries wrote unsafe
+# high-score self-claims-only results that must not contaminate v0.3.1.
+CURRENT_CACHE_SCHEMA_VERSION = 3
+
+
+def is_cache_entry_trustworthy(
+    entry: Dict[str, Any], *, allow_weak_cache: bool = False
+) -> bool:
+    """Decide whether a cached entry is safe to return on lookup.
+
+    This enforces the same trust rules as insertion. Old cache entries
+    that predate the trust model (schema_version < 3, missing
+    verification_method, self_claims_only with high score) are rejected.
+
+    Args:
+        entry: the cached entry dict.
+        allow_weak_cache: if True, allow self_claims_only entries through.
+
+    Returns:
+        True if the entry is trustworthy, False otherwise.
+    """
+    answer = str(entry.get("best_answer") or entry.get("answer") or "").strip()
+    if not answer:
+        return False
+    if answer.lower() in BAD_ANSWERS:
+        return False
+    if entry.get("failure"):
+        return False
+    if entry.get("transport_failures", 0) > 0 and not entry.get("verified"):
+        return False
+    if entry.get("claim_count", 0) < 5:
+        return False
+    method = entry.get("verification_method", "self_claims_only")
+    if method == "self_claims_only" and not allow_weak_cache:
+        return False
+    # Even with allow_weak_cache, a self_claims_only entry with a score
+    # above 0.65 is suspicious — it was likely written by an older build
+    # that didn't enforce the cap.
+    if method == "self_claims_only" and entry.get("best_score", 0.0) > 0.65:
+        return False
+    if entry.get("schema_version", 1) < CURRENT_CACHE_SCHEMA_VERSION:
+        return False
+    return True
 
 
 def should_cache(result: Dict[str, Any], allow_weak_cache: bool = False) -> bool:
@@ -323,22 +370,44 @@ class CLRResultCache:
         _atomic_write_json(self.path, data)
 
     # ----------------------- lookup ----------------------- #
-    def lookup(self, problem: str) -> Optional[Dict[str, Any]]:
-        """Return a cached result if a similar high-score problem exists."""
+    def lookup(self, problem: str, allow_weak_cache: bool = False) -> Optional[Dict[str, Any]]:
+        """Return a cached result if a similar high-score problem exists.
+
+        Enforces the same trust rules as insertion via
+        :func:`is_cache_entry_trustworthy`. Old cache entries that predate
+        the trust model (schema_version < 3, self_claims_only with high
+        score, missing verification metadata) are silently rejected.
+
+        Args:
+            problem: the query to look up.
+            allow_weak_cache: if True, allow self_claims_only entries
+                through lookup. Default is False.
+        """
         if not self.entries or self._embeddings_matrix is None:
             return None
         q_emb = self.model.encode([problem])[0].reshape(1, -1)
         sims = cosine_similarity(q_emb, self._embeddings_matrix)[0]
-        best_idx = int(np.argmax(sims))
-        best_sim = float(sims[best_idx])
-        entry = self.entries[best_idx]
-        if best_sim >= self.similarity_threshold and entry.get("best_score", 0) >= self.min_score:
+        # Search entries in order of similarity, return the first
+        # trustworthy one above the threshold.
+        ranked_indices = np.argsort(sims)[::-1]
+        for idx in ranked_indices:
+            best_sim = float(sims[idx])
+            if best_sim < self.similarity_threshold:
+                break
+            entry = self.entries[int(idx)]
+            if entry.get("best_score", 0) < self.min_score:
+                continue
+            if not is_cache_entry_trustworthy(entry, allow_weak_cache=allow_weak_cache):
+                continue
             return {
                 "best_answer": entry["best_answer"],
                 "best_score": entry["best_score"],
                 "k": entry.get("k"),
                 "timestamp": entry.get("timestamp"),
                 "trajectory_count": entry.get("trajectory_count"),
+                "verification_method": entry.get("verification_method", "self_claims_only"),
+                "verified": entry.get("verified", False),
+                "schema_version": entry.get("schema_version", 1),
                 "cached": True,
                 "similarity": best_sim,
                 "matched_problem": entry["problem"],
@@ -374,7 +443,7 @@ class CLRResultCache:
           - failure: None if successful, error description if failed
           - transport_failures: number of trajectories that failed at transport level
           - model_failures: number of trajectories that failed at model level
-          - schema_version: cache entry format version (2)
+          - schema_version: cache entry format version (3)
         """
         embedding = self.model.encode([problem])[0].tolist()
         entry = {
@@ -393,7 +462,7 @@ class CLRResultCache:
             "failure": failure,
             "transport_failures": int(transport_failures),
             "model_failures": int(model_failures),
-            "schema_version": 2,
+            "schema_version": CURRENT_CACHE_SCHEMA_VERSION,
         }
         self.entries.append(entry)
         # Evict oldest low-score entries if over capacity (keep best scores)

@@ -5,7 +5,12 @@ import os
 
 import pytest
 
-from persistent_cache import PersistentRouteCache, should_cache
+from persistent_cache import (
+    PersistentRouteCache,
+    should_cache,
+    is_cache_entry_trustworthy,
+    CURRENT_CACHE_SCHEMA_VERSION,
+)
 
 
 @pytest.fixture
@@ -143,4 +148,95 @@ class TestShouldCache:
     def test_cache_rejects_none_answer(self):
         result = self._good_result(answer="none")
         assert should_cache(result) is False
+
+
+class TestCacheLookupTrust:
+    """Tests for cache lookup trust rules.
+
+    Old cache entries that predate the trust model must be rejected
+    on lookup, not just on insertion.
+    """
+
+    def _entry(self, **overrides):
+        base = {
+            "best_answer": "42",
+            "best_score": 0.91,
+            "verified": True,
+            "verification_method": "math_verifier",
+            "claim_count": 8,
+            "schema_version": CURRENT_CACHE_SCHEMA_VERSION,
+            "failure": None,
+            "transport_failures": 0,
+        }
+        base.update(overrides)
+        return base
+
+    def test_lookup_rejects_legacy_missing_schema_version(self):
+        entry = self._entry(schema_version=1)
+        assert is_cache_entry_trustworthy(entry) is False
+
+    def test_lookup_rejects_schema_version_2(self):
+        """v0.3 entries (schema_version=2) are rejected — they may contain
+        unsafe high-score self-claims-only results."""
+        entry = self._entry(schema_version=2)
+        assert is_cache_entry_trustworthy(entry) is False
+
+    def test_lookup_rejects_self_claims_only_high_score(self):
+        """A self_claims_only entry with score > 0.65 is suspicious —
+        it was likely written by an older build that didn't enforce the cap."""
+        entry = self._entry(
+            verification_method="self_claims_only",
+            best_score=0.95,
+            verified=False,
+        )
+        assert is_cache_entry_trustworthy(entry) is False
+
+    def test_lookup_rejects_self_claims_only_by_default(self):
+        """self_claims_only entries are rejected by default."""
+        entry = self._entry(
+            verification_method="self_claims_only",
+            best_score=0.60,
+            verified=False,
+        )
+        assert is_cache_entry_trustworthy(entry) is False
+
+    def test_lookup_allows_self_claims_only_with_weak_flag(self):
+        """With allow_weak_cache, a low-score self_claims_only entry is OK."""
+        entry = self._entry(
+            verification_method="self_claims_only",
+            best_score=0.60,
+            verified=False,
+        )
+        assert is_cache_entry_trustworthy(entry, allow_weak_cache=True) is True
+
+    def test_lookup_rejects_no_clear_answer(self):
+        entry = self._entry(best_answer="No clear answer found")
+        assert is_cache_entry_trustworthy(entry) is False
+
+    def test_lookup_rejects_specialist_call_failed(self):
+        entry = self._entry(best_answer="specialist call failed")
+        assert is_cache_entry_trustworthy(entry) is False
+
+    def test_lookup_rejects_transport_failure(self):
+        entry = self._entry(transport_failures=2, verified=False)
+        assert is_cache_entry_trustworthy(entry) is False
+
+    def test_lookup_rejects_failure_entry(self):
+        entry = self._entry(failure="all trajectories failed")
+        assert is_cache_entry_trustworthy(entry) is False
+
+    def test_lookup_rejects_low_claim_count(self):
+        entry = self._entry(claim_count=3)
+        assert is_cache_entry_trustworthy(entry) is False
+
+    def test_lookup_accepts_deterministically_verified_entry(self):
+        entry = self._entry(verification_method="math_verifier", verified=True)
+        assert is_cache_entry_trustworthy(entry) is True
+
+    def test_lookup_accepts_code_verifier_entry(self):
+        entry = self._entry(verification_method="code_verifier", verified=True)
+        assert is_cache_entry_trustworthy(entry) is True
+
+    def test_current_schema_version_is_3(self):
+        assert CURRENT_CACHE_SCHEMA_VERSION == 3
 
