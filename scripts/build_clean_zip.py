@@ -99,10 +99,15 @@ def main() -> int:
 
         # --- Validation: pytest ---
         print("Running pytest...")
-        result = subprocess.run(
-            [sys.executable, "-m", "pytest", staging + "/tests", "-q"],
-            capture_output=True, text=True, cwd=staging,
-        )
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "pytest", staging + "/tests", "-q"],
+                capture_output=True, text=True, cwd=staging,
+                timeout=120,
+            )
+        except subprocess.TimeoutExpired:
+            print("  pytest: TIMED OUT (120s)", file=sys.stderr)
+            return 1
         if result.returncode == 0:
             print("  pytest: OK")
         else:
