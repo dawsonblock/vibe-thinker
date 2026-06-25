@@ -5,7 +5,7 @@ high-precision reasoning specialist (VibeThinker-3B with Claim-Level
 Reliability) and a generalist model, with a priority async job queue,
 bi-temporal audit logging, deterministic verifiers, and an interactive CLI.
 
-## Status: ALPHA SOFTWARE (v0.3.1)
+## Status: ALPHA SOFTWARE (v0.3.2)
 
 **This is alpha software.** It is a local reasoning control plane prototype,
 not a production reasoning engine. The following limitations are real and
@@ -136,6 +136,70 @@ self-agreement with deterministic verification:
 - With deterministic verification: `final_score = det * 0.7 + consistency * 0.3`
 - Without deterministic verification: `final_score = min(consistency, 0.65)`
 - Self-claims-only confidence is **hard-capped at 0.65**
+- **Cross-trajectory consistency is NOT deterministic verification.**
+  The model agreeing with itself is not proof of correctness.
+  Consensus gives a small boost within the 0.65 cap (+0.05) but can
+  NEVER exceed it. Only external verifiers can exceed 0.65.
+
+## Adaptive compute (v0.3.2)
+
+The CLR runtime uses adaptive compute (dynamic sampling / early exiting)
+instead of brute-force trajectory generation:
+
+**Phase 1 — Fast Path (System 1):**
+- If a verifier exists: generate k=1 lightweight trajectory (answer
+  extraction only, no claim verification — saves 6 LLM calls), verify
+  immediately. If `verified=True`, exit early.
+- If no verifier: generate k=2 full trajectories.
+
+**Phase 2 — Consensus Check:**
+- If no verifier confirmed, check if trajectories agree.
+- If all `\boxed{}` answers match, exit early — more trajectories won't
+  raise the score above 0.65 without a verifier.
+- **Score is capped at 0.65.** Consensus saves compute, not trust.
+- High-risk tasks (code, file modification, security, medical, legal,
+  financial) cannot early-exit from self-consensus alone.
+
+**Phase 3 — Branching (System 2):**
+- If trajectories disagree, verifier refuted, or high-risk task without
+  verifier: scale up to `max_k=6` trajectories.
+- Aggregate all trajectories to find the most consistent answer.
+- Self-only results still capped at 0.65.
+
+**Decision table:**
+
+| Condition | Action | Max score |
+|---|---|---|
+| Deterministic verifier passes | Early exit at k=1 | >0.65 allowed |
+| Deterministic verifier refutes | Branch to max_k | 0 unless later verified |
+| Verifier unsupported | Continue self-check | ≤0.65 |
+| 2 trajectories agree, no verifier | Early exit at k=2 | ≤0.65 |
+| 2 trajectories disagree | Branch to max_k | ≤0.65 unless verifier passes |
+| No final answer | Branch; if still none, fail | 0 |
+| Model/server error | Fail job if all attempts fail | 0 |
+| High-risk task, no verifier | Branch to max_k (no consensus exit) | ≤0.65 |
+
+**Queue-load-aware max_k:** When the job queue is under pressure,
+max_k is automatically reduced to improve throughput:
+- Queue load < 50% → max_k = 6 (full budget)
+- Queue load 50–80% → max_k = 4
+- Queue load > 80% → max_k = 2
+
+**CLRResult metadata:** Every result includes adaptive compute metadata:
+```json
+{
+  "best_answer": "42",
+  "best_score": 0.65,
+  "verified": false,
+  "verification_method": "self_claims_only",
+  "verification_status": "self_only",
+  "adaptive": true,
+  "trajectories_used": 2,
+  "max_trajectories": 6,
+  "early_exit_reason": "self_consensus_cap_reached",
+  "agreement": true
+}
+```
 
 ## Cache promotion rules
 

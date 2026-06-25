@@ -23,7 +23,7 @@ import tempfile
 import zipfile
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 DIST_DIR = os.path.join(PROJECT_ROOT, "dist")
 ZIP_NAME = f"vibe-thinker-v{VERSION}.zip"
 

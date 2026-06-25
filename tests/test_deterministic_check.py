@@ -1,4 +1,9 @@
-"""Pytest tests for deterministic answer checking and structured routing."""
+"""Pytest tests for cross-trajectory answer consistency checking.
+
+Renamed from 'deterministic check' to 'consistency check' because
+cross-trajectory agreement is NOT deterministic verification — it is
+the model agreeing with itself. Consensus is not proof.
+"""
 
 import pytest
 
@@ -40,14 +45,14 @@ class TestNumericNormalization:
             assert abs(result - expected) < 1e-6
 
 
-class TestDeterministicCheck:
-    def test_consistent_numeric_answers_boost(self, clr):
+class TestConsistencyCheck:
+    def test_consistent_numeric_answers(self, clr):
         trajectories = [
             {"answer_present": True, "raw_trace": "reasoning \\boxed{42}"},
             {"answer_present": True, "raw_trace": "other reasoning \\boxed{42}"},
             {"answer_present": True, "raw_trace": "third \\boxed{42}"},
         ]
-        result = clr._check_answer_deterministic("42", trajectories)
+        result = clr._check_answer_consistency("42", trajectories)
         assert result is True
 
     def test_contradictory_answers_flagged(self, clr):
@@ -56,12 +61,12 @@ class TestDeterministicCheck:
             {"answer_present": True, "raw_trace": "other \\boxed{99}"},
             {"answer_present": True, "raw_trace": "third \\boxed{99}"},
         ]
-        result = clr._check_answer_deterministic("42", trajectories)
+        result = clr._check_answer_consistency("42", trajectories)
         assert result is False
 
     def test_insufficient_data_returns_none(self, clr):
         trajectories = [{"answer_present": True, "raw_trace": "\\boxed{42}"}]
-        result = clr._check_answer_deterministic("42", trajectories)
+        result = clr._check_answer_consistency("42", trajectories)
         assert result is None
 
     def test_non_numeric_string_match(self, clr):
@@ -69,5 +74,5 @@ class TestDeterministicCheck:
             {"answer_present": True, "raw_trace": "\\boxed{Paris}"},
             {"answer_present": True, "raw_trace": "\\boxed{Paris}"},
         ]
-        result = clr._check_answer_deterministic("Paris", trajectories)
+        result = clr._check_answer_consistency("Paris", trajectories)
         assert result is True

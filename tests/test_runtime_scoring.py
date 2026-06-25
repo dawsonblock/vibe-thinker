@@ -11,6 +11,7 @@ Acceptance criteria tested:
   5. FactualVerifier unsupported result prevents high confidence.
 """
 
+from contextlib import contextmanager
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -21,6 +22,20 @@ from verifiers.base import VerificationResult
 from hybrid_orchestrator import select_verifier
 from math_solver import solve as solve_math
 from sandbox import LocalSubprocessExecutor
+
+
+@contextmanager
+def patch_generators(clr, return_value=None, side_effect=None):
+    """Patch both trajectory generation methods.
+
+    Adaptive mode uses _generate_lightweight_trajectory when a verifier
+    is present, and _generate_one_trajectory otherwise. Tests need to
+    patch both to cover all code paths.
+    """
+    mock = AsyncMock(return_value=return_value, side_effect=side_effect)
+    with patch.object(clr, "_generate_one_trajectory", new=mock):
+        with patch.object(clr, "_generate_lightweight_trajectory", new=mock):
+            yield mock
 
 
 @pytest.fixture
@@ -64,8 +79,7 @@ class TestRuntimeConfidenceCap:
             )
         verifier.verify = mock_verify
 
-        with patch.object(clr, "_generate_one_trajectory",
-                          new=AsyncMock(return_value=_good_trajectory("42"))):
+        with patch_generators(clr, return_value=_good_trajectory("42")):
             result = await clr.run("Compute 2 + 2", verifier=verifier, task_type="math")
         assert result.verification_method == "math_verifier"
         assert result.verified is True
@@ -82,8 +96,7 @@ class TestRuntimeConfidenceCap:
             )
         verifier.verify = mock_verify
 
-        with patch.object(clr, "_generate_one_trajectory",
-                          new=AsyncMock(return_value=_good_trajectory("5"))):
+        with patch_generators(clr, return_value=_good_trajectory("5")):
             result = await clr.run("Compute 2 + 2", verifier=verifier, task_type="math")
         assert result.verified is False
         assert result.best_score == 0.0
@@ -102,8 +115,7 @@ class TestRuntimeConfidenceCap:
             )
         verifier.verify = mock_verify
 
-        with patch.object(clr, "_generate_one_trajectory",
-                          new=AsyncMock(return_value=_good_trajectory("42"))):
+        with patch_generators(clr, return_value=_good_trajectory("42")):
             result = await clr.run("Compute 2 + 2", verifier=verifier, task_type="math")
         assert result.verified is True
         # 0.7 * 0.7 + 0.65 * 0.3 = 0.49 + 0.195 = 0.685
@@ -200,8 +212,7 @@ class TestFactualVerifierHonesty:
         verifier = FactualVerifier()
         # FactualVerifier with no sources returns verified=False
         # The CLR run should fall back to self_claims_only cap
-        with patch.object(clr, "_generate_one_trajectory",
-                          new=AsyncMock(return_value=_good_trajectory("Paris"))):
+        with patch_generators(clr, return_value=_good_trajectory("Paris")):
             result = await clr.run(
                 "What is the capital of France?",
                 verifier=verifier,
@@ -237,8 +248,7 @@ class TestVerifierContextDerivation:
         # The solver will derive expected_answer="4" for "What is 2+2?"
         context = {"expected_answer": "4"}
 
-        with patch.object(clr, "_generate_one_trajectory",
-                          new=AsyncMock(return_value=_good_trajectory("4"))):
+        with patch_generators(clr, return_value=_good_trajectory("4")):
             result = await clr.run(
                 "What is 2+2?",
                 verifier=verifier,
@@ -256,8 +266,7 @@ class TestVerifierContextDerivation:
         verifier = MathVerifier()
         context = {"expected_answer": "4"}  # correct answer is 4
 
-        with patch.object(clr, "_generate_one_trajectory",
-                          new=AsyncMock(return_value=_good_trajectory("5"))):
+        with patch_generators(clr, return_value=_good_trajectory("5")):
             result = await clr.run(
                 "What is 2+2?",
                 verifier=verifier,
@@ -274,8 +283,7 @@ class TestVerifierContextDerivation:
         verifier = MathVerifier()
         context = {}  # no expected_answer
 
-        with patch.object(clr, "_generate_one_trajectory",
-                          new=AsyncMock(return_value=_good_trajectory("42"))):
+        with patch_generators(clr, return_value=_good_trajectory("42")):
             result = await clr.run(
                 "Explain something complex",
                 verifier=verifier,

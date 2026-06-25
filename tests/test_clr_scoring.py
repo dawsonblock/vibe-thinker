@@ -64,7 +64,7 @@ class TestReliabilityScoring:
         ]
         score = clr._calculate_reliability(
             [1, 1, 1, 1, 1], claims=claims, answer_present=True,
-            deterministic_check=None,
+            consistency_check=None,
         )
         assert score <= 0.65, f"Self-claims-only score {score} exceeds 0.65 cap"
 
@@ -75,24 +75,34 @@ class TestReliabilityScoring:
         score = clr._calculate_reliability([1, 1, 1, 1, 1], claims=claims, answer_present=True)
         assert score <= 0.65
 
-    def test_deterministic_check_allows_above_065(self, clr):
-        """With deterministic verification, score CAN exceed 0.65."""
+    def test_consistency_check_does_not_exceed_065(self, clr):
+        """Cross-trajectory consistency (model agreeing with itself) must NOT
+        allow score above 0.65. Consensus is not proof — only external
+        verifiers can exceed the cap."""
         claims = ["a" * 20, "b" * 20, "c" * 20, "d" * 20, "e" * 20]
         score = clr._calculate_reliability(
             [1, 1, 1, 1, 1], claims=claims, answer_present=True,
-            deterministic_check=True,
+            consistency_check=True,
         )
-        # 1.0 * 0.7 + 1.0 * 0.3 = 1.0
-        assert score > 0.65
+        assert score <= 0.65, f"Consistency-boosted score {score} exceeds 0.65 cap"
 
-    def test_deterministic_check_refutation_scores_zero(self, clr):
-        """If a deterministic verifier refutes the answer, score must be 0."""
+    def test_consistency_check_refutation_penalizes(self, clr):
+        """If trajectories contradict, the score is penalized (but not zeroed
+        — that's only for external verifier refutation)."""
         claims = ["a" * 20, "b" * 20, "c" * 20, "d" * 20, "e" * 20]
-        score = clr._calculate_reliability(
-            [1, 1, 1, 1, 1], claims=claims, answer_present=True,
-            deterministic_check=False,
+        # Use mixed verdicts so base score is below the cap, allowing
+        # us to see the consistency boost vs contradiction penalty.
+        score_consistent = clr._calculate_reliability(
+            [1, 1, 1, 1, 0], claims=claims, answer_present=True,
+            consistency_check=True,
         )
-        assert score == 0.0
+        score_contradicted = clr._calculate_reliability(
+            [1, 1, 1, 1, 0], claims=claims, answer_present=True,
+            consistency_check=False,
+        )
+        assert score_contradicted < score_consistent
+        assert score_contradicted <= 0.65
+        assert score_consistent <= 0.65
 
     def test_mixed_garbage_and_real_claims_capped(self, clr):
         # 2 garbage + 5 real, all verified -> only 5 count, but capped at 0.65
@@ -227,7 +237,6 @@ class TestVerifierIntegration:
         }
         # Mock the math verifier to return verified=True
         verifier = MathVerifier()
-        original_verify = verifier.verify
         async def mock_verify(query, answer, context):
             return VerificationResult(
                 verified=True, score=1.0, method="numeric_comparison",
@@ -235,9 +244,13 @@ class TestVerifierIntegration:
             )
         verifier.verify = mock_verify
 
+        # Adaptive mode uses lightweight trajectory when verifier is present.
+        # Mock both methods to cover both paths.
         with patch.object(clr, "_generate_one_trajectory",
                           new=AsyncMock(return_value=good_traj)):
-            result = await clr.run("What is 2+2?", verifier=verifier, task_type="math")
+            with patch.object(clr, "_generate_lightweight_trajectory",
+                              new=AsyncMock(return_value=good_traj)):
+                result = await clr.run("What is 2+2?", verifier=verifier, task_type="math")
         assert result.verification_method == "math_verifier"
         assert result.verified is True
         assert result.best_score > 0.65
@@ -267,7 +280,9 @@ class TestVerifierIntegration:
 
         with patch.object(clr, "_generate_one_trajectory",
                           new=AsyncMock(return_value=good_traj)):
-            result = await clr.run("What is 2+2?", verifier=verifier, task_type="math")
+            with patch.object(clr, "_generate_lightweight_trajectory",
+                              new=AsyncMock(return_value=good_traj)):
+                result = await clr.run("What is 2+2?", verifier=verifier, task_type="math")
         assert result.verified is False
         assert result.best_score == 0.0
 
@@ -291,7 +306,9 @@ class TestVerifierIntegration:
 
         with patch.object(clr, "_generate_one_trajectory",
                           new=AsyncMock(return_value=good_traj)):
-            result = await clr.run("What is 2+2?", verifier=verifier, task_type="math")
+            with patch.object(clr, "_generate_lightweight_trajectory",
+                              new=AsyncMock(return_value=good_traj)):
+                result = await clr.run("What is 2+2?", verifier=verifier, task_type="math")
         assert result.verification_method == "self_claims_only"
         assert result.verified is False
         assert result.best_score <= 0.65

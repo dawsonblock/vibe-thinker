@@ -11,6 +11,7 @@ for an unverified question is mathematically useless. Adaptive compute
 fixes this waste.
 """
 
+from contextlib import contextmanager
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -18,6 +19,19 @@ import pytest
 from vibe_clr_async import CLRResult, VibeThinkerCLRAsync
 from verifiers import MathVerifier
 from verifiers.base import VerificationResult
+
+
+@contextmanager
+def patch_generators(clr, return_value=None, side_effect=None):
+    """Patch both trajectory generation methods.
+
+    Adaptive mode uses _generate_lightweight_trajectory when a verifier
+    is present, and _generate_one_trajectory otherwise.
+    """
+    mock = AsyncMock(return_value=return_value, side_effect=side_effect)
+    with patch.object(clr, "_generate_one_trajectory", new=mock):
+        with patch.object(clr, "_generate_lightweight_trajectory", new=mock):
+            yield mock
 
 
 def _good_trajectory(answer="42", score=0.65):
@@ -104,11 +118,16 @@ class TestAdaptiveConfig:
 
 
 class TestPhase1EarlyVerifierExit:
-    """Phase 1: if a verifier confirms the answer, exit immediately."""
+    """Phase 1: if a verifier confirms the answer, exit immediately.
+
+    With a verifier, adaptive mode starts with k=1 (not k=2) and uses
+    lightweight trajectory generation (answer extraction only, no claim
+    verification). This saves 6 LLM calls per trajectory.
+    """
 
     @pytest.mark.asyncio
     async def test_verifier_confirms_exits_early(self, adaptive_clr):
-        """When the verifier confirms on the first k_min trajectories,
+        """When the verifier confirms on the first k=1 trajectory,
         no more trajectories should be generated."""
         call_count = 0
         async def mock_gen(*args, **kwargs):
@@ -124,18 +143,19 @@ class TestPhase1EarlyVerifierExit:
             )
         verifier.verify = mock_verify
 
-        with patch.object(adaptive_clr, "_generate_one_trajectory",
-                          new=AsyncMock(side_effect=mock_gen)):
+        with patch_generators(adaptive_clr, side_effect=mock_gen):
             result = await adaptive_clr.run(
                 "What is 2+2?", verifier=verifier, task_type="math",
                 verifier_context={"expected_answer": "4"},
             )
 
-        # Should have only generated k_min=2 trajectories, not k_max=6
-        assert call_count == 2, f"Expected 2 trajectories, got {call_count}"
+        # Should have only generated k=1 trajectory (verifier fast path)
+        assert call_count == 1, f"Expected 1 trajectory, got {call_count}"
         assert result.verified is True
         assert result.verification_method == "math_verifier"
         assert result.best_score > 0.65
+        assert result.early_exit_reason == "deterministic_verifier_passed"
+        assert result.trajectories_used == 1
 
     @pytest.mark.asyncio
     async def test_verifier_refutes_continues_to_phase3(self, adaptive_clr):
@@ -155,8 +175,7 @@ class TestPhase1EarlyVerifierExit:
             )
         verifier.verify = mock_verify
 
-        with patch.object(adaptive_clr, "_generate_one_trajectory",
-                          new=AsyncMock(side_effect=mock_gen)):
+        with patch_generators(adaptive_clr, side_effect=mock_gen):
             result = await adaptive_clr.run(
                 "What is 2+2?", verifier=verifier, task_type="math",
                 verifier_context={"expected_answer": "4"},
@@ -173,23 +192,24 @@ class TestPhase2ConsensusExit:
 
     @pytest.mark.asyncio
     async def test_consensus_exits_early_without_verifier(self, adaptive_clr):
-        """When k_min trajectories agree and there's no verifier, exit early.
-        More trajectories won't meaningfully change the score."""
+        """When k=2 trajectories agree and there's no verifier, exit early.
+        Score is capped at 0.65 — consensus saves compute, not trust."""
         call_count = 0
         async def mock_gen(*args, **kwargs):
             nonlocal call_count
             call_count += 1
             return _good_trajectory("42")  # all agree
 
-        with patch.object(adaptive_clr, "_generate_one_trajectory",
-                          new=AsyncMock(side_effect=mock_gen)):
+        with patch_generators(adaptive_clr, side_effect=mock_gen):
             result = await adaptive_clr.run("What is 6*7?")
 
-        # Should have only generated k_min=2 trajectories
+        # Should have only generated k=2 trajectories (no verifier path)
         assert call_count == 2, f"Expected 2 trajectories, got {call_count}"
-        # Cross-trajectory agreement (deterministic_check=True) CAN boost
-        # the score above 0.65 — that's existing behavior. The key test
-        # is that we didn't waste compute generating more trajectories.
+        # Consensus does NOT raise trust above 0.65
+        assert result.best_score <= 0.65
+        assert result.verified is False
+        assert result.verification_method == "self_claims_only"
+        assert result.early_exit_reason == "self_consensus_cap_reached"
         assert result.best_answer == "42"
 
     @pytest.mark.asyncio
@@ -280,7 +300,7 @@ class TestComputeSavings:
 
     @pytest.mark.asyncio
     async def test_easy_problem_uses_minimal_compute(self, adaptive_clr):
-        """An easy problem with verifier confirmation uses only k_min calls."""
+        """An easy problem with verifier confirmation uses only k=1 call."""
         call_count = 0
         async def mock_gen(*args, **kwargs):
             nonlocal call_count
@@ -295,17 +315,17 @@ class TestComputeSavings:
             )
         verifier.verify = mock_verify
 
-        with patch.object(adaptive_clr, "_generate_one_trajectory",
-                          new=AsyncMock(side_effect=mock_gen)):
+        with patch_generators(adaptive_clr, side_effect=mock_gen):
             result = await adaptive_clr.run(
                 "What is 2+2?", verifier=verifier, task_type="math",
                 verifier_context={"expected_answer": "4"},
             )
 
-        # k_min=2 trajectories instead of k_max=6 or k=8
-        # That's a 75% reduction in compute for verified easy problems
-        assert call_count == 2
+        # k=1 trajectory instead of k_max=6 or k=8
+        # That's an 87.5% reduction in compute for verified easy problems
+        assert call_count == 1
         assert result.verified is True
+        assert result.trajectories_used == 1
 
     @pytest.mark.asyncio
     async def test_hard_problem_uses_max_compute(self, adaptive_clr):
@@ -319,9 +339,289 @@ class TestComputeSavings:
                 return _good_trajectory("42")
             return _good_trajectory("1807")
 
-        with patch.object(adaptive_clr, "_generate_one_trajectory",
-                          new=AsyncMock(side_effect=mock_gen)):
+        with patch_generators(adaptive_clr, side_effect=mock_gen):
             result = await adaptive_clr.run("Solve a hard problem")
 
         # Should use all k_max=6 trajectories
         assert call_count == 6
+
+
+# ======================================================================
+# REQUIRED REGRESSION TESTS FROM VERDICT
+# These are non-negotiable acceptance criteria for v0.3.2.
+# ======================================================================
+
+class TestAdaptiveMathVerifierEarlyExitsAtK1:
+    """test_adaptive_math_verifier_early_exits_at_k1"""
+
+    @pytest.mark.asyncio
+    async def test_math_verifier_early_exits_at_k1(self, adaptive_clr):
+        """Easy verified math exits at k=1."""
+        call_count = 0
+        async def mock_gen(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return _good_trajectory("4")
+
+        verifier = MathVerifier()
+        async def mock_verify(query, answer, context):
+            return VerificationResult(
+                verified=True, score=1.0, method="numeric_comparison",
+                evidence={"candidate": 4.0, "expected": 4.0},
+            )
+        verifier.verify = mock_verify
+
+        with patch_generators(adaptive_clr, side_effect=mock_gen):
+            result = await adaptive_clr.run(
+                "What is 2+2?", verifier=verifier, task_type="math",
+                verifier_context={"expected_answer": "4"},
+            )
+
+        assert call_count == 1, f"Expected k=1, got k={call_count}"
+        assert result.verified is True
+        assert result.best_score > 0.65
+        assert result.trajectories_used == 1
+        assert result.early_exit_reason == "deterministic_verifier_passed"
+
+
+class TestAdaptiveSelfConsensusEarlyExitsAtK2ButScoreCapped:
+    """test_adaptive_self_consensus_early_exits_at_k2_but_score_capped"""
+
+    @pytest.mark.asyncio
+    async def test_self_consensus_capped(self, adaptive_clr):
+        """Easy self-only agreement exits at k=2, score <= 0.65."""
+        call_count = 0
+        async def mock_gen(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return _good_trajectory("42")
+
+        with patch_generators(adaptive_clr, side_effect=mock_gen):
+            result = await adaptive_clr.run("What is 6*7?")
+
+        assert call_count == 2, f"Expected k=2, got k={call_count}"
+        assert result.best_score <= 0.65
+        assert result.verified is False
+        assert result.verification_method == "self_claims_only"
+        assert result.verification_status == "self_only"
+
+
+class TestAdaptiveDisagreementBranchesToMaxK:
+    """test_adaptive_disagreement_branches_to_max_k"""
+
+    @pytest.mark.asyncio
+    async def test_disagreement_branches(self, adaptive_clr):
+        """Disagreement branches to max_k."""
+        call_count = 0
+        async def mock_gen(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count % 2 == 1:
+                return _good_trajectory("42")
+            return _good_trajectory("1807")
+
+        with patch_generators(adaptive_clr, side_effect=mock_gen):
+            result = await adaptive_clr.run("Solve a problem")
+
+        assert call_count == 6, f"Expected k=6, got k={call_count}"
+
+
+class TestCrossTrajectoryAgreementNeverSetsVerifiedTrue:
+    """test_cross_trajectory_agreement_never_sets_verified_true"""
+
+    @pytest.mark.asyncio
+    async def test_agreement_does_not_verify(self, adaptive_clr):
+        """Cross-trajectory agreement must never set verified=True."""
+        async def mock_gen(*args, **kwargs):
+            return _good_trajectory("42")
+
+        with patch_generators(adaptive_clr, side_effect=mock_gen):
+            result = await adaptive_clr.run("What is 6*7?")
+
+        assert result.verified is False
+        assert result.verification_method == "self_claims_only"
+
+    def test_consistency_check_method_renamed(self, adaptive_clr):
+        """The method must be renamed from _check_answer_deterministic
+        to _check_answer_consistency — consensus is not verification."""
+        assert hasattr(adaptive_clr, "_check_answer_consistency")
+        assert not hasattr(adaptive_clr, "_check_answer_deterministic")
+
+
+class TestCrossTrajectoryAgreementNeverExceeds065WithoutVerifier:
+    """test_cross_trajectory_agreement_never_exceeds_065_without_verifier
+
+    THE MOST IMPORTANT REGRESSION TEST.
+    """
+
+    @pytest.mark.asyncio
+    async def test_consensus_does_not_bypass_self_claim_cap(self, adaptive_clr):
+        """Consensus must not bypass the self-claim cap.
+
+        Even if all trajectories agree perfectly, the score must stay
+        <= 0.65 without an external verifier.
+        """
+        async def mock_gen(*args, **kwargs):
+            return _good_trajectory("42")
+
+        with patch_generators(adaptive_clr, side_effect=mock_gen):
+            result = await adaptive_clr.run(
+                "Answer this question",
+                verifier=None,
+            )
+
+        assert result.verification_method == "self_claims_only"
+        assert result.verified is False
+        assert result.best_score <= 0.65
+        assert result.trajectories_used <= 2
+
+    def test_calculate_reliability_consistency_does_not_exceed_cap(self, adaptive_clr):
+        """_calculate_reliability with consistency_check=True must not
+        exceed 0.65. This is the unit-level test for the trust bug."""
+        claims = ["a" * 20, "b" * 20, "c" * 20, "d" * 20, "e" * 20]
+        score = adaptive_clr._calculate_reliability(
+            [1, 1, 1, 1, 1], claims=claims, answer_present=True,
+            consistency_check=True,
+        )
+        assert score <= 0.65, f"Consistency score {score} exceeds 0.65 cap"
+
+
+class TestRefutedVerifierBranches:
+    """test_refuted_verifier_branches"""
+
+    @pytest.mark.asyncio
+    async def test_refuted_verifier_branches(self, adaptive_clr):
+        """When the verifier refutes, branch to max_k."""
+        call_count = 0
+        async def mock_gen(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return _good_trajectory("5")  # wrong answer
+
+        verifier = MathVerifier()
+        async def mock_verify(query, answer, context):
+            return VerificationResult(
+                verified=False, score=0.0, method="numeric_comparison",
+                error="wrong answer",
+            )
+        verifier.verify = mock_verify
+
+        with patch_generators(adaptive_clr, side_effect=mock_gen):
+            result = await adaptive_clr.run(
+                "What is 2+2?", verifier=verifier, task_type="math",
+                verifier_context={"expected_answer": "4"},
+            )
+
+        assert call_count == 6, f"Expected k=6, got k={call_count}"
+        assert result.verified is False
+
+
+class TestUnsupportedVerifierDoesNotZeroAnswer:
+    """test_unsupported_verifier_does_not_zero_answer_unless_refuted"""
+
+    @pytest.mark.asyncio
+    async def test_unsupported_verifier_keeps_self_score(self, adaptive_clr):
+        """When a verifier returns unsupported (not refuted), the answer
+        should keep its self-claim score (capped at 0.65), NOT be zeroed."""
+        async def mock_gen(*args, **kwargs):
+            return _good_trajectory("42")
+
+        verifier = MathVerifier()
+        async def mock_verify(query, answer, context):
+            return VerificationResult(
+                verified=False, score=0.5, method="numeric_comparison",
+                error="no expected answer available",
+            )
+        verifier.verify = mock_verify
+
+        with patch_generators(adaptive_clr, side_effect=mock_gen):
+            result = await adaptive_clr.run(
+                "Solve a problem", verifier=verifier, task_type="math",
+            )
+
+        # Unsupported (not refuted) -> score stays at self-claim level
+        assert result.verified is False
+        assert result.best_score > 0.0  # NOT zeroed
+        assert result.best_score <= 0.65  # still capped
+
+
+class TestAllTransportFailuresFailJob:
+    """test_all_transport_failures_fail_job"""
+
+    @pytest.mark.asyncio
+    async def test_all_failures_raise(self, adaptive_clr):
+        """All trajectories fail -> RuntimeError (infrastructure failure)."""
+        async def boom(*args, **kwargs):
+            raise RuntimeError("Connection refused")
+
+        with patch_generators(adaptive_clr, side_effect=boom):
+            with pytest.raises(RuntimeError, match="All CLR trajectories failed"):
+                await adaptive_clr.run("test problem")
+
+
+class TestQueuePressureLowersMaxK:
+    """test_queue_pressure_lowers_max_k"""
+
+    def test_low_load_keeps_max_k(self, adaptive_clr):
+        """Queue load < 50% -> max_k stays at 6."""
+        adaptive_clr.adjust_max_k_for_queue_load(0.3)
+        assert adaptive_clr.policy.max_k == 6
+
+    def test_medium_load_lowers_max_k(self, adaptive_clr):
+        """Queue load 50-80% -> max_k = 4."""
+        adaptive_clr.adjust_max_k_for_queue_load(0.6)
+        assert adaptive_clr.policy.max_k == 4
+
+    def test_high_load_lowers_max_k(self, adaptive_clr):
+        """Queue load > 80% -> max_k = 2."""
+        adaptive_clr.adjust_max_k_for_queue_load(0.9)
+        assert adaptive_clr.policy.max_k == 2
+
+    def test_load_adjustment_affects_compute(self, adaptive_clr):
+        """High queue load should reduce actual trajectories used."""
+        import asyncio
+
+        async def test():
+            adaptive_clr.adjust_max_k_for_queue_load(0.9)
+            assert adaptive_clr.policy.max_k == 2
+
+            call_count = 0
+            async def mock_gen(*args, **kwargs):
+                nonlocal call_count
+                call_count += 1
+                if call_count % 2 == 1:
+                    return _good_trajectory("42")
+                return _good_trajectory("1807")
+
+            with patch_generators(adaptive_clr, side_effect=mock_gen):
+                result = await adaptive_clr.run("Solve a problem")
+
+            # With max_k=2, even disagreement can only use 2 trajectories
+            assert call_count == 2, f"Expected 2, got {call_count}"
+
+        asyncio.run(test())
+
+
+class TestHighRiskTaskDisablesSelfConsensus:
+    """High-risk tasks cannot early-exit from self-consensus alone."""
+
+    @pytest.mark.asyncio
+    async def test_high_risk_no_self_consensus_exit(self, adaptive_clr):
+        """Code tasks (high-risk) should NOT early-exit from consensus
+        without a verifier — the model agreeing with itself is not
+        sufficient for code execution."""
+        call_count = 0
+        async def mock_gen(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return _good_trajectory("42")
+
+        with patch_generators(adaptive_clr, side_effect=mock_gen):
+            result = await adaptive_clr.run(
+                "Write code to sort a list", task_type="code",
+            )
+
+        # High-risk task: should branch to max_k even if trajectories agree
+        assert call_count == 6, f"Expected 6 (high-risk no consensus), got {call_count}"
+        assert result.verified is False
+        assert result.best_score <= 0.65

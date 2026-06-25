@@ -32,6 +32,38 @@ from scoring import compute_confidence
 
 
 @dataclass
+class AdaptivePolicy:
+    """Policy for adaptive compute (dynamic sampling / early exiting).
+
+    Controls how the CLR runtime scales trajectory generation:
+      - Start with initial_k trajectories
+      - Verify early if a verifier is available
+      - Branch up to max_k on disagreement/uncertainty
+      - Self-consensus never exceeds self_claim_cap (0.65)
+      - Only external verifiers can exceed the cap
+      - High-risk tasks disable self-consensus early exit
+    """
+    initial_k_with_verifier: int = 1
+    initial_k_without_verifier: int = 2
+    max_k: int = 6
+    branch_batch_size: int = 2
+    self_claim_cap: float = 0.65
+    min_claims: int = 5
+    early_exit_on_self_consensus: bool = True
+    disable_self_consensus_for_high_risk: bool = True
+    # Consistency boost within the cap (agreement adds this much, capped)
+    consistency_boost: float = 0.05
+    # Contradiction penalty (disagreement multiplies by this)
+    contradiction_penalty: float = 0.75
+
+
+# High-risk task types that should NOT early-exit from self-consensus alone.
+# These require external verification — the model agreeing with itself
+# is not sufficient for code execution, file modification, etc.
+HIGH_RISK_TASK_TYPES = {"code", "file_modify", "security", "medical", "legal", "financial"}
+
+
+@dataclass
 class CLRResult:
     best_answer: str
     best_score: float
@@ -52,6 +84,18 @@ class CLRResult:
     verification_method: str = "self_claims_only"
     verified: bool = False
     deterministic_verification: Optional[float] = None
+    # Adaptive compute metadata: how much compute was actually used.
+    # trajectories_used <= max_trajectories. When early_exit_reason is set,
+    # the system stopped before exhausting the budget.
+    adaptive: bool = False
+    trajectories_used: int = 0
+    max_trajectories: int = 0
+    early_exit_reason: Optional[str] = None
+    branch_reason: Optional[str] = None
+    agreement: Optional[bool] = None
+    # Verification status: one of "verified", "refuted", "unsupported",
+    # "self_only", "error". More granular than verified (bool).
+    verification_status: str = "self_only"
 
 
 class VibeThinkerCLRAsync:
@@ -63,21 +107,57 @@ class VibeThinkerCLRAsync:
         adaptive: bool = True,
         k_min: int = 2,
         k_max: int = 6,
+        policy: Optional[AdaptivePolicy] = None,
     ):
         self.server_url = server_url.rstrip("/")
         self.k = k
         self.max_concurrent = max_concurrent  # Limit concurrent requests
         self.semaphore = asyncio.Semaphore(max_concurrent)
 
-        # Adaptive compute: instead of firing all k trajectories at once,
-        # start with k_min and scale up to k_max only when needed.
-        # This is "System 1 / System 2" thinking:
-        #   Phase 1: k_min trajectories + early verifier exit
-        #   Phase 2: consensus check (early exit if answers agree)
-        #   Phase 3: scale up to k_max on disagreement/uncertainty
+        # Adaptive compute policy. If not provided, construct from k_min/k_max
+        # for backwards compatibility.
         self.adaptive = adaptive
-        self.k_min = min(k_min, k) if adaptive else k
-        self.k_max = min(k_max, k) if adaptive else k
+        if policy is None:
+            self.policy = AdaptivePolicy(
+                initial_k_without_verifier=min(k_min, k) if adaptive else k,
+                initial_k_with_verifier=1 if adaptive else k,
+                max_k=min(k_max, k) if adaptive else k,
+            )
+        else:
+            self.policy = policy
+        # Keep k_min/k_max for backwards compat
+        self.k_min = self.policy.initial_k_without_verifier
+        self.k_max = self.policy.max_k
+
+    def adjust_max_k_for_queue_load(self, queue_load: float) -> None:
+        """Adjust max_k based on queue pressure.
+
+        When the job queue is busy, lower max compute to improve throughput.
+        Most jobs can early-exit at k=1 or k=2, so lowering max_k for
+        high-load periods doesn't hurt reliability for easy problems.
+
+        Queue load thresholds:
+          < 0.5  -> max_k = policy.max_k (full budget)
+          0.5-0.8 -> max_k = 4 (moderate reduction)
+          > 0.8  -> max_k = 2 (minimal, unless verifier required)
+
+        For code/math tasks with a verifier, a single verified answer is
+        better than six self-consistent guesses, so this reduction is safe.
+
+        Args:
+            queue_load: fraction of queue capacity in use (0.0 to 1.0).
+        """
+        original_max = self.policy.max_k
+        if queue_load > 0.8:
+            self.policy.max_k = min(2, original_max)
+        elif queue_load > 0.5:
+            self.policy.max_k = min(4, original_max)
+        else:
+            self.policy.max_k = original_max
+        self.k_max = self.policy.max_k
+        if self.policy.max_k != original_max:
+            print(f"[CLR] Queue load {queue_load:.0%}: max_k adjusted "
+                  f"{original_max} -> {self.policy.max_k}")
 
     # ------------------------------------------------------------------ #
     # Low-level async model call
@@ -290,17 +370,21 @@ rather than silently proceeding with an empty string."""
         except ValueError:
             return None
 
-    def _check_answer_deterministic(self, answer: str, trajectories: List[Dict]) -> Optional[bool]:
-        """Deterministically check if an answer is consistent across trajectories.
+    def _check_answer_consistency(self, answer: str, trajectories: List[Dict]) -> Optional[bool]:
+        """Check if an answer is consistent across trajectories.
 
-        For math problems, if multiple trajectories produced the same numeric
-        answer extracted from \\boxed{}, that's a strong correctness signal that
-        doesn't depend on self-verification.
+        This is NOT deterministic verification. It is cross-trajectory
+        consistency — the model agreeing with itself. Consensus is not
+        proof of correctness. This signal can adjust the score WITHIN
+        the self-claims-only cap (0.65) but can NEVER exceed it.
+
+        Only an external deterministic verifier (MathVerifier,
+        CodeVerifier, FactualVerifier) can produce scores above 0.65.
 
         Returns:
-          True  — answer is consistent across multiple trajectories (boost)
-          False — answer contradicts other trajectories (penalty)
-          None  — cannot determine (no deterministic check possible)
+          True  — answer is consistent across multiple trajectories
+          False — answer contradicts other trajectories
+          None  — cannot determine (not enough data)
         """
         boxed_answers = []
         for t in trajectories:
@@ -348,7 +432,7 @@ rather than silently proceeding with an empty string."""
         verdicts: List[int],
         claims: Optional[List[str]] = None,
         answer_present: bool = False,
-        deterministic_check: Optional[bool] = None,
+        consistency_check: Optional[bool] = None,
     ) -> float:
         """Calculate a reliability score for a trajectory.
 
@@ -358,8 +442,8 @@ rather than silently proceeding with an empty string."""
           - Fewer than MIN_CLAIMS_FOR_SCORING meaningful claims -> 0.0
           - Any unverified claim (verdict 0) heavily penalizes the score
           - Self-claims-only confidence is HARD CAPPED at 0.65
-          - Deterministic verifier passes -> eligible above 0.65
-          - Deterministic verifier fails -> score 0.0
+          - Cross-trajectory consistency gives a small boost WITHIN the cap
+          - Only an external verifier can exceed 0.65
 
         The raw claim-level score (mean^5 over meaningful claims) is passed
         through :func:`compute_confidence` which enforces the self-claims-only
@@ -369,7 +453,10 @@ rather than silently proceeding with an empty string."""
             verdicts: list of 0/1 verdicts from the verifier.
             claims: optional list of claim strings, used to filter garbage.
             answer_present: whether the trajectory produced a final answer.
-            deterministic_check: result of deterministic cross-trajectory check.
+            consistency_check: result of cross-trajectory consistency check.
+                This is NOT deterministic verification — it is the model
+                agreeing with itself. It can adjust the score within the
+                0.65 cap but can NEVER exceed it.
         """
         if not verdicts:
             return 0.0
@@ -395,27 +482,26 @@ rather than silently proceeding with an empty string."""
             mean = sum(verdicts) / len(verdicts)
             base = mean ** 5
 
-        # Convert deterministic_check (bool|None) to a numeric verification
-        # score for compute_confidence: 1.0 (confirmed), 0.0 (refuted),
-        # None (no verifier run).
-        det_verification: Optional[float] = None
-        if deterministic_check is True:
-            det_verification = 1.0
-        elif deterministic_check is False:
-            det_verification = 0.0
+        # Cross-trajectory consistency is NOT deterministic verification.
+        # It is the model agreeing with itself — consensus is not proof.
+        # Consistency gives a small boost within the 0.65 cap:
+        #   - Agree: +0.05 (capped at 0.65)
+        #   - Disagree: * 0.75 (penalty)
+        # It NEVER sets det_verification or verification_method to anything
+        # that would bypass the self-claims-only cap.
+        if consistency_check is True:
+            base = min(base + 0.05, 0.65)
+        elif consistency_check is False:
+            base *= 0.75
 
-        verification_method = (
-            "deterministic_check" if det_verification is not None
-            else "self_claims_only"
-        )
-
-        # Route through compute_confidence to enforce the self-claims-only cap.
-        # This is the trust model: self-agreement alone can never exceed 0.65.
+        # Always route through compute_confidence as self_claims_only.
+        # The cap is enforced here. Only external verifiers (handled in
+        # run() after this method returns) can exceed 0.65.
         confidence = compute_confidence(
             model_score=base,
             claim_consistency=base,
-            deterministic_verification=det_verification,
-            verification_method=verification_method,
+            deterministic_verification=None,
+            verification_method="self_claims_only",
         )
         return confidence.final_score
 
@@ -425,7 +511,11 @@ rather than silently proceeding with an empty string."""
     async def _generate_one_trajectory(
         self, session: aiohttp.ClientSession, problem: str, max_tokens: int
     ) -> Dict:
-        """Generate + score one full trajectory."""
+        """Generate + score one full trajectory.
+
+        This does the full CLR pipeline: reasoning → claim extraction →
+        claim verification → scoring. It is the expensive path (7 LLM calls).
+        """
         reasoning_prompt = (
             "<|im_start|>user\n"
             f"{problem}\n\n"
@@ -439,7 +529,7 @@ rather than silently proceeding with an empty string."""
 
         parsed = await self._extract_claims_and_answer(session, raw_trace)
         verdicts = await self._verify_claims(session, parsed["claims"])
-        # Initial score without deterministic check (applied later in run())
+        # Initial score without consistency check (applied later in run())
         score = self._calculate_reliability(
             verdicts,
             claims=parsed["claims"],
@@ -453,6 +543,44 @@ rather than silently proceeding with an empty string."""
             "verdicts": verdicts,
             "raw_trace": raw_trace,
             "answer_present": parsed["final_answer"] is not None,
+        }
+
+    async def _generate_lightweight_trajectory(
+        self, session: aiohttp.ClientSession, problem: str, max_tokens: int
+    ) -> Dict:
+        """Generate a trajectory with reasoning + answer extraction only.
+
+        Skips claim extraction and claim verification (saves 6 LLM calls).
+        Used in the fast path when a deterministic verifier can check the
+        final answer directly — no need for expensive self-verification
+        if an external verifier will confirm or refute.
+
+        The claims/verdicts fields are empty. If the verifier doesn't
+        confirm, the caller should re-run with full trajectory generation
+        to get self-claim scores.
+        """
+        reasoning_prompt = (
+            "<|im_start|>user\n"
+            f"{problem}\n\n"
+            "Solve this step by step. Think carefully and put your final "
+            "answer in \\boxed{}.\n"
+            "<|im_end|>\n<|im_start|>assistant\n"
+        )
+        raw_trace = await self._call_model(
+            session, reasoning_prompt, max_tokens=max_tokens
+        )
+
+        # Extract just the final answer (no LLM call — regex only)
+        final_answer = self._extract_boxed_answer(raw_trace)
+
+        return {
+            "score": 0.0,  # Not scored yet — caller scores after verification
+            "answer": final_answer,
+            "claims": [],
+            "verdicts": [],
+            "raw_trace": raw_trace,
+            "answer_present": final_answer is not None,
+            "lightweight": True,
         }
 
     # ------------------------------------------------------------------ #
@@ -514,22 +642,56 @@ rather than silently proceeding with an empty string."""
         task_type: str,
         verifier_context: Optional[Dict[str, Any]],
     ) -> CLRResult:
-        """Adaptive compute: phased trajectory generation with early exit."""
-        k_initial = self.k_min
-        k_total = self.k_max
+        """Adaptive compute: phased trajectory generation with early exit.
+
+        Trust model (NON-NEGOTIABLE):
+          - Self-consensus NEVER exceeds 0.65 (self_claim_cap)
+          - Only external verifier success can exceed 0.65
+          - Consensus saves compute, it does NOT raise trust
+          - High-risk tasks cannot early-exit from self-consensus alone
+
+        Phases:
+          Phase 1: k=1 if verifier, k=2 if no verifier
+            - If verifier: lightweight trajectory (answer only) + verify
+            - If no verifier: full trajectories + consensus check
+          Phase 2: consensus early exit (capped at 0.65, no high-risk)
+          Phase 3: branch up to max_k on disagreement/uncertainty
+        """
+        policy = self.policy
+        is_high_risk = task_type in HIGH_RISK_TASK_TYPES
+
+        # Determine initial k
+        if verifier is not None:
+            k_initial = policy.initial_k_with_verifier
+        else:
+            k_initial = policy.initial_k_without_verifier
+        k_total = policy.max_k
+
         print(
-            f"Running adaptive CLR: k_min={k_initial}, k_max={k_total} "
-            f"(max_concurrent={self.max_concurrent})..."
+            f"Running adaptive CLR: k_initial={k_initial}, k_max={k_total} "
+            f"(max_concurrent={self.max_concurrent}, "
+            f"verifier={'yes' if verifier else 'no'}, "
+            f"high_risk={is_high_risk})..."
         )
 
         all_trajectories: List[Any] = []
         all_failures: List[Exception] = []
+        early_exit_reason: Optional[str] = None
+        branch_reason: Optional[str] = None
 
         async with aiohttp.ClientSession() as session:
             # === Phase 1: Fast Path ===
-            print(f"[CLR] Phase 1: generating {k_initial} trajectories...")
+            # If a verifier exists, use lightweight generation (answer only)
+            # and verify immediately. This saves 6 LLM calls per trajectory.
+            use_lightweight = verifier is not None
+            gen_method = (
+                self._generate_lightweight_trajectory if use_lightweight
+                else self._generate_one_trajectory
+            )
+            print(f"[CLR] Phase 1: generating {k_initial} trajectories "
+                  f"({'lightweight' if use_lightweight else 'full'})...")
             tasks = [
-                self._generate_one_trajectory(session, problem, max_tokens_per_trace)
+                gen_method(session, problem, max_tokens_per_trace)
                 for _ in range(k_initial)
             ]
             phase1_results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -546,55 +708,96 @@ rather than silently proceeding with an empty string."""
                     f"{all_failures[0]}"
                 )
 
-            # Score the phase 1 trajectories
-            answered = self._score_trajectories(all_trajectories)
+            # Get answered trajectories
+            valid = [t for t in all_trajectories if isinstance(t, dict)]
+            answered = [t for t in valid if t.get("answer_present") and t.get("answer")]
             if not answered:
                 return self._build_no_answer_result(
-                    all_trajectories, all_failures, k_initial,
+                    all_trajectories, all_failures, k_total,
+                    adaptive=True, max_trajectories=k_total,
                 )
 
-            best = max(answered, key=lambda x: x["score"])
+            best = max(answered, key=lambda x: x.get("score", 0.0))
 
             # Early exit: verifier confirms the answer
             verifier_refuted = False
+            verifier_unsupported = False
             if verifier is not None:
                 v_result = await self._try_verifier(
-                    verifier, problem, best["answer"], verifier_context, best_score=best["score"],
+                    verifier, problem, best["answer"], verifier_context,
+                    best_score=0.65,  # cap for self-claims baseline
                 )
                 if v_result and v_result[2]:  # verified=True
                     print(f"[CLR] Phase 1 early exit: verifier confirmed answer")
+                    early_exit_reason = "deterministic_verifier_passed"
                     return self._build_final_result(
                         best, all_trajectories, all_failures,
                         k_used=len(all_trajectories),
+                        max_k=k_total,
                         verification_method=v_result[0],
                         verified=v_result[2],
                         det_verification=v_result[1],
                         final_score_override=v_result[3],
+                        adaptive=True,
+                        early_exit_reason=early_exit_reason,
+                        verification_status="verified",
                     )
                 if v_result and not v_result[2]:
-                    verifier_refuted = True
+                    if v_result[1] is not None and v_result[1] <= 0.0:
+                        verifier_refuted = True
+                    else:
+                        verifier_unsupported = True
 
             # === Phase 2: Consensus Check ===
-            # Skip consensus if the verifier already refuted — the answer
-            # is wrong even if trajectories agree. We need more trajectories
-            # to find a correct answer.
-            # If trajectories agree and self-verify well, no need to branch.
-            # More trajectories won't raise the score above 0.65 without
-            # a verifier, so spending the compute is pointless.
-            if not verifier_refuted and self._check_consensus(answered):
-                print(f"[CLR] Phase 2 early exit: trajectories agree (consensus)")
-                return self._build_final_result(
-                    best, all_trajectories, all_failures,
-                    k_used=len(all_trajectories),
-                )
+            # Only for non-high-risk tasks, and only when verifier didn't refute.
+            # Consensus saves compute but does NOT raise trust above 0.65.
+            can_consensus_exit = (
+                not verifier_refuted
+                and policy.early_exit_on_self_consensus
+                and not (is_high_risk and policy.disable_self_consensus_for_high_risk)
+            )
+            if can_consensus_exit and len(answered) >= 2:
+                # Need full trajectories for consensus scoring
+                # If we used lightweight trajectories, we need to check
+                # answer agreement via boxed extraction only
+                agreement = self._check_answer_agreement(answered)
+                if agreement:
+                    print(f"[CLR] Phase 2 early exit: self-consensus "
+                          f"(score capped at {policy.self_claim_cap})")
+                    early_exit_reason = "self_consensus_cap_reached"
+                    # Score is capped at 0.65 — consensus does NOT raise trust
+                    final_score = min(
+                        best.get("score", 0.0), policy.self_claim_cap,
+                    )
+                    return self._build_final_result(
+                        best, all_trajectories, all_failures,
+                        k_used=len(all_trajectories),
+                        max_k=k_total,
+                        final_score_override=final_score,
+                        adaptive=True,
+                        early_exit_reason=early_exit_reason,
+                        agreement=True,
+                        verification_status="self_only",
+                    )
 
             # === Phase 3: Branching (System 2) ===
+            if verifier_refuted:
+                branch_reason = "verifier_refuted"
+            elif verifier_unsupported and len(answered) < 2:
+                branch_reason = "insufficient_trajectories"
+            elif not can_consensus_exit and is_high_risk:
+                branch_reason = "high_risk_no_verifier"
+            else:
+                branch_reason = "disagreement_or_uncertainty"
+
             remaining = k_total - len(all_trajectories)
             if remaining > 0:
                 print(
-                    f"[CLR] Phase 3: uncertainty detected — "
+                    f"[CLR] Phase 3: {branch_reason} — "
                     f"generating {remaining} more trajectories..."
                 )
+                # In phase 3, always use full trajectory generation
+                # (we need claim scores for final ranking)
                 tasks = [
                     self._generate_one_trajectory(session, problem, max_tokens_per_trace)
                     for _ in range(remaining)
@@ -611,6 +814,8 @@ rather than silently proceeding with an empty string."""
         if not answered:
             return self._build_no_answer_result(
                 all_trajectories, all_failures, k_total,
+                adaptive=True, max_trajectories=k_total,
+                branch_reason=branch_reason,
             )
 
         best = max(answered, key=lambda x: x["score"])
@@ -620,15 +825,28 @@ rather than silently proceeding with an empty string."""
         verified = False
         det_verification: Optional[float] = None
         final_score = best["score"]
+        verification_status = "self_only"
 
         if verifier is not None:
             v_result = await self._try_verifier(
-                verifier, problem, best["answer"], verifier_context, best_score=best["score"],
+                verifier, problem, best["answer"], verifier_context,
+                best_score=best["score"],
             )
             if v_result:
                 verification_method, det_verification, verified, final_score = v_result
                 if final_score is None:
                     final_score = best["score"]
+                if verified:
+                    verification_status = "verified"
+                elif det_verification is not None and det_verification <= 0.0:
+                    verification_status = "refuted"
+                    final_score = 0.0
+                else:
+                    verification_status = "unsupported"
+
+        # Enforce the self-claims-only cap
+        if not verified:
+            final_score = min(final_score, policy.self_claim_cap)
 
         result = CLRResult(
             best_answer=best["answer"],
@@ -641,12 +859,20 @@ rather than silently proceeding with an empty string."""
             verification_method=verification_method,
             verified=verified,
             deterministic_verification=det_verification,
+            adaptive=True,
+            trajectories_used=len([t for t in all_trajectories if isinstance(t, dict)]),
+            max_trajectories=k_total,
+            early_exit_reason=early_exit_reason,
+            branch_reason=branch_reason,
+            agreement=self._check_answer_agreement(answered) if len(answered) >= 2 else None,
+            verification_status=verification_status,
         )
 
         print(f"\nBest trajectory score: {final_score:.4f}")
         print(f"Best answer: {result.best_answer}")
-        print(f"Verification: {verification_method} (verified={verified})")
-        print(f"Compute used: {len(all_trajectories)} trajectories "
+        print(f"Verification: {verification_method} (verified={verified}, "
+              f"status={verification_status})")
+        print(f"Compute used: {result.trajectories_used} trajectories "
               f"(of max {k_total})")
         return result
 
@@ -696,6 +922,10 @@ rather than silently proceeding with an empty string."""
                 all_trajectories=[],
                 k=self.k,
                 failure_reason="no trajectories produced",
+                adaptive=False,
+                trajectories_used=0,
+                max_trajectories=self.k,
+                verification_status="error",
             )
 
         answered = self._score_trajectories(valid_trajectories)
@@ -708,6 +938,10 @@ rather than silently proceeding with an empty string."""
                 k=self.k,
                 transport_failures=len(failures),
                 partial_failure=partial_failure,
+                adaptive=False,
+                trajectories_used=len(valid_trajectories),
+                max_trajectories=self.k,
+                verification_status="error",
             )
 
         best = max(answered, key=lambda x: x["score"])
@@ -717,6 +951,7 @@ rather than silently proceeding with an empty string."""
         verified = False
         det_verification: Optional[float] = None
         final_score = best["score"]
+        verification_status = "self_only"
 
         if verifier is not None:
             v_result = await self._try_verifier(
@@ -726,6 +961,17 @@ rather than silently proceeding with an empty string."""
                 verification_method, det_verification, verified, final_score = v_result
                 if final_score is None:
                     final_score = best["score"]
+                if verified:
+                    verification_status = "verified"
+                elif det_verification is not None and det_verification <= 0.0:
+                    verification_status = "refuted"
+                    final_score = 0.0
+                else:
+                    verification_status = "unsupported"
+
+        # Enforce self-claims-only cap
+        if not verified:
+            final_score = min(final_score, self.policy.self_claim_cap)
 
         result = CLRResult(
             best_answer=best["answer"],
@@ -738,18 +984,27 @@ rather than silently proceeding with an empty string."""
             verification_method=verification_method,
             verified=verified,
             deterministic_verification=det_verification,
+            adaptive=False,
+            trajectories_used=len(valid_trajectories),
+            max_trajectories=self.k,
+            verification_status=verification_status,
         )
 
         print(f"\nBest trajectory score: {final_score:.4f}")
         print(f"Best answer: {result.best_answer}")
-        print(f"Verification: {verification_method} (verified={verified})")
+        print(f"Verification: {verification_method} (verified={verified}, "
+              f"status={verification_status})")
         return result
 
     def _score_trajectories(self, trajectories: List[Any]) -> List[Dict]:
         """Score valid trajectories and return those with answers.
 
-        Applies deterministic cross-trajectory checking and contradiction
+        Applies cross-trajectory consistency checking and contradiction
         penalties. Returns only trajectories that produced a final answer.
+
+        Consistency is NOT deterministic verification — it is the model
+        agreeing with itself. It can adjust the score within the 0.65 cap
+        but can NEVER exceed it.
         """
         valid = [t for t in trajectories if isinstance(t, dict)]
         answered = [t for t in valid if t.get("answer_present") and t.get("answer")]
@@ -757,16 +1012,17 @@ rather than silently proceeding with an empty string."""
             return []
 
         for t in answered:
-            det_check = self._check_answer_deterministic(t["answer"], valid)
-            t["deterministic_check"] = det_check
+            consistency = self._check_answer_consistency(t["answer"], valid)
+            t["consistency_check"] = consistency
             t["score"] = self._calculate_reliability(
                 t["verdicts"],
                 claims=t["claims"],
                 answer_present=True,
-                deterministic_check=det_check,
+                consistency_check=consistency,
             )
 
-        # Contradiction penalty
+        # Contradiction penalty: if different trajectories produced different
+        # answers, lower confidence in all of them.
         unique_answers = set()
         for t in answered:
             boxed = self._extract_boxed_answer(t.get("raw_trace", ""))
@@ -774,8 +1030,9 @@ rather than silently proceeding with an empty string."""
                 unique_answers.add(boxed.lower().strip())
         if len(unique_answers) > 1:
             for t in answered:
-                t["score"] *= 0.7
-            print(f"[CLR] {len(unique_answers)} distinct answers detected — applying contradiction penalty")
+                t["score"] *= self.policy.contradiction_penalty
+            print(f"[CLR] {len(unique_answers)} distinct answers detected — "
+                  f"applying contradiction penalty ({self.policy.contradiction_penalty})")
 
         return answered
 
@@ -793,6 +1050,26 @@ rather than silently proceeding with an empty string."""
         if len(answered) < 2:
             return False  # Need at least 2 to check consensus
 
+        if not self._check_answer_agreement(answered):
+            return False
+
+        best_score = max(t.get("score", 0.0) for t in answered)
+        if best_score >= 0.3:
+            print(f"[CLR] Consensus: all trajectories agree "
+                  f"(score={best_score:.3f})")
+            return True
+
+        return False
+
+    def _check_answer_agreement(self, answered: List[Dict]) -> bool:
+        """Check if all answered trajectories produced the same boxed answer.
+
+        This is cross-trajectory consistency — NOT deterministic verification.
+        The model agreeing with itself is not proof of correctness.
+        """
+        if len(answered) < 2:
+            return False
+
         boxed_answers = []
         for t in answered:
             extracted = self._extract_boxed_answer(t.get("raw_trace", ""))
@@ -800,17 +1077,9 @@ rather than silently proceeding with an empty string."""
                 boxed_answers.append(extracted.lower().strip())
 
         if len(boxed_answers) < 2:
-            return False  # Not enough boxed answers to compare
+            return False
 
-        # All answers agree
-        if len(set(boxed_answers)) == 1:
-            best_score = max(t["score"] for t in answered)
-            if best_score >= 0.3:
-                print(f"[CLR] Consensus: all {len(boxed_answers)} trajectories agree "
-                      f"(score={best_score:.3f})")
-                return True
-
-        return False
+        return len(set(boxed_answers)) == 1
 
     async def _try_verifier(
         self,
@@ -825,6 +1094,12 @@ rather than silently proceeding with an empty string."""
         Returns None if the verifier raises an exception.
         final_score is None if the verifier didn't verify (caller uses
         best["score"] as default).
+
+        det_score semantics:
+          - verified=True: det_score = v_result.score (the verifier's confidence)
+          - verified=False, v_result.score == 0.0: refuted (det_score = 0.0)
+          - verified=False, v_result.score > 0.0: unsupported (det_score = None)
+            This preserves the self-claim score instead of zeroing it.
         """
         try:
             v_result = await verifier.verify(
@@ -832,10 +1107,19 @@ rather than silently proceeding with an empty string."""
                 context=verifier_context or {},
             )
             verification_method = getattr(verifier, "name", "verifier")
-            det_verification = v_result.score if v_result.verified else 0.0
             verified = v_result.verified
             print(f"[CLR] Verifier {verification_method}: "
                   f"verified={verified}, score={v_result.score:.3f}")
+
+            if verified:
+                det_verification = v_result.score
+            elif v_result.score <= 0.0:
+                # Explicit refutation
+                det_verification = 0.0
+            else:
+                # Unsupported — verifier couldn't verify but didn't refute.
+                # det_verification = None so caller keeps self-claim score.
+                det_verification = None
 
             final_score = None
             if verified:
@@ -847,9 +1131,10 @@ rather than silently proceeding with an empty string."""
                     verification_method=verification_method,
                 )
                 final_score = confidence.final_score
-            else:
-                if v_result.score <= 0.0 and v_result.error:
-                    final_score = 0.0
+            elif det_verification == 0.0 and v_result.error:
+                # Explicit refutation -> zero the score
+                final_score = 0.0
+            # else: unsupported -> final_score stays None, caller uses best["score"]
 
             return (verification_method, det_verification, verified, final_score)
         except Exception as e:
@@ -862,14 +1147,23 @@ rather than silently proceeding with an empty string."""
         all_trajectories: List[Any],
         all_failures: List[Exception],
         k_used: int,
+        max_k: int = 0,
         verification_method: str = "self_claims_only",
         verified: bool = False,
         det_verification: Optional[float] = None,
         final_score_override: Optional[float] = None,
+        adaptive: bool = False,
+        early_exit_reason: Optional[str] = None,
+        agreement: Optional[bool] = None,
+        verification_status: str = "self_only",
     ) -> CLRResult:
         """Build a CLRResult from the best trajectory."""
         final_score = final_score_override if final_score_override is not None else best["score"]
         valid = [t for t in all_trajectories if isinstance(t, dict)]
+
+        # Enforce self-claims-only cap
+        if not verified:
+            final_score = min(final_score, self.policy.self_claim_cap)
 
         result = CLRResult(
             best_answer=best["answer"],
@@ -882,12 +1176,19 @@ rather than silently proceeding with an empty string."""
             verification_method=verification_method,
             verified=verified,
             deterministic_verification=det_verification,
+            adaptive=adaptive,
+            trajectories_used=len(valid),
+            max_trajectories=max_k or k_used,
+            early_exit_reason=early_exit_reason,
+            agreement=agreement,
+            verification_status=verification_status,
         )
 
         print(f"\nBest trajectory score: {final_score:.4f}")
         print(f"Best answer: {result.best_answer}")
-        print(f"Verification: {verification_method} (verified={verified})")
-        print(f"Compute used: {len(valid)} trajectories (of max {k_used})")
+        print(f"Verification: {verification_method} (verified={verified}, "
+              f"status={verification_status})")
+        print(f"Compute used: {len(valid)} trajectories (of max {max_k or k_used})")
         return result
 
     def _build_no_answer_result(
@@ -895,6 +1196,9 @@ rather than silently proceeding with an empty string."""
         all_trajectories: List[Any],
         all_failures: List[Exception],
         k_used: int,
+        adaptive: bool = False,
+        max_trajectories: int = 0,
+        branch_reason: Optional[str] = None,
     ) -> CLRResult:
         """Build a CLRResult when no trajectories produced an answer."""
         valid = [t for t in all_trajectories if isinstance(t, dict)]
@@ -906,6 +1210,11 @@ rather than silently proceeding with an empty string."""
             k=k_used,
             transport_failures=len(all_failures),
             partial_failure=len(all_failures) > 0,
+            adaptive=adaptive,
+            trajectories_used=len(valid),
+            max_trajectories=max_trajectories or k_used,
+            branch_reason=branch_reason,
+            verification_status="error",
         )
 
 
