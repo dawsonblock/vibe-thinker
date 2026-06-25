@@ -367,9 +367,9 @@ async def test_queue_cancel():
     check(ok is True, "cancel returns True for pending job")
     check(q.status(j2.job_id) == JobStatus.CANCELLED, "j2 status is CANCELLED")
 
-    # Cancel non-pending -> False
+    # Cancel running job -> True (now supported via cooperative cancellation)
     ok2 = q.cancel(j1.job_id)
-    check(ok2 is False, "cancel returns False for running job")
+    check(ok2 is True, "cancel returns True for running job (cooperative)")
 
     # Cancel unknown -> False
     check(q.cancel("nonexistent") is False, "cancel returns False for unknown job")
@@ -378,7 +378,13 @@ async def test_queue_cancel():
     hist = q.job_history(j2.job_id)
     check(any(e["event"] == "cancelled" for e in hist), "log has 'cancelled' event")
 
-    await q.wait_for(j1.job_id, timeout=5)
+    # j1 was cancelled, so wait_for should raise RuntimeError
+    try:
+        await q.wait_for(j1.job_id, timeout=5)
+        check(False, "wait_for on cancelled job should raise")
+    except RuntimeError:
+        check(True, "wait_for on cancelled job raises RuntimeError")
+
     await q.stop()
     os.unlink(tmp)
 

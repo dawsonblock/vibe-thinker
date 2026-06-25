@@ -165,6 +165,66 @@ class TestMalformedLines:
         assert entries[1]["event"] == "completed"
 
 
+class TestHashChain:
+    def test_chain_integrity_valid(self, log):
+        for evt in ["submitted", "started", "completed"]:
+            log.record(FakeJob(), evt,
+                       valid_time=f"2026-01-01T00:00:0{evt[0]}+00:00",
+                       transaction_time=f"2026-01-01T00:00:0{evt[0]}+00:00")
+        ok, errors = log.verify_chain()
+        assert ok, f"Chain should be valid: {errors}"
+
+    def test_chain_detects_tampering(self, log_path):
+        log = BiTemporalAuditLog(log_path)
+        log.record(FakeJob(), "submitted",
+                   valid_time="2026-01-01T00:00:00+00:00",
+                   transaction_time="2026-01-01T00:00:01+00:00")
+        log.record(FakeJob(), "completed",
+                   valid_time="2026-01-01T00:00:05+00:00",
+                   transaction_time="2026-01-01T00:00:06+00:00")
+        # Tamper with the first line
+        with open(log_path, "r") as f:
+            lines = f.readlines()
+        import json as _json
+        entry = _json.loads(lines[0])
+        entry["status"] = "tampered"
+        lines[0] = _json.dumps(entry) + "\n"
+        with open(log_path, "w") as f:
+            f.writelines(lines)
+        log2 = BiTemporalAuditLog(log_path)
+        ok, errors = log2.verify_chain()
+        assert not ok
+        assert any("record_hash mismatch" in e for e in errors)
+
+    def test_sequence_numbers_monotonic(self, log):
+        for i in range(5):
+            log.record(FakeJob(), "submitted",
+                       valid_time=f"2026-01-01T00:00:0{i}+00:00",
+                       transaction_time=f"2026-01-01T00:00:0{i}+00:00")
+        entries = log.read_all()
+        seqs = [e["sequence_number"] for e in entries]
+        assert seqs == [1, 2, 3, 4, 5]
+
+    def test_schema_version_present(self, log):
+        log.record(FakeJob(), "submitted",
+                   valid_time="2026-01-01T00:00:00+00:00",
+                   transaction_time="2026-01-01T00:00:01+00:00")
+        entry = log.read_all()[0]
+        assert "schema_version" in entry
+        assert entry["schema_version"] == 2
+
+    def test_previous_hash_links_entries(self, log):
+        log.record(FakeJob(), "submitted",
+                   valid_time="2026-01-01T00:00:00+00:00",
+                   transaction_time="2026-01-01T00:00:01+00:00")
+        log.record(FakeJob(), "completed",
+                   valid_time="2026-01-01T00:00:05+00:00",
+                   transaction_time="2026-01-01T00:00:06+00:00")
+        entries = log.read_all()
+        assert entries[0]["previous_hash"] is None
+        assert entries[1]["previous_hash"] == entries[0]["record_hash"]
+
+
 class TestMigration:
     def test_migration_roundtrip(self, log_path):
         legacy = tempfile.mktemp(suffix=".jsonl")

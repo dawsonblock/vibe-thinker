@@ -300,7 +300,23 @@ class CLRResultCache:
         best_score: float,
         k: int,
         trajectory_count: int,
+        verified: bool = False,
+        verification_method: str = "self_claims",
+        claim_count: int = 0,
+        answer_present: bool = True,
+        deterministic_check: Optional[bool] = None,
+        failure: Optional[str] = None,
     ) -> None:
+        """Insert a CLR result into the semantic cache.
+
+        Enriched entry format (per audit requirements):
+          - verified: whether the answer was independently verified
+          - verification_method: how it was verified (self_claims, python_eval, etc.)
+          - claim_count: number of meaningful claims that were scored
+          - answer_present: whether a final answer was produced
+          - deterministic_check: result of cross-trajectory deterministic check
+          - failure: None if successful, error description if failed
+        """
         embedding = self.model.encode([problem])[0].tolist()
         entry = {
             "problem": problem,
@@ -310,6 +326,12 @@ class CLRResultCache:
             "k": int(k),
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "trajectory_count": int(trajectory_count),
+            "verified": verified,
+            "verification_method": verification_method,
+            "claim_count": int(claim_count),
+            "answer_present": answer_present,
+            "deterministic_check": deterministic_check,
+            "failure": failure,
         }
         self.entries.append(entry)
         # Evict oldest low-score entries if over capacity (keep best scores)

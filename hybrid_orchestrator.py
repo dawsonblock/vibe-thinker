@@ -28,6 +28,7 @@ Bug fixes vs. the original walkthrough version:
 
 import asyncio
 import json
+import re
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -274,6 +275,120 @@ class HybridReasoningOrchestrator:
     # ------------------------------------------------------------------ #
     # Routing
     # ------------------------------------------------------------------ #
+    # Task-type keywords for structured routing. Maps task categories to
+    # the tools they typically require for deterministic verification.
+    _TASK_TYPE_KEYWORDS = {
+        "math": {
+            "keywords": {"solve", "calculate", "prove", "find the value", "sum",
+                         "sequence", "series", "integral", "derivative", "probability",
+                         "recurrence", "equation", "matrix", "vector", "theorem",
+                         "geometric", "algebra", "calculus", "combinatorics"},
+            "requires_tools": ["deterministic_check"],
+            "requires_model": True,
+        },
+        "code": {
+            "keywords": {"leetcode", "code", "algorithm", "complexity",
+                         "implement", "function", "debug", "refactor", "program",
+                         "python", "javascript", "rust", "compile"},
+            "requires_tools": ["python_exec", "unit_tests"],
+            "requires_model": True,
+        },
+        "planning": {
+            "keywords": {"plan", "strategy", "roadmap", "design", "architect",
+                         "steps to", "how to", "approach"},
+            "requires_tools": [],
+            "requires_model": True,
+        },
+        "retrieval": {
+            "keywords": {"search", "find information", "look up", "retrieve",
+                         "what does the docs say"},
+            "requires_tools": ["search", "retrieval"],
+            "requires_model": False,
+        },
+        "summarization": {
+            "keywords": {"summarize", "summarise", "tldr", "brief", "overview",
+                         "key points"},
+            "requires_tools": [],
+            "requires_model": True,
+        },
+        "conversation": {
+            "keywords": {"explain", "what is", "who is", "history of", "compare",
+                         "opinion", "describe", "tell me about", "why does"},
+            "requires_tools": [],
+            "requires_model": True,
+        },
+    }
+
+    def _detect_task_type(self, query: str) -> Tuple[str, List[str], bool]:
+        """Detect task type from query keywords.
+
+        Returns (task_type, requires_tools, requires_model).
+        Falls back to ("unknown", [], True) if no match.
+
+        Uses word-boundary matching to avoid false positives (e.g. "summarize"
+        containing "sum" should NOT match the math keyword "sum").
+        """
+        q_lower = query.lower()
+        best_type = "unknown"
+        best_score = 0
+        for task_type, config in self._TASK_TYPE_KEYWORDS.items():
+            score = 0
+            for kw in config["keywords"]:
+                # Use word boundary matching for single words;
+                # substring for multi-word phrases
+                if " " in kw:
+                    if kw in q_lower:
+                        score += 1
+                else:
+                    if re.search(r"\b" + re.escape(kw) + r"\b", q_lower):
+                        score += 1
+            if score > best_score:
+                best_score = score
+                best_type = task_type
+
+        if best_type == "unknown":
+            return "unknown", [], True
+
+        config = self._TASK_TYPE_KEYWORDS[best_type]
+        return best_type, config["requires_tools"], config["requires_model"]
+
+    def route_structured(self, query: str) -> Dict[str, Any]:
+        """Produce a structured routing decision.
+
+        Returns a dict with:
+          - route: specialist | generalist | hybrid
+          - confidence: float 0-1
+          - task_type: math | code | planning | retrieval | summarization | conversation | unknown
+          - requires_tools: list of tool names needed for verification
+          - requires_model: whether a model call is needed
+          - requires_human_review: whether human review is recommended
+          - reason: human-readable explanation
+        """
+        route, confidence = self._classify_route(query)
+        task_type, requires_tools, requires_model = self._detect_task_type(query)
+
+        # Human review recommended for low-confidence routing or unknown task types
+        requires_human_review = confidence < 0.65 or task_type == "unknown"
+
+        reasons = []
+        if self.use_embedding_router:
+            reasons.append(f"embedding router (conf={confidence:.2f})")
+        else:
+            reasons.append("keyword fallback router")
+        reasons.append(f"task_type={task_type}")
+        if requires_tools:
+            reasons.append(f"requires_tools={requires_tools}")
+
+        return {
+            "route": route,
+            "confidence": round(confidence, 4),
+            "task_type": task_type,
+            "requires_tools": requires_tools,
+            "requires_model": requires_model,
+            "requires_human_review": requires_human_review,
+            "reason": ", ".join(reasons),
+        }
+
     def _classify_route(self, query: str) -> Tuple[str, float]:
         if self.use_embedding_router:
             return self.router.classify(query)
@@ -418,14 +533,31 @@ class HybridReasoningOrchestrator:
 
         # Insert into cache ONLY if the result is cacheable
         if self.use_clr_cache and self.clr_cache is not None and self._is_cacheable(clr_result):
+            # Count meaningful claims from the best trajectory
+            best_traj = max(
+                (t for t in clr_result.all_trajectories if isinstance(t, dict)),
+                key=lambda x: x.get("score", 0),
+                default=None,
+            )
+            claim_count = len([c for c in (best_traj or {}).get("claims", [])
+                              if self.reasoner._is_meaningful_claim(c)]) if best_traj else 0
+            det_check = (best_traj or {}).get("deterministic_check")
+
             self.clr_cache.insert(
                 problem=query,
                 best_answer=clr_result.best_answer,
                 best_score=clr_result.best_score,
                 k=clr_result.k,
                 trajectory_count=len(clr_result.all_trajectories),
+                verified=clr_result.best_score > 0,
+                verification_method="self_claims" if clr_result.best_score > 0 else "none",
+                claim_count=claim_count,
+                answer_present=True,
+                deterministic_check=det_check,
+                failure=None,
             )
-            print(f"[CLRCache] Stored result (score={clr_result.best_score:.3f})")
+            print(f"[CLRCache] Stored result (score={clr_result.best_score:.3f}, "
+                  f"claims={claim_count}, det_check={det_check})")
         elif self.use_clr_cache and self.clr_cache is not None:
             print(
                 f"[CLRCache] NOT caching (score={clr_result.best_score:.3f}, "

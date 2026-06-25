@@ -202,9 +202,9 @@ rather than silently proceeding with an empty string."""
     # Scoring
     # ------------------------------------------------------------------ #
     # Minimum number of meaningful claims required for a non-zero score.
-    # A trajectory with fewer claims cannot be considered "reliable" —
-    # verifying one trivial fragment is not enough.
-    MIN_CLAIMS_FOR_SCORING = 3
+    # The audit requires at least 5 meaningful claims — verifying fewer
+    # than that is insufficient to claim "reliability."
+    MIN_CLAIMS_FOR_SCORING = 5
 
     # Claims shorter than this (after stripping) are too trivial to count.
     MIN_CLAIM_LENGTH = 15
@@ -231,23 +231,116 @@ rather than silently proceeding with an empty string."""
             return False
         return True
 
+    # ------------------------------------------------------------------ #
+    # Deterministic answer extraction + comparison
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _extract_boxed_answer(text: str) -> Optional[str]:
+        """Extract the content of \\boxed{...} from a reasoning trace."""
+        # Find the last \boxed{...} in the text (the final answer)
+        matches = re.findall(r"\\boxed\{([^}]*)\}", text)
+        if matches:
+            return matches[-1].strip()
+        return None
+
+    @staticmethod
+    def _normalize_numeric(s: str) -> Optional[float]:
+        """Try to parse a string as a number. Returns None if not numeric."""
+        s = s.strip().replace(",", "").replace(" ", "")
+        # Remove common math formatting: \frac{a}{b} -> a/b
+        s = re.sub(r"\\(?:dfrac|frac|tfrac)\{([^}]+)\}\{([^}]+)\}", r"\1/\2", s)
+        # Handle plain fractions like "7/2" or "1/2"
+        frac_match = re.match(r"^(-?\d+(?:\.\d+)?)/(-?\d+(?:\.\d+)?)$", s)
+        if frac_match:
+            num, den = float(frac_match.group(1)), float(frac_match.group(2))
+            if den != 0:
+                return num / den
+            return None
+        try:
+            return float(s)
+        except ValueError:
+            return None
+
+    def _check_answer_deterministic(self, answer: str, trajectories: List[Dict]) -> Optional[bool]:
+        """Deterministically check if an answer is consistent across trajectories.
+
+        For math problems, if multiple trajectories produced the same numeric
+        answer extracted from \\boxed{}, that's a strong correctness signal that
+        doesn't depend on self-verification.
+
+        Returns:
+          True  — answer is consistent across multiple trajectories (boost)
+          False — answer contradicts other trajectories (penalty)
+          None  — cannot determine (no deterministic check possible)
+        """
+        boxed_answers = []
+        for t in trajectories:
+            if not t.get("answer_present"):
+                continue
+            extracted = self._extract_boxed_answer(t.get("raw_trace", ""))
+            if extracted is not None:
+                boxed_answers.append(extracted)
+
+        if len(boxed_answers) < 2:
+            return None  # Not enough data for deterministic check
+
+        # Normalize and compare
+        target = self._normalize_numeric(answer)
+        if target is None:
+            # Non-numeric answer — check exact string match
+            matching = sum(1 for a in boxed_answers if a.strip().lower() == answer.strip().lower())
+            if matching >= 2:
+                return True
+            contradicting = sum(1 for a in boxed_answers if a.strip().lower() != answer.strip().lower())
+            if contradicting > matching:
+                return False
+            return None
+
+        # Numeric: compare with tolerance
+        matching = 0
+        contradicting = 0
+        for a in boxed_answers:
+            n = self._normalize_numeric(a)
+            if n is None:
+                continue
+            if abs(n - target) < 1e-6:
+                matching += 1
+            else:
+                contradicting += 1
+
+        if matching >= 2:
+            return True
+        if contradicting > matching:
+            return False
+        return None
+
     def _calculate_reliability(
-        self, verdicts: List[int], claims: Optional[List[str]] = None
+        self,
+        verdicts: List[int],
+        claims: Optional[List[str]] = None,
+        answer_present: bool = False,
+        deterministic_check: Optional[bool] = None,
     ) -> float:
         """Calculate a reliability score for a trajectory.
 
         Scoring rules (fail-closed):
           - No verdicts or empty claims -> 0.0
+          - No final answer -> 0.0
           - Fewer than MIN_CLAIMS_FOR_SCORING meaningful claims -> 0.0
           - Any unverified claim (verdict 0) heavily penalizes the score
-          - The score is mean^5 but only over *meaningful* claims, and
-            is further penalized if some claims were filtered as garbage.
+          - Deterministic check contradicts -> score halved
+          - Deterministic check confirms -> score boosted (capped at 1.0)
+          - The score is mean^5 but only over *meaningful* claims
 
         Args:
             verdicts: list of 0/1 verdicts from the verifier.
             claims: optional list of claim strings, used to filter garbage.
+            answer_present: whether the trajectory produced a final answer.
+            deterministic_check: result of deterministic cross-trajectory check.
         """
         if not verdicts:
+            return 0.0
+        if not answer_present:
             return 0.0
 
         # If claims are provided, filter to meaningful ones and their verdicts
@@ -264,10 +357,20 @@ rather than silently proceeding with an empty string."""
         if failed > 0:
             # A trajectory with even one wrong claim cannot be "perfect"
             # Score is proportional to how many claims passed, but capped low
-            return (len(verdicts) - failed) / len(verdicts) * 0.3
+            base = (len(verdicts) - failed) / len(verdicts) * 0.3
+        else:
+            mean = sum(verdicts) / len(verdicts)
+            base = mean ** 5
 
-        mean = sum(verdicts) / len(verdicts)
-        return mean ** 5
+        # Apply deterministic check adjustment
+        if deterministic_check is False:
+            # Answer contradicts other trajectories — halve the score
+            base *= 0.5
+        elif deterministic_check is True:
+            # Answer confirmed by deterministic check — boost, cap at 1.0
+            base = min(base * 1.15, 1.0)
+
+        return base
 
     # ------------------------------------------------------------------ #
     # One full trajectory
@@ -289,7 +392,12 @@ rather than silently proceeding with an empty string."""
 
         parsed = await self._extract_claims_and_answer(session, raw_trace)
         verdicts = await self._verify_claims(session, parsed["claims"])
-        score = self._calculate_reliability(verdicts, claims=parsed["claims"])
+        # Initial score without deterministic check (applied later in run())
+        score = self._calculate_reliability(
+            verdicts,
+            claims=parsed["claims"],
+            answer_present=parsed["final_answer"] is not None,
+        )
 
         return {
             "score": score,
@@ -340,6 +448,33 @@ rather than silently proceeding with an empty string."""
                 all_trajectories=valid_trajectories,
                 k=self.k,
             )
+
+        # Apply deterministic cross-trajectory answer checking.
+        # This is independent of self-verification: if multiple trajectories
+        # produced the same \\boxed{} answer, that's a correctness signal.
+        # If they contradict, the score is penalized.
+        for t in answered:
+            det_check = self._check_answer_deterministic(t["answer"], valid_trajectories)
+            t["deterministic_check"] = det_check
+            t["score"] = self._calculate_reliability(
+                t["verdicts"],
+                claims=t["claims"],
+                answer_present=True,
+                deterministic_check=det_check,
+            )
+
+        # Penalize contradictory trajectories: if different trajectories
+        # produced different answers, lower confidence in all of them.
+        unique_answers = set()
+        for t in answered:
+            boxed = self._extract_boxed_answer(t.get("raw_trace", ""))
+            if boxed is not None:
+                unique_answers.add(boxed.lower().strip())
+        if len(unique_answers) > 1:
+            # Multiple different answers -> contradiction penalty
+            for t in answered:
+                t["score"] *= 0.7
+            print(f"[CLR] {len(unique_answers)} distinct answers detected — applying contradiction penalty")
 
         best = max(answered, key=lambda x: x["score"])
 

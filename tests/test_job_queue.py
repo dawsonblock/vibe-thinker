@@ -78,13 +78,39 @@ class TestLifecycle:
         j1 = q.submit("running", priority=10)
         j2 = q.submit("pending", priority=1)
         await asyncio.sleep(0.05)
+        # Cancel pending job
         assert q.cancel(j2.job_id) is True
         assert q.status(j2.job_id) == JobStatus.CANCELLED
-        # Can't cancel a running job
-        assert q.cancel(j1.job_id) is False
         # Can't cancel unknown
         assert q.cancel("nonexistent") is False
         await q.wait_for(j1.job_id, timeout=5)
+        await q.stop()
+
+    @pytest.mark.asyncio
+    async def test_cancel_running(self, log_path):
+        """Running jobs can now be cooperatively cancelled."""
+        orch = MockOrchestrator(delay=2.0)
+        q = JobQueue(orch, max_concurrent=1, audit_log=log_path)
+        await q.start()
+        j1 = q.submit("long running", priority=10)
+        await asyncio.sleep(0.1)  # let it start
+        assert q.status(j1.job_id) == JobStatus.RUNNING
+        # Cancel the running job
+        assert q.cancel(j1.job_id) is True
+        await asyncio.sleep(0.1)  # let cancellation propagate
+        assert q.status(j1.job_id) == JobStatus.CANCELLED
+        await q.stop()
+
+    @pytest.mark.asyncio
+    async def test_cancel_completed_returns_false(self, log_path):
+        """Can't cancel a job that already completed."""
+        orch = MockOrchestrator(delay=0.01)
+        q = JobQueue(orch, max_concurrent=1, audit_log=log_path)
+        await q.start()
+        j = q.submit("fast", priority=1)
+        await q.wait_for(j.job_id, timeout=5)
+        assert q.status(j.job_id) == JobStatus.COMPLETED
+        assert q.cancel(j.job_id) is False
         await q.stop()
 
     @pytest.mark.asyncio

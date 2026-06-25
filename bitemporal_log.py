@@ -23,35 +23,55 @@ full, replayable history.
 Entry schema (one JSON object per line, JSONL):
 
     {
-      "record_id":      "r_0f1a...",      # stable id for this record
-      "valid_time":     "2026-06-24T...", # real-world event time
-      "transaction_time":"2026-06-24T...",# when written to the log
+      "schema_version":  2,                  # log format version
+      "sequence_number": 42,                 # monotonic per-file sequence
+      "record_id":      "r_0f1a...",         # stable id for this record
+      "previous_hash":  "sha256:abc123...",  # hash of the previous entry
+      "record_hash":    "sha256:def456...",  # hash of this entry's content
+      "valid_time":     "2026-06-24T...",    # real-world event time
+      "transaction_time":"2026-06-24T...",   # when written to the log
       "job_id":         "e165b4a57f65",
-      "event":          "submitted",      # submitted|started|completed|failed|cancelled
-      "status":         "pending",        # resulting status
+      "event":          "submitted",         # submitted|started|completed|failed|cancelled
+      "status":         "pending",           # resulting status
       "query":          "...",
       "priority":       5,
       "force_route":    null,
-      "extra":          { ... },          # route, clr_score, error, etc.
-      "correction_of":  null              # record_id this entry corrects (if any)
+      "extra":          { ... },             # route, clr_score, error, etc.
+      "correction_of":  null                 # record_id this entry corrects (if any)
     }
+
+Integrity: each entry includes a SHA-256 hash of its content and the hash of
+the previous entry, forming a tamper-evident chain. The ``verify_chain()``
+method checks that the chain is intact.
 
 Dependency-free (stdlib only), matching the rest of the project.
 """
 
+import hashlib
 import json
 import os
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+
+SCHEMA_VERSION = 2
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _hash_entry(entry: Dict[str, Any]) -> str:
+    """Compute SHA-256 hash of an entry's content (excluding record_hash itself)."""
+    # Create a copy without record_hash for hashing
+    content = {k: v for k, v in entry.items() if k != "record_hash"}
+    raw = json.dumps(content, sort_keys=True, default=str)
+    return "sha256:" + hashlib.sha256(raw.encode()).hexdigest()
+
+
 class BiTemporalAuditLog:
-    """Append-only bi-temporal JSONL audit log.
+    """Append-only bi-temporal JSONL audit log with hash-chain integrity.
 
     Args:
         path: path to the JSONL file. Created on first write.
@@ -63,6 +83,28 @@ class BiTemporalAuditLog:
     def __init__(self, path: str, clock=None):
         self.path = path
         self._clock = clock
+
+    def _last_entry(self) -> Optional[Dict[str, Any]]:
+        """Read the last entry from the log file (for chain continuation)."""
+        if not os.path.exists(self.path):
+            return None
+        last = None
+        with open(self.path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        last = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+        return last
+
+    def _next_sequence_number(self) -> int:
+        """Get the next sequence number (1-based, monotonic)."""
+        last = self._last_entry()
+        if last is not None and "sequence_number" in last:
+            return int(last["sequence_number"]) + 1
+        return 1
 
     # ----------------------- writing ----------------------- #
     def record(
@@ -89,8 +131,16 @@ class BiTemporalAuditLog:
 
         status = job.status.value if hasattr(job.status, "value") else str(job.status)
 
+        # Get previous hash for chain integrity
+        last = self._last_entry()
+        previous_hash = last.get("record_hash") if last else None
+        seq = self._next_sequence_number()
+
         entry: Dict[str, Any] = {
+            "schema_version": SCHEMA_VERSION,
+            "sequence_number": seq,
             "record_id": "r_" + uuid.uuid4().hex[:16],
+            "previous_hash": previous_hash,
             "valid_time": valid_time,
             "transaction_time": transaction_time,
             "job_id": job.job_id,
@@ -102,12 +152,50 @@ class BiTemporalAuditLog:
             "extra": extra or {},
             "correction_of": correction_of,
         }
+        # Compute and add this entry's hash
+        entry["record_hash"] = _hash_entry(entry)
+
         try:
             with open(self.path, "a") as f:
                 f.write(json.dumps(entry) + "\n")
         except (OSError, TypeError) as e:
             print(f"[BiTemporalLog] write failed: {e}")
         return entry
+
+    # ----------------------- chain verification ----------------------- #
+    def verify_chain(self) -> Tuple[bool, List[str]]:
+        """Verify the integrity of the hash chain.
+
+        Returns (is_valid, list_of_errors). Each error describes a broken link.
+        """
+        entries = self.read_all()
+        errors = []
+        prev_hash = None
+        expected_seq = 1
+
+        for i, entry in enumerate(entries):
+            # Check sequence number
+            seq = entry.get("sequence_number")
+            if seq != expected_seq:
+                errors.append(f"line {i+1}: sequence_number={seq}, expected={expected_seq}")
+            expected_seq += 1
+
+            # Check previous_hash linkage
+            if entry.get("previous_hash") != prev_hash:
+                errors.append(
+                    f"line {i+1}: previous_hash mismatch "
+                    f"(got {entry.get('previous_hash')}, expected {prev_hash})"
+                )
+
+            # Verify record_hash
+            stored_hash = entry.get("record_hash")
+            computed_hash = _hash_entry(entry)
+            if stored_hash != computed_hash:
+                errors.append(f"line {i+1}: record_hash mismatch (tampered content)")
+
+            prev_hash = stored_hash
+
+        return (len(errors) == 0, errors)
 
     # ----------------------- reading ----------------------- #
     @staticmethod
@@ -245,6 +333,15 @@ def migrate_legacy_log(
                 "force_route"}
 
     mode = "w" if overwrite else "a"
+    previous_hash = None
+    seq = 1
+    # If appending, continue from the last entry's hash/seq
+    if mode == "a" and os.path.exists(out_path):
+        last = BiTemporalAuditLog(out_path)._last_entry()
+        if last:
+            previous_hash = last.get("record_hash")
+            seq = int(last.get("sequence_number", 0)) + 1
+
     with open(out_path, mode) as out_f:
         with open(legacy_path, "r") as in_f:
             for line in in_f:
@@ -258,7 +355,10 @@ def migrate_legacy_log(
                 }
                 extra["migrated"] = True
                 entry = {
+                    "schema_version": SCHEMA_VERSION,
+                    "sequence_number": seq,
                     "record_id": "r_" + uuid.uuid4().hex[:16],
+                    "previous_hash": previous_hash,
                     "valid_time": valid_time,
                     "transaction_time": migration_time,
                     "job_id": row["job_id"],
@@ -270,7 +370,10 @@ def migrate_legacy_log(
                     "extra": extra,
                     "correction_of": None,
                 }
+                entry["record_hash"] = _hash_entry(entry)
                 out_f.write(json.dumps(entry) + "\n")
+                previous_hash = entry["record_hash"]
+                seq += 1
                 written += 1
     return written
 
@@ -300,6 +403,9 @@ if __name__ == "__main__":
         "--axis", choices=["valid", "transaction"], default="valid",
     )
 
+    v = sub.add_parser("verify", help="Verify the hash-chain integrity of the log.")
+    v.add_argument("path", help="Bi-temporal log path.")
+
     args = p.parse_args()
     if args.cmd == "migrate":
         n = migrate_legacy_log(args.legacy, args.out, overwrite=args.force)
@@ -312,5 +418,14 @@ if __name__ == "__main__":
         log = BiTemporalAuditLog(args.path)
         for jid, e in log.current_state(axis=args.axis).items():
             print(f"{jid}\t{e['status']}\t{e['event']}\t{e['valid_time']}")
+    elif args.cmd == "verify":
+        log = BiTemporalAuditLog(args.path)
+        ok, errors = log.verify_chain()
+        if ok:
+            print("Chain integrity: OK")
+        else:
+            print(f"Chain integrity: BROKEN ({len(errors)} errors)")
+            for err in errors:
+                print(f"  {err}")
     else:
         p.print_help()

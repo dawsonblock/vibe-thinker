@@ -119,6 +119,7 @@ class JobQueue:
         self._dispatcher_task: Optional[asyncio.Task] = None
         self._wakeup = asyncio.Event()
         self._job_tasks: set = set()  # tracks in-flight job tasks for clean shutdown
+        self._job_task_map: Dict[str, asyncio.Task] = {}  # job_id -> task for cancellation
 
     # ----------------------- audit log ----------------------- #
     def _log(self, job: Job, event: str, extra: Optional[Dict] = None) -> None:
@@ -226,18 +227,35 @@ class JobQueue:
         return job.result
 
     def cancel(self, job_id: str) -> bool:
-        """Cancel a pending job. Running jobs cannot be cancelled here
-        (they'd need cooperative cancellation). Returns True if cancelled."""
+        """Cancel a job. Pending jobs are removed from the queue immediately.
+        Running jobs are cooperatively cancelled via asyncio task cancellation.
+        Returns True if the job was cancelled (or already cancelled)."""
         job = self._jobs.get(job_id)
-        if job is None or job.status != JobStatus.PENDING:
+        if job is None:
             return False
-        if job in self._pending:
-            self._pending.remove(job)
-        job.status = JobStatus.CANCELLED
-        job.finished_at = datetime.now(timezone.utc).isoformat()
-        self._events[job.job_id].set()
-        self._log(job, "cancelled")
-        return True
+        if job.status == JobStatus.CANCELLED:
+            return True  # already cancelled
+        if job.status in (JobStatus.COMPLETED, JobStatus.FAILED):
+            return False  # can't cancel a finished job
+
+        if job.status == JobStatus.PENDING:
+            if job in self._pending:
+                self._pending.remove(job)
+            job.status = JobStatus.CANCELLED
+            job.finished_at = datetime.now(timezone.utc).isoformat()
+            self._events[job.job_id].set()
+            self._log(job, "cancelled")
+            return True
+
+        if job.status == JobStatus.RUNNING:
+            # Cooperatively cancel the running task
+            task = self._job_task_map.get(job_id)
+            if task is not None and not task.done():
+                task.cancel()
+                return True
+            return False
+
+        return False
 
     # ----------------------- dispatcher ----------------------- #
     async def _dispatch_loop(self) -> None:
@@ -253,7 +271,11 @@ class JobQueue:
             # Launch the job, respecting the concurrency limit
             task = asyncio.create_task(self._run_job(job))
             self._job_tasks.add(task)
-            task.add_done_callback(self._job_tasks.discard)
+            self._job_task_map[job.job_id] = task
+            def _cleanup(t, jid=job.job_id):
+                self._job_tasks.discard(t)
+                self._job_task_map.pop(jid, None)
+            task.add_done_callback(_cleanup)
 
     async def _run_job(self, job: Job) -> None:
         async with self._semaphore:
@@ -284,6 +306,12 @@ class JobQueue:
                             await cb
                     except Exception as cb_err:
                         print(f"[JobQueue] callback error for {job.job_id}: {cb_err}")
+            except asyncio.CancelledError:
+                # Cooperative cancellation from cancel()
+                job.error = "cancelled by user"
+                job.status = JobStatus.CANCELLED
+                self._log(job, "cancelled", extra={"reason": "user_cancelled"})
+                raise  # re-raise so the task is properly marked as cancelled
             except Exception as e:
                 job.error = str(e)
                 job.status = JobStatus.FAILED

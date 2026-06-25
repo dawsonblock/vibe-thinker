@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "vibe-thinker"
+version = "0.2.0"
+description = "Hybrid reasoning orchestrator for local LLMs with CLR, job queue, and bi-temporal audit logging"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.10"
+dependencies = [
+    "aiohttp>=3.9,<4",
+]
+
+[project.optional-dependencies]
+embeddings = [
+    "sentence-transformers>=2.2,<3",
+    "scikit-learn>=1.3,<2",
+    "numpy>=1.24,<2",
+]
+test = [
+    "pytest>=7.0,<9",
+    "pytest-asyncio>=0.21,<1",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.setuptools]
+py-modules = [
+    "vibe_clr",
+    "vibe_clr_async",
+    "hybrid_orchestrator",
+    "persistent_cache",
+    "rfsn_job_queue",
+    "bitemporal_log",
+    "rfsn_cli",
+]
