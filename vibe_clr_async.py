@@ -451,6 +451,7 @@ rather than silently proceeding with an empty string."""
         max_tokens_per_trace: int = 16384,
         verifier: Optional[Any] = None,
         task_type: str = "unknown",
+        verifier_context: Optional[Dict[str, Any]] = None,
     ) -> CLRResult:
         """Run CLR with k trajectories.
 
@@ -463,6 +464,9 @@ rather than silently proceeding with an empty string."""
                 the self-claims-only cap of 0.65.
             task_type: the detected task type (math, code, factual, etc.).
                 Used for verification metadata.
+            verifier_context: optional context dict passed to the verifier
+                (expected_answer, unit_tests, sources, etc.). Without this,
+                verifiers cannot verify — they will return verified=False.
         """
         print(
             f"Running async CLR with k={self.k} trajectories "
@@ -571,19 +575,24 @@ rather than silently proceeding with an empty string."""
 
         if verifier is not None:
             try:
-                v_result = await verifier.verify(problem, best["answer"], context={})
+                v_result = await verifier.verify(
+                    problem, best["answer"],
+                    context=verifier_context or {},
+                )
                 verification_method = getattr(verifier, "name", "verifier")
                 det_verification = v_result.score if v_result.verified else 0.0
                 verified = v_result.verified
                 print(f"[CLR] Verifier {verification_method}: "
                       f"verified={verified}, score={v_result.score:.3f}")
                 if verified:
-                    # Recompute final score with deterministic verification
-                    # This CAN exceed 0.65
+                    # Recompute final score with deterministic verification.
+                    # Use the verifier's actual score, not 1.0 — a weak
+                    # verifier (e.g. FactualVerifier overlap=0.7) must not
+                    # be inflated to full verification.
                     confidence = compute_confidence(
                         model_score=best["score"],
                         claim_consistency=best["score"],
-                        deterministic_verification=1.0,
+                        deterministic_verification=v_result.score,
                         verification_method=verification_method,
                     )
                     final_score = confidence.final_score

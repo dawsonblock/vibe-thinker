@@ -96,6 +96,10 @@ def is_cache_entry_trustworthy(
     # that didn't enforce the cap.
     if method == "self_claims_only" and entry.get("best_score", 0.0) > 0.65:
         return False
+    # A label is not verification. If the method claims a deterministic
+    # verifier was used but verified=False, the entry is NOT trustworthy.
+    if method != "self_claims_only" and not entry.get("verified"):
+        return False
     if entry.get("schema_version", 1) < CURRENT_CACHE_SCHEMA_VERSION:
         return False
     return True
@@ -137,6 +141,10 @@ def should_cache(result: Dict[str, Any], allow_weak_cache: bool = False) -> bool
         return False
     method = result.get("verification_method", "self_claims_only")
     if method == "self_claims_only" and not allow_weak_cache:
+        return False
+    # A label is not verification. If the method claims a deterministic
+    # verifier was used but verified=False, the result is NOT cacheable.
+    if method != "self_claims_only" and not result.get("verified"):
         return False
     if result.get("transport_failures", 0) > 0:
         return False

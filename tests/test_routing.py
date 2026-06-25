@@ -168,3 +168,23 @@ class TestRouteClassification:
         if decision["task_type"] == "conversation":
             assert decision["route"] == "generalist"
 
+    def test_recurrence_query_routes_math_specialist(self, orch):
+        """The canonical recurrence query from test_full_stack.py must route
+        to specialist with task_type=math, not hybrid/unknown."""
+        q = "Solve this step by step: a_1=2, a_{n+1}=a_n^2 - a_n + 1. Find a_5."
+        decision = orch.route_structured(q)
+        assert decision["task_type"] == "math", \
+            f"Expected math, got {decision['task_type']}"
+        assert decision["route"] == "specialist", \
+            f"Expected specialist, got {decision['route']}"
+
+    def test_indexed_variable_routes_math(self, orch):
+        """Queries with indexed variable notation should route to math."""
+        decision = orch.route_structured("Given a_1=3, find a_4")
+        assert decision["task_type"] == "math"
+
+    def test_find_a5_routes_math(self, orch):
+        """'find a_5' pattern should trigger math intent."""
+        decision = orch.route_structured("Find a_5 where a_1=1")
+        assert decision["task_type"] == "math"
+

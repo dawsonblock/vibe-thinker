@@ -39,6 +39,7 @@ import aiohttp
 from vibe_clr_async import CLRResult, VibeThinkerCLRAsync
 from persistent_cache import CLRResultCache, PersistentRouteCache, should_cache
 from verifiers import MathVerifier, CodeVerifier, FactualVerifier
+from math_solver import solve as solve_math
 
 
 def select_verifier(task_type: str):
@@ -359,6 +360,19 @@ class HybridReasoningOrchestrator:
         r"\balgebra\b",
         r"\bcalculus\b",
         r"\bcombinatorics\b",
+        # Indexed variable notation: a_1, a_{n+1}, a_n, x_0, etc.
+        r"\ba_\{?\w+\}?\s*=",
+        r"\ba_?\{?\d+\}?\b",
+        r"\bx_?\{?\d+\}?\b",
+        # Recurrence-like notation: a_{n+1}=a_n^2...
+        r"\ba_\{?n\+1\}?\s*=",
+        r"\ba_n\s*[+\-*/^]",
+        # "find a_5" or "find a_{5}"
+        r"\bfind\s+a_?\{?\d+\}?",
+        # "solve this step by step" with numbers — canonical math query shape
+        r"\bsolve this step by step\b.*\d",
+        # Explicit recurrence definition: a_1=... a_{n+1}=...
+        r"\ba_1\s*=\s*\d",
     ]
 
     # Task-type keywords for structured routing. Maps task categories to
@@ -471,6 +485,12 @@ class HybridReasoningOrchestrator:
             if score > best_score:
                 best_score = score
                 best_type = task_type
+
+        # If math intent was detected but no keywords matched, still classify
+        # as math. The intent patterns (indexed variables, recurrence notation,
+        # "solve this step by step" with numbers) ARE the math signal.
+        if best_type == "unknown" and has_math_intent:
+            return "math", ["deterministic_check"], True
 
         if best_type == "unknown":
             return "unknown", [], True
@@ -682,6 +702,39 @@ class HybridReasoningOrchestrator:
             return False
         return True
 
+    def _build_verifier_context(self, query: str, task_type: str) -> Dict[str, Any]:
+        """Derive verifier context from the query.
+
+        This is what makes verifiers actually useful instead of ceremonial.
+        Without context, MathVerifier has no expected_answer, CodeVerifier
+        has no unit_tests, and FactualVerifier has no sources.
+
+        For math: use the deterministic math_solver to derive expected_answer.
+        For code: extract code blocks and test assertions from the query.
+        For factual: no sources available unless caller provides them.
+
+        Do NOT fake context. If we can't derive it deterministically, leave
+        it absent — the verifier will return verified=False, which is honest.
+        """
+        context: Dict[str, Any] = {}
+
+        if task_type == "math":
+            expected = solve_math(query)
+            if expected is not None:
+                context["expected_answer"] = expected
+                print(f"[CLR] Math solver derived expected_answer={expected}")
+
+        elif task_type == "code":
+            # Extract code blocks from the query (```python ... ```)
+            code_blocks = re.findall(r"```(?:python)?\n(.*?)```", query, re.DOTALL)
+            if code_blocks:
+                context["expected_output"] = code_blocks[0].strip()
+
+        # Factual: no sources to derive. The verifier will return
+        # unsupported_factual, which is the honest result.
+
+        return context
+
     async def _run_clr_with_cache(self, query: str) -> Tuple[CLRResult, bool]:
         """Run CLR, but return a cached result if a similar high-score
         problem was solved before. Returns (result, cache_hit).
@@ -720,12 +773,18 @@ class HybridReasoningOrchestrator:
         decision = self.route_structured(query)
         task_type = decision["task_type"]
         verifier = select_verifier(task_type)
+        verifier_context = self._build_verifier_context(query, task_type)
         if verifier is not None:
-            print(f"[CLR] Selected verifier: {verifier.name} (task_type={task_type})")
+            ctx_desc = ", ".join(f"{k}={v!r}" for k, v in verifier_context.items() if v)
+            print(f"[CLR] Selected verifier: {verifier.name} (task_type={task_type})"
+                  f"{f', context: {ctx_desc}' if ctx_desc else ', no derivable context'}")
         else:
             print(f"[CLR] No verifier for task_type={task_type} — self-claims-only cap applies")
 
-        clr_result = await self.reasoner.run(query, verifier=verifier, task_type=task_type)
+        clr_result = await self.reasoner.run(
+            query, verifier=verifier, task_type=task_type,
+            verifier_context=verifier_context,
+        )
 
         # Insert into cache ONLY if the result is cacheable per the strict
         # should_cache policy. Weak self-verification is NOT cached by default.

@@ -87,6 +87,7 @@ class TestShouldCache:
             "answer_present": True,
             "claim_count": 8,
             "verification_method": "deterministic_check",
+            "verified": True,
             "failure": None,
             "transport_failures": 0,
         }
@@ -132,6 +133,16 @@ class TestShouldCache:
     def test_cache_accepts_deterministically_verified_answer(self):
         result = self._good_result(verification_method="python_eval")
         assert should_cache(result) is True
+
+    def test_does_not_cache_unverified_deterministic_method(self):
+        """A label is not verification. math_verifier with verified=False
+        must NOT be cached."""
+        result = self._good_result(verification_method="math_verifier", verified=False)
+        assert should_cache(result) is False
+
+    def test_does_not_cache_unverified_code_verifier(self):
+        result = self._good_result(verification_method="code_verifier", verified=False)
+        assert should_cache(result) is False
 
     def test_cache_accepts_unit_test_verified_answer(self):
         result = self._good_result(verification_method="unit_tests")
@@ -236,6 +247,16 @@ class TestCacheLookupTrust:
     def test_lookup_accepts_code_verifier_entry(self):
         entry = self._entry(verification_method="code_verifier", verified=True)
         assert is_cache_entry_trustworthy(entry) is True
+
+    def test_lookup_rejects_unverified_deterministic_method(self):
+        """A label is not verification. math_verifier with verified=False
+        must NOT pass lookup trust checks."""
+        entry = self._entry(verification_method="math_verifier", verified=False)
+        assert is_cache_entry_trustworthy(entry) is False
+
+    def test_lookup_rejects_unverified_code_verifier(self):
+        entry = self._entry(verification_method="code_verifier", verified=False)
+        assert is_cache_entry_trustworthy(entry) is False
 
     def test_current_schema_version_is_3(self):
         assert CURRENT_CACHE_SCHEMA_VERSION == 3
