@@ -1,19 +1,26 @@
 """Deterministic math verifier.
 
-Extracts the final numeric answer from the candidate answer and an optional
-expected answer, then compares them numerically (with tolerance for
-floating-point and fraction equivalence).
+Compares extracted numeric answers against an expected numeric answer
+when one is provided in the context. This is a comparison verifier, not
+a solver — it does not derive the expected answer itself. The
+:mod:`math_solver` module handles derivation for simple cases (arithmetic,
+finite sums, explicit recurrences).
 
 Capabilities:
   - extract final numeric answer (\\boxed{}, "answer is X", trailing number)
-  - evaluate simple arithmetic expressions safely
   - compare fractions (\\frac{a}{b}, a/b)
   - compare decimals within tolerance
-  - verify geometric-series examples
-  - verify recurrence outputs where parseable
+  - reject non-numeric answers
 
-This verifier does NOT execute arbitrary Python. It uses a restricted
-numeric parser and direct comparison.
+Limitations:
+  - Cannot verify correctness without expected_answer in context
+  - Cannot solve equations, integrals, or proofs
+  - Cannot verify symbolic equivalence
+  - Does not execute Python or evaluate arbitrary expressions
+
+When no expected_answer is provided, returns verified=False with
+"no expected_answer provided; cannot verify correctness" — this is the
+honest result, not a failure.
 """
 
 import re
