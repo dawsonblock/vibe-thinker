@@ -118,3 +118,53 @@ class TestRoutingFalsePositives:
         decision = orch.route_structured("Explain the legal code for property rights")
         assert decision["task_type"] != "code"
 
+
+class TestRouteClassification:
+    """Tests that actual route (specialist/generalist/hybrid) agrees with
+    task_type. The route must NOT send generalist tasks to specialist CLR."""
+
+    def test_code_of_conduct_routes_generalist(self, orch):
+        decision = orch.route_structured("What is a code of conduct?")
+        assert decision["route"] == "generalist"
+
+    def test_code_of_ethics_routes_generalist(self, orch):
+        decision = orch.route_structured("Explain the code of ethics for engineers")
+        assert decision["route"] == "generalist"
+
+    def test_dress_code_routes_generalist(self, orch):
+        decision = orch.route_structured("What is the dress code for the event?")
+        assert decision["route"] == "generalist"
+
+    def test_sum_of_human_knowledge_routes_generalist_or_hybrid(self, orch):
+        decision = orch.route_structured("The sum of human knowledge is vast")
+        assert decision["route"] in {"generalist", "hybrid"}
+        assert decision["route"] != "specialist"
+
+    def test_world_series_routes_generalist_or_hybrid(self, orch):
+        decision = orch.route_structured("Who won the World Series in 2024?")
+        assert decision["route"] in {"generalist", "hybrid"}
+
+    def test_compute_sum_routes_specialist(self, orch):
+        decision = orch.route_structured("Compute the sum of 1 + 2 + 3 + 4 + 5")
+        assert decision["route"] == "specialist"
+
+    def test_debug_python_routes_specialist(self, orch):
+        decision = orch.route_structured("Debug this Python function for me")
+        assert decision["route"] == "specialist"
+
+    def test_solve_equation_routes_specialist(self, orch):
+        decision = orch.route_structured("Solve the equation 2x + 3 = 7")
+        assert decision["route"] == "specialist"
+
+    def test_task_type_and_route_agree_for_math(self, orch):
+        """If task_type is math, route must be specialist."""
+        decision = orch.route_structured("Calculate the integral of x^2")
+        if decision["task_type"] == "math":
+            assert decision["route"] == "specialist"
+
+    def test_task_type_and_route_agree_for_conversation(self, orch):
+        """If task_type is conversation, route must be generalist."""
+        decision = orch.route_structured("Explain quantum mechanics in simple terms")
+        if decision["task_type"] == "conversation":
+            assert decision["route"] == "generalist"
+

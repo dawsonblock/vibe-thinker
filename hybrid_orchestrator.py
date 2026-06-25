@@ -516,15 +516,41 @@ class HybridReasoningOrchestrator:
         }
 
     def _classify_route(self, query: str) -> Tuple[str, float]:
+        """Classify a query into a route: specialist, generalist, or hybrid.
+
+        Uses the structured task type to determine the route. This ensures
+        that task_type and route agree — "code of conduct" is conversation,
+        not code, so it must route to generalist, not specialist.
+
+        Routing rules:
+          - math, code -> specialist (these need CLR + deterministic verification)
+          - conversation, summarization -> generalist (no verifier needed)
+          - planning, retrieval, unknown -> hybrid
+        """
+        task_type, _, _ = self._detect_task_type(query)
+
+        if task_type in {"math", "code"}:
+            # Specialist for verifiable tasks
+            if self.use_embedding_router:
+                route, conf = self.router.classify(query)
+                # Override embedding router if it disagrees with task_type
+                if route != "specialist":
+                    print(f"[Route] Embedding router said {route} but task_type={task_type} -> specialist")
+                return "specialist", max(conf, 0.8)
+            return "specialist", 0.8
+
+        if task_type in {"conversation", "summarization"}:
+            # Generalist for non-verifiable tasks
+            if self.use_embedding_router:
+                route, conf = self.router.classify(query)
+                if route == "specialist":
+                    print(f"[Route] Embedding router said specialist but task_type={task_type} -> generalist")
+                return "generalist", max(conf, 0.75)
+            return "generalist", 0.75
+
+        # planning, retrieval, unknown -> hybrid
         if self.use_embedding_router:
             return self.router.classify(query)
-
-        # Keyword fallback
-        q_lower = query.lower()
-        if any(kw in q_lower for kw in self.verifiable_keywords):
-            return "specialist", 0.8
-        if any(kw in q_lower for kw in self.generalist_keywords):
-            return "generalist", 0.75
         return "hybrid", 0.5
 
     # ------------------------------------------------------------------ #
