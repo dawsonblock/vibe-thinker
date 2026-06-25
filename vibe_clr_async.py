@@ -60,11 +60,24 @@ class VibeThinkerCLRAsync:
         server_url: str = "http://127.0.0.1:8080",
         k: int = 8,
         max_concurrent: int = 6,
+        adaptive: bool = True,
+        k_min: int = 2,
+        k_max: int = 6,
     ):
         self.server_url = server_url.rstrip("/")
         self.k = k
         self.max_concurrent = max_concurrent  # Limit concurrent requests
         self.semaphore = asyncio.Semaphore(max_concurrent)
+
+        # Adaptive compute: instead of firing all k trajectories at once,
+        # start with k_min and scale up to k_max only when needed.
+        # This is "System 1 / System 2" thinking:
+        #   Phase 1: k_min trajectories + early verifier exit
+        #   Phase 2: consensus check (early exit if answers agree)
+        #   Phase 3: scale up to k_max on disagreement/uncertainty
+        self.adaptive = adaptive
+        self.k_min = min(k_min, k) if adaptive else k
+        self.k_max = min(k_max, k) if adaptive else k
 
     # ------------------------------------------------------------------ #
     # Low-level async model call
@@ -453,23 +466,201 @@ rather than silently proceeding with an empty string."""
         task_type: str = "unknown",
         verifier_context: Optional[Dict[str, Any]] = None,
     ) -> CLRResult:
-        """Run CLR with k trajectories.
+        """Run CLR with adaptive compute.
+
+        Uses a phased approach instead of brute-force k trajectories:
+
+        Phase 1 (Fast Path): Generate k_min trajectories. If a verifier
+        is available, run it immediately. If it returns verified=True,
+        exit early — no need for more compute.
+
+        Phase 2 (Consensus Check): If no verifier or verifier didn't
+        confirm, check if the first trajectories agree. If they do and
+        self-verify well, exit early — more trajectories won't raise
+        the score above the 0.65 cap anyway.
+
+        Phase 3 (Branching): If trajectories disagree or the verifier
+        failed, scale up to k_max trajectories. This is the "System 2"
+        mode for high-uncertainty problems.
+
+        If adaptive=False, falls back to the original brute-force mode
+        (all k trajectories at once).
 
         Args:
             problem: the problem to solve.
             max_tokens_per_trace: max tokens per trajectory.
-            verifier: optional deterministic verifier (implements the
-                Verifier protocol). If provided, the verifier independently
-                checks the best answer and the result score can exceed
-                the self-claims-only cap of 0.65.
+            verifier: optional deterministic verifier. If provided, the
+                verifier independently checks the best answer and the
+                result score can exceed the self-claims-only cap of 0.65.
             task_type: the detected task type (math, code, factual, etc.).
-                Used for verification metadata.
-            verifier_context: optional context dict passed to the verifier
-                (expected_answer, unit_tests, sources, etc.). Without this,
-                verifiers cannot verify — they will return verified=False.
+            verifier_context: optional context dict passed to the verifier.
         """
+        if not self.adaptive:
+            return await self._run_static(
+                problem, max_tokens_per_trace, verifier, task_type,
+                verifier_context,
+            )
+
+        return await self._run_adaptive(
+            problem, max_tokens_per_trace, verifier, task_type,
+            verifier_context,
+        )
+
+    async def _run_adaptive(
+        self,
+        problem: str,
+        max_tokens_per_trace: int,
+        verifier: Optional[Any],
+        task_type: str,
+        verifier_context: Optional[Dict[str, Any]],
+    ) -> CLRResult:
+        """Adaptive compute: phased trajectory generation with early exit."""
+        k_initial = self.k_min
+        k_total = self.k_max
         print(
-            f"Running async CLR with k={self.k} trajectories "
+            f"Running adaptive CLR: k_min={k_initial}, k_max={k_total} "
+            f"(max_concurrent={self.max_concurrent})..."
+        )
+
+        all_trajectories: List[Any] = []
+        all_failures: List[Exception] = []
+
+        async with aiohttp.ClientSession() as session:
+            # === Phase 1: Fast Path ===
+            print(f"[CLR] Phase 1: generating {k_initial} trajectories...")
+            tasks = [
+                self._generate_one_trajectory(session, problem, max_tokens_per_trace)
+                for _ in range(k_initial)
+            ]
+            phase1_results = await asyncio.gather(*tasks, return_exceptions=True)
+            for r in phase1_results:
+                if isinstance(r, Exception):
+                    all_failures.append(r)
+                else:
+                    all_trajectories.append(r)
+
+            # Check for total infrastructure failure
+            if not all_trajectories and all_failures:
+                raise RuntimeError(
+                    f"All CLR trajectories failed ({len(all_failures)}/{k_initial}): "
+                    f"{all_failures[0]}"
+                )
+
+            # Score the phase 1 trajectories
+            answered = self._score_trajectories(all_trajectories)
+            if not answered:
+                return self._build_no_answer_result(
+                    all_trajectories, all_failures, k_initial,
+                )
+
+            best = max(answered, key=lambda x: x["score"])
+
+            # Early exit: verifier confirms the answer
+            verifier_refuted = False
+            if verifier is not None:
+                v_result = await self._try_verifier(
+                    verifier, problem, best["answer"], verifier_context, best_score=best["score"],
+                )
+                if v_result and v_result[2]:  # verified=True
+                    print(f"[CLR] Phase 1 early exit: verifier confirmed answer")
+                    return self._build_final_result(
+                        best, all_trajectories, all_failures,
+                        k_used=len(all_trajectories),
+                        verification_method=v_result[0],
+                        verified=v_result[2],
+                        det_verification=v_result[1],
+                        final_score_override=v_result[3],
+                    )
+                if v_result and not v_result[2]:
+                    verifier_refuted = True
+
+            # === Phase 2: Consensus Check ===
+            # Skip consensus if the verifier already refuted — the answer
+            # is wrong even if trajectories agree. We need more trajectories
+            # to find a correct answer.
+            # If trajectories agree and self-verify well, no need to branch.
+            # More trajectories won't raise the score above 0.65 without
+            # a verifier, so spending the compute is pointless.
+            if not verifier_refuted and self._check_consensus(answered):
+                print(f"[CLR] Phase 2 early exit: trajectories agree (consensus)")
+                return self._build_final_result(
+                    best, all_trajectories, all_failures,
+                    k_used=len(all_trajectories),
+                )
+
+            # === Phase 3: Branching (System 2) ===
+            remaining = k_total - len(all_trajectories)
+            if remaining > 0:
+                print(
+                    f"[CLR] Phase 3: uncertainty detected — "
+                    f"generating {remaining} more trajectories..."
+                )
+                tasks = [
+                    self._generate_one_trajectory(session, problem, max_tokens_per_trace)
+                    for _ in range(remaining)
+                ]
+                phase3_results = await asyncio.gather(*tasks, return_exceptions=True)
+                for r in phase3_results:
+                    if isinstance(r, Exception):
+                        all_failures.append(r)
+                    else:
+                        all_trajectories.append(r)
+
+        # Re-score all trajectories with the full set
+        answered = self._score_trajectories(all_trajectories)
+        if not answered:
+            return self._build_no_answer_result(
+                all_trajectories, all_failures, k_total,
+            )
+
+        best = max(answered, key=lambda x: x["score"])
+
+        # Run verifier on the best answer from the full set
+        verification_method = "self_claims_only"
+        verified = False
+        det_verification: Optional[float] = None
+        final_score = best["score"]
+
+        if verifier is not None:
+            v_result = await self._try_verifier(
+                verifier, problem, best["answer"], verifier_context, best_score=best["score"],
+            )
+            if v_result:
+                verification_method, det_verification, verified, final_score = v_result
+                if final_score is None:
+                    final_score = best["score"]
+
+        result = CLRResult(
+            best_answer=best["answer"],
+            best_score=final_score,
+            best_raw_trace=best["raw_trace"],
+            all_trajectories=[t for t in all_trajectories if isinstance(t, dict)],
+            k=k_total,
+            transport_failures=len(all_failures),
+            partial_failure=len(all_failures) > 0,
+            verification_method=verification_method,
+            verified=verified,
+            deterministic_verification=det_verification,
+        )
+
+        print(f"\nBest trajectory score: {final_score:.4f}")
+        print(f"Best answer: {result.best_answer}")
+        print(f"Verification: {verification_method} (verified={verified})")
+        print(f"Compute used: {len(all_trajectories)} trajectories "
+              f"(of max {k_total})")
+        return result
+
+    async def _run_static(
+        self,
+        problem: str,
+        max_tokens_per_trace: int,
+        verifier: Optional[Any],
+        task_type: str,
+        verifier_context: Optional[Dict[str, Any]],
+    ) -> CLRResult:
+        """Original brute-force mode: all k trajectories at once."""
+        print(
+            f"Running static CLR with k={self.k} trajectories "
             f"(max_concurrent={self.max_concurrent})..."
         )
 
@@ -480,17 +671,10 @@ rather than silently proceeding with an empty string."""
             ]
             trajectories = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Separate successful trajectories from failures.
-        # Fail-closed rule: if ALL trajectories failed due to transport/model
-        # exceptions, that is an INFRASTRUCTURE failure, not a low-confidence
-        # answer. It must raise so the job queue marks the job FAILED.
         successful = [t for t in trajectories if isinstance(t, dict)]
         failures = [t for t in trajectories if isinstance(t, Exception)]
 
         if not successful and failures:
-            # Every single trajectory failed — the model server is dead or
-            # unreachable. Raise so callers know it was infrastructure, not
-            # reasoning uncertainty.
             raise RuntimeError(
                 f"All CLR trajectories failed ({len(failures)}/{self.k}): "
                 f"{failures[0]}"
@@ -505,8 +689,6 @@ rather than silently proceeding with an empty string."""
             )
 
         if not valid_trajectories:
-            # No failures but no successes either (shouldn't happen, but
-            # fail closed just in case).
             return CLRResult(
                 best_answer="No clear answer found",
                 best_score=0.0,
@@ -516,14 +698,8 @@ rather than silently proceeding with an empty string."""
                 failure_reason="no trajectories produced",
             )
 
-        # Only consider trajectories that actually produced a final answer.
-        # A trajectory with no answer is worthless regardless of claim scores.
-        answered = [t for t in valid_trajectories if t.get("answer_present") and t.get("answer")]
-
+        answered = self._score_trajectories(valid_trajectories)
         if not answered:
-            # Trajectories succeeded (model responded) but none produced a
-            # usable answer. This is a genuine score-0 completed result, NOT
-            # an infrastructure failure.
             return CLRResult(
                 best_answer="No clear answer found",
                 best_score=0.0,
@@ -534,78 +710,22 @@ rather than silently proceeding with an empty string."""
                 partial_failure=partial_failure,
             )
 
-        # Apply deterministic cross-trajectory answer checking.
-        # This is independent of self-verification: if multiple trajectories
-        # produced the same \\boxed{} answer, that's a correctness signal.
-        # If they contradict, the score is penalized.
-        for t in answered:
-            det_check = self._check_answer_deterministic(t["answer"], valid_trajectories)
-            t["deterministic_check"] = det_check
-            t["score"] = self._calculate_reliability(
-                t["verdicts"],
-                claims=t["claims"],
-                answer_present=True,
-                deterministic_check=det_check,
-            )
-
-        # Penalize contradictory trajectories: if different trajectories
-        # produced different answers, lower confidence in all of them.
-        unique_answers = set()
-        for t in answered:
-            boxed = self._extract_boxed_answer(t.get("raw_trace", ""))
-            if boxed is not None:
-                unique_answers.add(boxed.lower().strip())
-        if len(unique_answers) > 1:
-            # Multiple different answers -> contradiction penalty
-            for t in answered:
-                t["score"] *= 0.7
-            print(f"[CLR] {len(unique_answers)} distinct answers detected — applying contradiction penalty")
-
         best = max(answered, key=lambda x: x["score"])
 
-        # --- Independent deterministic verification ---
-        # If a verifier was provided, run it against the best answer.
-        # This is the ONLY path that can produce a score above 0.65.
-        # The verifier provides independent evidence — model self-agreement
-        # is not proof of correctness.
+        # Run verifier
         verification_method = "self_claims_only"
         verified = False
         det_verification: Optional[float] = None
-        final_score = best["score"]  # already capped at 0.65 by _calculate_reliability
+        final_score = best["score"]
 
         if verifier is not None:
-            try:
-                v_result = await verifier.verify(
-                    problem, best["answer"],
-                    context=verifier_context or {},
-                )
-                verification_method = getattr(verifier, "name", "verifier")
-                det_verification = v_result.score if v_result.verified else 0.0
-                verified = v_result.verified
-                print(f"[CLR] Verifier {verification_method}: "
-                      f"verified={verified}, score={v_result.score:.3f}")
-                if verified:
-                    # Recompute final score with deterministic verification.
-                    # Use the verifier's actual score, not 1.0 — a weak
-                    # verifier (e.g. FactualVerifier overlap=0.7) must not
-                    # be inflated to full verification.
-                    confidence = compute_confidence(
-                        model_score=best["score"],
-                        claim_consistency=best["score"],
-                        deterministic_verification=v_result.score,
-                        verification_method=verification_method,
-                    )
-                    final_score = confidence.final_score
-                else:
-                    # Verifier refuted or could not verify — score stays capped
-                    # If verifier explicitly refuted (score 0.0), final is 0.0
-                    if v_result.score <= 0.0 and v_result.error:
-                        final_score = 0.0
-            except Exception as e:
-                print(f"[CLR] Verifier error: {e}")
-                verification_method = "self_claims_only"
-                det_verification = None
-                verified = False
+            v_result = await self._try_verifier(
+                verifier, problem, best["answer"], verifier_context, best_score=best["score"],
+            )
+            if v_result:
+                verification_method, det_verification, verified, final_score = v_result
+                if final_score is None:
+                    final_score = best["score"]
 
         result = CLRResult(
             best_answer=best["answer"],
@@ -624,6 +744,169 @@ rather than silently proceeding with an empty string."""
         print(f"Best answer: {result.best_answer}")
         print(f"Verification: {verification_method} (verified={verified})")
         return result
+
+    def _score_trajectories(self, trajectories: List[Any]) -> List[Dict]:
+        """Score valid trajectories and return those with answers.
+
+        Applies deterministic cross-trajectory checking and contradiction
+        penalties. Returns only trajectories that produced a final answer.
+        """
+        valid = [t for t in trajectories if isinstance(t, dict)]
+        answered = [t for t in valid if t.get("answer_present") and t.get("answer")]
+        if not answered:
+            return []
+
+        for t in answered:
+            det_check = self._check_answer_deterministic(t["answer"], valid)
+            t["deterministic_check"] = det_check
+            t["score"] = self._calculate_reliability(
+                t["verdicts"],
+                claims=t["claims"],
+                answer_present=True,
+                deterministic_check=det_check,
+            )
+
+        # Contradiction penalty
+        unique_answers = set()
+        for t in answered:
+            boxed = self._extract_boxed_answer(t.get("raw_trace", ""))
+            if boxed is not None:
+                unique_answers.add(boxed.lower().strip())
+        if len(unique_answers) > 1:
+            for t in answered:
+                t["score"] *= 0.7
+            print(f"[CLR] {len(unique_answers)} distinct answers detected — applying contradiction penalty")
+
+        return answered
+
+    def _check_consensus(self, answered: List[Dict]) -> bool:
+        """Check if trajectories agree — early exit signal.
+
+        Returns True if:
+        - All answered trajectories produced the same boxed answer, AND
+        - The best score is reasonable (>= 0.3, meaning claims aren't garbage)
+
+        If they agree, generating more trajectories won't help: without a
+        verifier, the score is capped at 0.65 regardless of how many
+        trajectories agree.
+        """
+        if len(answered) < 2:
+            return False  # Need at least 2 to check consensus
+
+        boxed_answers = []
+        for t in answered:
+            extracted = self._extract_boxed_answer(t.get("raw_trace", ""))
+            if extracted is not None:
+                boxed_answers.append(extracted.lower().strip())
+
+        if len(boxed_answers) < 2:
+            return False  # Not enough boxed answers to compare
+
+        # All answers agree
+        if len(set(boxed_answers)) == 1:
+            best_score = max(t["score"] for t in answered)
+            if best_score >= 0.3:
+                print(f"[CLR] Consensus: all {len(boxed_answers)} trajectories agree "
+                      f"(score={best_score:.3f})")
+                return True
+
+        return False
+
+    async def _try_verifier(
+        self,
+        verifier: Any,
+        problem: str,
+        answer: str,
+        verifier_context: Optional[Dict[str, Any]],
+        best_score: float = 0.65,
+    ) -> Optional[tuple]:
+        """Run the verifier and return (method, det_score, verified, final_score).
+
+        Returns None if the verifier raises an exception.
+        final_score is None if the verifier didn't verify (caller uses
+        best["score"] as default).
+        """
+        try:
+            v_result = await verifier.verify(
+                problem, answer,
+                context=verifier_context or {},
+            )
+            verification_method = getattr(verifier, "name", "verifier")
+            det_verification = v_result.score if v_result.verified else 0.0
+            verified = v_result.verified
+            print(f"[CLR] Verifier {verification_method}: "
+                  f"verified={verified}, score={v_result.score:.3f}")
+
+            final_score = None
+            if verified:
+                # Use the verifier's actual score, not 1.0
+                confidence = compute_confidence(
+                    model_score=best_score,
+                    claim_consistency=best_score,
+                    deterministic_verification=v_result.score,
+                    verification_method=verification_method,
+                )
+                final_score = confidence.final_score
+            else:
+                if v_result.score <= 0.0 and v_result.error:
+                    final_score = 0.0
+
+            return (verification_method, det_verification, verified, final_score)
+        except Exception as e:
+            print(f"[CLR] Verifier error: {e}")
+            return None
+
+    def _build_final_result(
+        self,
+        best: Dict,
+        all_trajectories: List[Any],
+        all_failures: List[Exception],
+        k_used: int,
+        verification_method: str = "self_claims_only",
+        verified: bool = False,
+        det_verification: Optional[float] = None,
+        final_score_override: Optional[float] = None,
+    ) -> CLRResult:
+        """Build a CLRResult from the best trajectory."""
+        final_score = final_score_override if final_score_override is not None else best["score"]
+        valid = [t for t in all_trajectories if isinstance(t, dict)]
+
+        result = CLRResult(
+            best_answer=best["answer"],
+            best_score=final_score,
+            best_raw_trace=best["raw_trace"],
+            all_trajectories=valid,
+            k=k_used,
+            transport_failures=len(all_failures),
+            partial_failure=len(all_failures) > 0,
+            verification_method=verification_method,
+            verified=verified,
+            deterministic_verification=det_verification,
+        )
+
+        print(f"\nBest trajectory score: {final_score:.4f}")
+        print(f"Best answer: {result.best_answer}")
+        print(f"Verification: {verification_method} (verified={verified})")
+        print(f"Compute used: {len(valid)} trajectories (of max {k_used})")
+        return result
+
+    def _build_no_answer_result(
+        self,
+        all_trajectories: List[Any],
+        all_failures: List[Exception],
+        k_used: int,
+    ) -> CLRResult:
+        """Build a CLRResult when no trajectories produced an answer."""
+        valid = [t for t in all_trajectories if isinstance(t, dict)]
+        return CLRResult(
+            best_answer="No clear answer found",
+            best_score=0.0,
+            best_raw_trace="",
+            all_trajectories=valid,
+            k=k_used,
+            transport_failures=len(all_failures),
+            partial_failure=len(all_failures) > 0,
+        )
 
 
 # ====================== EXAMPLE USAGE ======================
