@@ -46,7 +46,6 @@ class AdaptivePolicy:
     initial_k_with_verifier: int = 1
     initial_k_without_verifier: int = 2
     max_k: int = 6
-    branch_batch_size: int = 2
     self_claim_cap: float = 0.65
     min_claims: int = 5
     early_exit_on_self_consensus: bool = True
@@ -128,6 +127,8 @@ class VibeThinkerCLRAsync:
         # Keep k_min/k_max for backwards compat
         self.k_min = self.policy.initial_k_without_verifier
         self.k_max = self.policy.max_k
+        # Store the original max_k so adjust_max_k_for_queue_load can restore it
+        self._original_max_k = self.policy.max_k
 
     def adjust_max_k_for_queue_load(self, queue_load: float) -> None:
         """Adjust max_k based on queue pressure.
@@ -147,7 +148,7 @@ class VibeThinkerCLRAsync:
         Args:
             queue_load: fraction of queue capacity in use (0.0 to 1.0).
         """
-        original_max = self.policy.max_k
+        original_max = self._original_max_k
         if queue_load > 0.8:
             self.policy.max_k = min(2, original_max)
         elif queue_load > 0.5:
@@ -468,7 +469,7 @@ rather than silently proceeding with an empty string."""
             meaningful = [
                 (c, v) for c, v in zip(claims, verdicts) if self._is_meaningful_claim(c)
             ]
-            if len(meaningful) < self.MIN_CLAIMS_FOR_SCORING:
+            if len(meaningful) < self.policy.min_claims:
                 return 0.0
             verdicts = [v for _, v in meaningful]
 
@@ -490,9 +491,9 @@ rather than silently proceeding with an empty string."""
         # It NEVER sets det_verification or verification_method to anything
         # that would bypass the self-claims-only cap.
         if consistency_check is True:
-            base = min(base + 0.05, 0.65)
+            base = min(base + self.policy.consistency_boost, self.policy.self_claim_cap)
         elif consistency_check is False:
-            base *= 0.75
+            base *= self.policy.contradiction_penalty
 
         # Always route through compute_confidence as self_claims_only.
         # The cap is enforced here. Only external verifiers (handled in
@@ -756,10 +757,10 @@ rather than silently proceeding with an empty string."""
                 and policy.early_exit_on_self_consensus
                 and not (is_high_risk and policy.disable_self_consensus_for_high_risk)
             )
-            if can_consensus_exit and len(answered) >= 2:
-                # Need full trajectories for consensus scoring
-                # If we used lightweight trajectories, we need to check
-                # answer agreement via boxed extraction only
+            if can_consensus_exit and len(answered) >= 2 and best.get("score", 0.0) > 0.0:
+                # Consensus requires full trajectories with real scores.
+                # Lightweight trajectories have score=0.0 (no claims/verdicts),
+                # so consensus among them is meaningless — proceed to Phase 3.
                 agreement = self._check_answer_agreement(answered)
                 if agreement:
                     print(f"[CLR] Phase 2 early exit: self-consensus "
@@ -1021,18 +1022,9 @@ rather than silently proceeding with an empty string."""
                 consistency_check=consistency,
             )
 
-        # Contradiction penalty: if different trajectories produced different
-        # answers, lower confidence in all of them.
-        unique_answers = set()
-        for t in answered:
-            boxed = self._extract_boxed_answer(t.get("raw_trace", ""))
-            if boxed is not None:
-                unique_answers.add(boxed.lower().strip())
-        if len(unique_answers) > 1:
-            for t in answered:
-                t["score"] *= self.policy.contradiction_penalty
-            print(f"[CLR] {len(unique_answers)} distinct answers detected — "
-                  f"applying contradiction penalty ({self.policy.contradiction_penalty})")
+        # Note: contradiction penalty is already applied per-trajectory via
+        # _check_answer_consistency returning False -> _calculate_reliability
+        # multiplies by contradiction_penalty. No separate penalty needed here.
 
         return answered
 
@@ -1131,7 +1123,7 @@ rather than silently proceeding with an empty string."""
                     verification_method=verification_method,
                 )
                 final_score = confidence.final_score
-            elif det_verification == 0.0 and v_result.error:
+            elif det_verification == 0.0:
                 # Explicit refutation -> zero the score
                 final_score = 0.0
             # else: unsupported -> final_score stays None, caller uses best["score"]

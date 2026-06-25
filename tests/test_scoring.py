@@ -85,5 +85,8 @@ class TestComputeConfidence:
         )
         # 0.5 * 0.7 + 0.8 * 0.3 = 0.35 + 0.24 = 0.59
         assert abs(result.final_score - 0.59) < 1e-4
-        # Not fully verified (needs >= 1.0)
+        # compute_confidence.verified is intentionally strict (>= 1.0).
+        # Callers use v_result.verified for actual verification status,
+        # not confidence.verified. Partial scores blend normally but
+        # don't set the verified flag in ConfidenceBreakdown.
         assert result.verified is False
