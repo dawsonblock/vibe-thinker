@@ -5,7 +5,7 @@ high-precision reasoning specialist (VibeThinker-3B with Claim-Level
 Reliability) and a generalist model, with a priority async job queue,
 bi-temporal audit logging, deterministic verifiers, and an interactive CLI.
 
-## Status: ALPHA SOFTWARE
+## Status: ALPHA SOFTWARE (v0.3.1)
 
 **This is alpha software.** It is a local reasoning control plane prototype,
 not a production reasoning engine. The following limitations are real and
@@ -100,6 +100,7 @@ python test_full_stack.py
 | `rfsn_cli.py` | Interactive CLI/REPL over the job queue (env var + CLI flag support) |
 | `scoring.py` | Separated confidence fields (model_confidence, claim_consistency, deterministic_verification) |
 | `verifiers/` | Deterministic verifier adapters (math, code, factual) |
+| `math_solver.py` | Deterministic solver for simple math (arithmetic, sums, recurrences) — derives expected_answer for MathVerifier |
 | `test_demo.py` | Comprehensive test suite (no model servers needed) |
 | `test_full_stack.py` | Full-stack integration test (needs live servers) |
 

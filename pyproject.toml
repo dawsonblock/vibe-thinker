@@ -4,7 +4,7 @@ build-backend = "setuptools.backends._legacy:_Backend"
 
 [project]
 name = "vibe-thinker"
-version = "0.3.0"
+version = "0.3.1"
 description = "Fail-closed hybrid reasoning control plane for local LLMs with CLR, deterministic verifiers, job queue, and bi-temporal audit logging"
 readme = "README.md"
 license = {file = "LICENSE"}
@@ -23,6 +23,7 @@ embeddings = [
 dev = [
     "pytest>=7.0,<9",
     "pytest-asyncio>=0.21,<1",
+    "pytest-timeout>=2.0,<3",
     "ruff>=0.1,<1",
     "mypy>=1.0,<2",
 ]
@@ -30,6 +31,8 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+timeout = 60
+timeout_method = "thread"
 
 [tool.setuptools]
 py-modules = [
@@ -41,5 +44,6 @@ py-modules = [
     "bitemporal_log",
     "rfsn_cli",
     "scoring",
+    "math_solver",
 ]
 packages = ["verifiers"]

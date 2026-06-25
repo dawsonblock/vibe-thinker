@@ -23,7 +23,7 @@ import tempfile
 import zipfile
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-VERSION = "0.3"
+VERSION = "0.3.1"
 DIST_DIR = os.path.join(PROJECT_ROOT, "dist")
 ZIP_NAME = f"vibe-thinker-v{VERSION}.zip"
 
@@ -32,7 +32,7 @@ INCLUDE_DIRS = ["verifiers", "tests", "examples", "scripts"]
 INCLUDE_FILES = [
     "vibe_clr.py", "vibe_clr_async.py", "hybrid_orchestrator.py",
     "persistent_cache.py", "rfsn_job_queue.py", "bitemporal_log.py",
-    "rfsn_cli.py", "scoring.py", "demo.py", "test_demo.py",
+    "rfsn_cli.py", "scoring.py", "math_solver.py", "demo.py", "test_demo.py",
     "test_full_stack.py", "test_clr.py",
     "README.md", "LICENSE", "pyproject.toml", "requirements.txt",
     ".env.example", ".gitignore",
@@ -98,15 +98,18 @@ def main() -> int:
                     shutil.rmtree(os.path.join(root, d), ignore_errors=True)
 
         # --- Validation: pytest ---
+        # Use --timeout=60 for per-test timeout (requires pytest-timeout)
+        # and subprocess timeout=120 as a hard outer limit.
         print("Running pytest...")
         try:
             result = subprocess.run(
-                [sys.executable, "-m", "pytest", staging + "/tests", "-q"],
+                [sys.executable, "-m", "pytest", staging + "/tests", "-q",
+                 "--timeout=60", "--timeout-method=thread"],
                 capture_output=True, text=True, cwd=staging,
                 timeout=120,
             )
         except subprocess.TimeoutExpired:
-            print("  pytest: TIMED OUT (120s)", file=sys.stderr)
+            print("  pytest: TIMED OUT (120s outer limit)", file=sys.stderr)
             return 1
         if result.returncode == 0:
             print("  pytest: OK")
