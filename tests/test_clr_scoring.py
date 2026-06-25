@@ -185,3 +185,114 @@ class TestFailClosedRun:
         assert result.best_answer == "No clear answer found"
         assert result.failure_reason is None  # not an infrastructure failure
 
+
+class TestVerifierIntegration:
+    """Tests for the verifier integration in CLR run().
+
+    A deterministic verifier is the ONLY path that allows the final score
+    to exceed the self-claims-only cap of 0.65.
+    """
+
+    @pytest.mark.asyncio
+    async def test_no_verifier_caps_at_065(self, clr):
+        """Without a verifier, score is capped at 0.65 even with perfect claims."""
+        good_traj = {
+            "score": 0.65,
+            "answer": "42",
+            "claims": ["a" * 20, "b" * 20, "c" * 20, "d" * 20, "e" * 20],
+            "verdicts": [1, 1, 1, 1, 1],
+            "raw_trace": "reasoning \\boxed{42}",
+            "answer_present": True,
+        }
+        with patch.object(clr, "_generate_one_trajectory",
+                          new=AsyncMock(return_value=good_traj)):
+            result = await clr.run("test problem", verifier=None)
+        assert result.verification_method == "self_claims_only"
+        assert result.verified is False
+        assert result.best_score <= 0.65
+
+    @pytest.mark.asyncio
+    async def test_math_verifier_allows_above_065(self, clr):
+        """With a passing math verifier, score CAN exceed 0.65."""
+        from verifiers import MathVerifier
+        from verifiers.base import VerificationResult
+
+        good_traj = {
+            "score": 0.65,
+            "answer": "4",
+            "claims": ["a" * 20, "b" * 20, "c" * 20, "d" * 20, "e" * 20],
+            "verdicts": [1, 1, 1, 1, 1],
+            "raw_trace": "reasoning \\boxed{4}",
+            "answer_present": True,
+        }
+        # Mock the math verifier to return verified=True
+        verifier = MathVerifier()
+        original_verify = verifier.verify
+        async def mock_verify(query, answer, context):
+            return VerificationResult(
+                verified=True, score=1.0, method="numeric_comparison",
+                evidence={"candidate": 4.0, "expected": 4.0},
+            )
+        verifier.verify = mock_verify
+
+        with patch.object(clr, "_generate_one_trajectory",
+                          new=AsyncMock(return_value=good_traj)):
+            result = await clr.run("What is 2+2?", verifier=verifier, task_type="math")
+        assert result.verification_method == "math_verifier"
+        assert result.verified is True
+        assert result.best_score > 0.65
+
+    @pytest.mark.asyncio
+    async def test_verifier_refutation_scores_zero(self, clr):
+        """If a verifier refutes the answer, score must be 0."""
+        from verifiers import MathVerifier
+        from verifiers.base import VerificationResult
+
+        good_traj = {
+            "score": 0.65,
+            "answer": "5",
+            "claims": ["a" * 20, "b" * 20, "c" * 20, "d" * 20, "e" * 20],
+            "verdicts": [1, 1, 1, 1, 1],
+            "raw_trace": "reasoning \\boxed{5}",
+            "answer_present": True,
+        }
+        verifier = MathVerifier()
+        async def mock_verify(query, answer, context):
+            return VerificationResult(
+                verified=False, score=0.0, method="numeric_comparison",
+                evidence={"candidate": 5.0, "expected": 4.0},
+                error="5.0 != expected 4.0",
+            )
+        verifier.verify = mock_verify
+
+        with patch.object(clr, "_generate_one_trajectory",
+                          new=AsyncMock(return_value=good_traj)):
+            result = await clr.run("What is 2+2?", verifier=verifier, task_type="math")
+        assert result.verified is False
+        assert result.best_score == 0.0
+
+    @pytest.mark.asyncio
+    async def test_verifier_error_falls_back_to_self_claims(self, clr):
+        """If a verifier raises an exception, fall back to self-claims-only."""
+        from verifiers import MathVerifier
+
+        good_traj = {
+            "score": 0.65,
+            "answer": "4",
+            "claims": ["a" * 20, "b" * 20, "c" * 20, "d" * 20, "e" * 20],
+            "verdicts": [1, 1, 1, 1, 1],
+            "raw_trace": "reasoning \\boxed{4}",
+            "answer_present": True,
+        }
+        verifier = MathVerifier()
+        async def boom_verify(query, answer, context):
+            raise RuntimeError("verifier crashed")
+        verifier.verify = boom_verify
+
+        with patch.object(clr, "_generate_one_trajectory",
+                          new=AsyncMock(return_value=good_traj)):
+            result = await clr.run("What is 2+2?", verifier=verifier, task_type="math")
+        assert result.verification_method == "self_claims_only"
+        assert result.verified is False
+        assert result.best_score <= 0.65
+

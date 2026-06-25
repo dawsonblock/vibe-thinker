@@ -24,7 +24,7 @@ import asyncio
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import aiohttp
 
@@ -45,6 +45,13 @@ class CLRResult:
     model_failures: int = 0
     partial_failure: bool = False
     failure_reason: Optional[str] = None
+    # Verification metadata: how the best answer was verified.
+    # "self_claims_only" means the model checked its own claims — weak.
+    # "math_verifier" / "code_verifier" / "factual_verifier" means an
+    # independent deterministic verifier was run.
+    verification_method: str = "self_claims_only"
+    verified: bool = False
+    deterministic_verification: Optional[float] = None
 
 
 class VibeThinkerCLRAsync:
@@ -438,7 +445,25 @@ rather than silently proceeding with an empty string."""
     # ------------------------------------------------------------------ #
     # Main CLR entry point
     # ------------------------------------------------------------------ #
-    async def run(self, problem: str, max_tokens_per_trace: int = 16384) -> CLRResult:
+    async def run(
+        self,
+        problem: str,
+        max_tokens_per_trace: int = 16384,
+        verifier: Optional[Any] = None,
+        task_type: str = "unknown",
+    ) -> CLRResult:
+        """Run CLR with k trajectories.
+
+        Args:
+            problem: the problem to solve.
+            max_tokens_per_trace: max tokens per trajectory.
+            verifier: optional deterministic verifier (implements the
+                Verifier protocol). If provided, the verifier independently
+                checks the best answer and the result score can exceed
+                the self-claims-only cap of 0.65.
+            task_type: the detected task type (math, code, factual, etc.).
+                Used for verification metadata.
+        """
         print(
             f"Running async CLR with k={self.k} trajectories "
             f"(max_concurrent={self.max_concurrent})..."
@@ -534,18 +559,61 @@ rather than silently proceeding with an empty string."""
 
         best = max(answered, key=lambda x: x["score"])
 
+        # --- Independent deterministic verification ---
+        # If a verifier was provided, run it against the best answer.
+        # This is the ONLY path that can produce a score above 0.65.
+        # The verifier provides independent evidence — model self-agreement
+        # is not proof of correctness.
+        verification_method = "self_claims_only"
+        verified = False
+        det_verification: Optional[float] = None
+        final_score = best["score"]  # already capped at 0.65 by _calculate_reliability
+
+        if verifier is not None:
+            try:
+                v_result = await verifier.verify(problem, best["answer"], context={})
+                verification_method = getattr(verifier, "name", "verifier")
+                det_verification = v_result.score if v_result.verified else 0.0
+                verified = v_result.verified
+                print(f"[CLR] Verifier {verification_method}: "
+                      f"verified={verified}, score={v_result.score:.3f}")
+                if verified:
+                    # Recompute final score with deterministic verification
+                    # This CAN exceed 0.65
+                    confidence = compute_confidence(
+                        model_score=best["score"],
+                        claim_consistency=best["score"],
+                        deterministic_verification=1.0,
+                        verification_method=verification_method,
+                    )
+                    final_score = confidence.final_score
+                else:
+                    # Verifier refuted or could not verify — score stays capped
+                    # If verifier explicitly refuted (score 0.0), final is 0.0
+                    if v_result.score <= 0.0 and v_result.error:
+                        final_score = 0.0
+            except Exception as e:
+                print(f"[CLR] Verifier error: {e}")
+                verification_method = "self_claims_only"
+                det_verification = None
+                verified = False
+
         result = CLRResult(
             best_answer=best["answer"],
-            best_score=best["score"],
+            best_score=final_score,
             best_raw_trace=best["raw_trace"],
             all_trajectories=valid_trajectories,
             k=self.k,
             transport_failures=len(failures),
             partial_failure=partial_failure,
+            verification_method=verification_method,
+            verified=verified,
+            deterministic_verification=det_verification,
         )
 
-        print(f"\nBest trajectory score: {best['score']:.4f}")
+        print(f"\nBest trajectory score: {final_score:.4f}")
         print(f"Best answer: {result.best_answer}")
+        print(f"Verification: {verification_method} (verified={verified})")
         return result
 
 

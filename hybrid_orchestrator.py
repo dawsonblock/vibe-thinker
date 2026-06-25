@@ -38,6 +38,23 @@ import aiohttp
 
 from vibe_clr_async import CLRResult, VibeThinkerCLRAsync
 from persistent_cache import CLRResultCache, PersistentRouteCache, should_cache
+from verifiers import MathVerifier, CodeVerifier, FactualVerifier
+
+
+def select_verifier(task_type: str):
+    """Select a deterministic verifier based on the detected task type.
+
+    Returns None if no verifier applies (conversation, summarization, etc.).
+    Conversation and summarization tasks do NOT get a verifier — there is
+    no deterministic way to verify "explain X" or "summarize Y".
+    """
+    if task_type == "math":
+        return MathVerifier()
+    if task_type == "code":
+        return CodeVerifier()
+    if task_type == "factual":
+        return FactualVerifier()
+    return None
 
 # Optional dependency — gracefully degrade if not installed
 try:
@@ -592,8 +609,8 @@ class HybridReasoningOrchestrator:
     })
 
     def _build_cache_result_dict(self, clr_result: CLRResult) -> dict:
-        """Build the result dict that should_cache() evaluates, enriched
-        with verification metadata from the best trajectory."""
+        """Build the result dict that should_cache() evaluates, using
+        verification metadata from the CLR result directly."""
         best_traj = max(
             (t for t in clr_result.all_trajectories if isinstance(t, dict)),
             key=lambda x: x.get("score", 0),
@@ -604,25 +621,16 @@ class HybridReasoningOrchestrator:
                  if self.reasoner._is_meaningful_claim(c)])
             if best_traj else 0
         )
-        det_check = (best_traj or {}).get("deterministic_check")
-
-        # Determine verification method honestly.
-        # self_claims_only means the only "verification" was the model
-        # checking its own claims — that is NOT independent verification.
-        if det_check is True:
-            verification_method = "deterministic_check"
-        else:
-            verification_method = "self_claims_only"
 
         return {
             "answer": clr_result.best_answer,
             "score": clr_result.best_score,
             "answer_present": bool(clr_result.best_answer),
             "claim_count": claim_count,
-            "verification_method": verification_method,
+            "verification_method": clr_result.verification_method,
             "failure": clr_result.failure_reason,
             "transport_failures": clr_result.transport_failures,
-            "deterministic_check": det_check,
+            "deterministic_check": clr_result.deterministic_verification,
         }
 
     def _is_cacheable(self, clr_result: CLRResult, allow_weak_cache: bool = False) -> bool:
@@ -650,7 +658,12 @@ class HybridReasoningOrchestrator:
 
     async def _run_clr_with_cache(self, query: str) -> Tuple[CLRResult, bool]:
         """Run CLR, but return a cached result if a similar high-score
-        problem was solved before. Returns (result, cache_hit)."""
+        problem was solved before. Returns (result, cache_hit).
+
+        Selects a deterministic verifier based on the detected task type
+        and passes it into the CLR run. This is the ONLY path that allows
+        the final score to exceed the self-claims-only cap of 0.65.
+        """
         if self.use_clr_cache and self.clr_cache is not None:
             cached = self.clr_cache.lookup(query)
             if cached is not None:
@@ -670,17 +683,28 @@ class HybridReasoningOrchestrator:
                             best_raw_trace="<cached>",
                             all_trajectories=[],
                             k=cached.get("k") or self.reasoner.k,
+                            verification_method=cached.get("verification_method", "self_claims_only"),
+                            verified=cached.get("verified", False),
                         ),
                         True,
                     )
 
-        clr_result = await self.reasoner.run(query)
+        # Select a deterministic verifier based on the task type.
+        # This is what allows math/code tasks to exceed the 0.65 cap.
+        decision = self.route_structured(query)
+        task_type = decision["task_type"]
+        verifier = select_verifier(task_type)
+        if verifier is not None:
+            print(f"[CLR] Selected verifier: {verifier.name} (task_type={task_type})")
+        else:
+            print(f"[CLR] No verifier for task_type={task_type} — self-claims-only cap applies")
+
+        clr_result = await self.reasoner.run(query, verifier=verifier, task_type=task_type)
 
         # Insert into cache ONLY if the result is cacheable per the strict
         # should_cache policy. Weak self-verification is NOT cached by default.
         if self.use_clr_cache and self.clr_cache is not None and self._is_cacheable(clr_result):
             result_dict = self._build_cache_result_dict(clr_result)
-            det_check = result_dict["deterministic_check"]
             claim_count = result_dict["claim_count"]
 
             self.clr_cache.insert(
@@ -689,25 +713,24 @@ class HybridReasoningOrchestrator:
                 best_score=clr_result.best_score,
                 k=clr_result.k,
                 trajectory_count=len(clr_result.all_trajectories),
-                verified=result_dict["verification_method"] != "self_claims_only",
-                verification_method=result_dict["verification_method"],
+                verified=clr_result.verified,
+                verification_method=clr_result.verification_method,
                 claim_count=claim_count,
                 answer_present=True,
-                deterministic_check=det_check,
+                deterministic_check=clr_result.deterministic_verification,
                 failure=clr_result.failure_reason,
                 transport_failures=clr_result.transport_failures,
                 model_failures=clr_result.model_failures,
             )
             print(f"[CLRCache] Stored result (score={clr_result.best_score:.3f}, "
-                  f"claims={claim_count}, method={result_dict['verification_method']}, "
-                  f"det_check={det_check})")
+                  f"claims={claim_count}, method={clr_result.verification_method}, "
+                  f"verified={clr_result.verified})")
         elif self.use_clr_cache and self.clr_cache is not None:
-            result_dict = self._build_cache_result_dict(clr_result)
             print(
                 f"[CLRCache] NOT caching (score={clr_result.best_score:.3f}, "
-                f"claims={result_dict['claim_count']}, "
-                f"method={result_dict['verification_method']}, "
-                f"answer={clr_result.best_answer[:40]!r}...)"
+                  f"method={clr_result.verification_method}, "
+                  f"verified={clr_result.verified}, "
+                  f"answer={clr_result.best_answer[:40]!r}...)"
             )
 
         return clr_result, False
