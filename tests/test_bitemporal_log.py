@@ -6,7 +6,7 @@ import tempfile
 
 import pytest
 
-from bitemporal_log import BiTemporalAuditLog, migrate_legacy_log
+from bitemporal_log import AuditCorruptionError, BiTemporalAuditLog, migrate_legacy_log
 
 
 class FakeJob:
@@ -255,3 +255,195 @@ class TestMigration:
         finally:
             if os.path.exists(legacy):
                 os.unlink(legacy)
+
+
+class TestStrictChainVerification:
+    """Strict verify_chain must fail on malformed lines, missing fields,
+    duplicate/out-of-order sequence numbers, and hash mismatches.
+
+    The old verify_chain used read_all() which silently skipped malformed
+    lines — making the integrity check too soft. Strict mode catches them.
+    """
+
+    def _write_lines(self, path, lines):
+        with open(path, "w") as f:
+            for line in lines:
+                f.write(line + "\n")
+
+    def test_verify_chain_fails_on_malformed_line(self, log_path):
+        log = BiTemporalAuditLog(log_path)
+        log.record(FakeJob(), "submitted",
+                   valid_time="2026-01-01T00:00:00+00:00",
+                   transaction_time="2026-01-01T00:00:01+00:00")
+        # Append a malformed line
+        with open(log_path, "a") as f:
+            f.write("THIS IS NOT JSON\n")
+        log2 = BiTemporalAuditLog(log_path)
+        ok, errors = log2.verify_chain(strict=True)
+        assert not ok
+        assert any("Malformed JSONL" in e for e in errors)
+
+    def test_verify_chain_fails_on_missing_record_hash(self, log_path):
+        entry = {
+            "schema_version": 2, "sequence_number": 1,
+            "record_id": "r1", "previous_hash": None,
+            "valid_time": "t1", "transaction_time": "t2",
+            "job_id": "j1", "event": "submitted", "status": "pending",
+            "query": "q", "priority": 1, "force_route": None,
+            "extra": {}, "correction_of": None,
+        }
+        # No record_hash field
+        self._write_lines(log_path, [json.dumps(entry)])
+        log = BiTemporalAuditLog(log_path)
+        ok, errors = log.verify_chain(strict=True)
+        assert not ok
+        assert any("missing record_hash" in e for e in errors)
+
+    def test_verify_chain_fails_on_missing_previous_hash(self, log_path):
+        entry = {
+            "schema_version": 2, "sequence_number": 1,
+            "record_id": "r1", "record_hash": "sha256:fake",
+            "valid_time": "t1", "transaction_time": "t2",
+            "job_id": "j1", "event": "submitted", "status": "pending",
+            "query": "q", "priority": 1, "force_route": None,
+            "extra": {}, "correction_of": None,
+        }
+        self._write_lines(log_path, [json.dumps(entry)])
+        log = BiTemporalAuditLog(log_path)
+        ok, errors = log.verify_chain(strict=True)
+        assert not ok
+        assert any("missing previous_hash" in e for e in errors)
+
+    def test_verify_chain_fails_on_duplicate_sequence(self, log_path):
+        log = BiTemporalAuditLog(log_path)
+        log.record(FakeJob(), "submitted",
+                   valid_time="2026-01-01T00:00:00+00:00",
+                   transaction_time="2026-01-01T00:00:01+00:00")
+        # Append a second entry with the SAME sequence_number (1)
+        import hashlib
+        entry = {
+            "schema_version": 2, "sequence_number": 1,  # duplicate!
+            "record_id": "r2", "previous_hash": log.read_all()[0]["record_hash"],
+            "valid_time": "t3", "transaction_time": "t4",
+            "job_id": "j1", "event": "completed", "status": "completed",
+            "query": "q", "priority": 1, "force_route": None,
+            "extra": {}, "correction_of": None,
+        }
+        entry["record_hash"] = "sha256:" + hashlib.sha256(
+            json.dumps({k: v for k, v in entry.items() if k != "record_hash"},
+                       sort_keys=True).encode()
+        ).hexdigest()
+        with open(log_path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+        log2 = BiTemporalAuditLog(log_path)
+        ok, errors = log2.verify_chain(strict=True)
+        assert not ok
+        assert any("duplicate sequence_number" in e for e in errors)
+
+    def test_verify_chain_fails_on_out_of_order_sequence(self, log_path):
+        log = BiTemporalAuditLog(log_path)
+        log.record(FakeJob(), "submitted",
+                   valid_time="2026-01-01T00:00:00+00:00",
+                   transaction_time="2026-01-01T00:00:01+00:00")
+        # Append entry with sequence_number=5 (skipping 2,3,4)
+        import hashlib
+        entry = {
+            "schema_version": 2, "sequence_number": 5,  # out of order
+            "record_id": "r2", "previous_hash": log.read_all()[0]["record_hash"],
+            "valid_time": "t3", "transaction_time": "t4",
+            "job_id": "j1", "event": "completed", "status": "completed",
+            "query": "q", "priority": 1, "force_route": None,
+            "extra": {}, "correction_of": None,
+        }
+        entry["record_hash"] = "sha256:" + hashlib.sha256(
+            json.dumps({k: v for k, v in entry.items() if k != "record_hash"},
+                       sort_keys=True).encode()
+        ).hexdigest()
+        with open(log_path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+        log2 = BiTemporalAuditLog(log_path)
+        ok, errors = log2.verify_chain(strict=True)
+        assert not ok
+        assert any("sequence_number=5" in e for e in errors)
+
+    def test_verify_chain_fails_on_previous_hash_mismatch(self, log_path):
+        log = BiTemporalAuditLog(log_path)
+        log.record(FakeJob(), "submitted",
+                   valid_time="2026-01-01T00:00:00+00:00",
+                   transaction_time="2026-01-01T00:00:01+00:00")
+        # Append entry with WRONG previous_hash
+        import hashlib
+        entry = {
+            "schema_version": 2, "sequence_number": 2,
+            "record_id": "r2", "previous_hash": "sha256:WRONG",
+            "valid_time": "t3", "transaction_time": "t4",
+            "job_id": "j1", "event": "completed", "status": "completed",
+            "query": "q", "priority": 1, "force_route": None,
+            "extra": {}, "correction_of": None,
+        }
+        entry["record_hash"] = "sha256:" + hashlib.sha256(
+            json.dumps({k: v for k, v in entry.items() if k != "record_hash"},
+                       sort_keys=True).encode()
+        ).hexdigest()
+        with open(log_path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+        log2 = BiTemporalAuditLog(log_path)
+        ok, errors = log2.verify_chain(strict=True)
+        assert not ok
+        assert any("previous_hash mismatch" in e for e in errors)
+
+    def test_verify_chain_fails_on_invalid_schema_version(self, log_path):
+        import hashlib
+        entry = {
+            "schema_version": 99,  # wrong version
+            "sequence_number": 1,
+            "record_id": "r1", "previous_hash": None,
+            "valid_time": "t1", "transaction_time": "t2",
+            "job_id": "j1", "event": "submitted", "status": "pending",
+            "query": "q", "priority": 1, "force_route": None,
+            "extra": {}, "correction_of": None,
+        }
+        entry["record_hash"] = "sha256:" + hashlib.sha256(
+            json.dumps({k: v for k, v in entry.items() if k != "record_hash"},
+                       sort_keys=True).encode()
+        ).hexdigest()
+        self._write_lines(log_path, [json.dumps(entry)])
+        log = BiTemporalAuditLog(log_path)
+        ok, errors = log.verify_chain(strict=True)
+        assert not ok
+        assert any("invalid schema_version" in e for e in errors)
+
+    def test_read_all_can_skip_malformed_for_dashboard(self, log_path):
+        """read_all() (non-strict) skips malformed lines for dashboard use."""
+        with open(log_path, "w") as f:
+            f.write(json.dumps({"record_id": "r1", "valid_time": "t1",
+                                "transaction_time": "t2", "job_id": "j1",
+                                "event": "submitted", "status": "pending",
+                                "query": "q", "priority": 1, "force_route": None,
+                                "extra": {}, "correction_of": None}) + "\n")
+            f.write("THIS IS NOT JSON\n")
+            f.write(json.dumps({"record_id": "r2", "valid_time": "t3",
+                                "transaction_time": "t4", "job_id": "j1",
+                                "event": "completed", "status": "completed",
+                                "query": "q", "priority": 1, "force_route": None,
+                                "extra": {}, "correction_of": None}) + "\n")
+        log = BiTemporalAuditLog(log_path)
+        entries = log.read_all()
+        assert len(entries) == 2  # malformed line skipped, no exception
+
+    def test_iter_raw_records_strict_raises_on_malformed(self, log_path):
+        with open(log_path, "w") as f:
+            f.write(json.dumps({"event": "ok"}) + "\n")
+            f.write("NOT JSON\n")
+        log = BiTemporalAuditLog(log_path)
+        with pytest.raises(AuditCorruptionError, match="Malformed JSONL"):
+            log.iter_raw_records_strict()
+
+    def test_strict_verify_chain_passes_on_valid_log(self, log):
+        for evt in ["submitted", "started", "completed"]:
+            log.record(FakeJob(), evt,
+                       valid_time=f"2026-01-01T00:00:0{evt[0]}+00:00",
+                       transaction_time=f"2026-01-01T00:00:0{evt[0]}+00:00")
+        ok, errors = log.verify_chain(strict=True)
+        assert ok, f"Chain should be valid in strict mode: {errors}"
+

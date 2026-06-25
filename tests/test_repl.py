@@ -1,9 +1,10 @@
 """Pytest tests for the REPL (no model servers needed)."""
 
 import asyncio
+import os
 import pytest
 
-from rfsn_cli import _split_flags, JobQueueREPL
+from rfsn_cli import _env_bool, _split_flags, build_argparser, JobQueueREPL
 
 
 class TestFlagParsing:
@@ -21,6 +22,110 @@ class TestFlagParsing:
     def test_dangling_flag_no_value(self):
         flags, _ = _split_flags(["-p"])
         assert flags == {}
+
+
+class TestCLIFlags:
+    """Tests for the CLI boolean flag parsing (--clr/--no-clr, etc.).
+
+    The old ``--clr/--no-clr`` argparse syntax was broken: ``--no-clr`` was
+    not recognized. These tests verify the split flag approach works.
+    """
+
+    def test_cli_parses_no_clr(self):
+        args = build_argparser().parse_args(["--no-clr"])
+        assert args.use_clr is False
+
+    def test_cli_parses_clr(self):
+        args = build_argparser().parse_args(["--clr"])
+        assert args.use_clr is True
+
+    def test_cli_default_clr_is_true(self):
+        args = build_argparser().parse_args([])
+        assert args.use_clr is True
+
+    def test_cli_parses_no_embedding_router(self):
+        args = build_argparser().parse_args(["--no-embedding-router"])
+        assert args.use_embedding_router is False
+
+    def test_cli_parses_embedding_router(self):
+        args = build_argparser().parse_args(["--embedding-router"])
+        assert args.use_embedding_router is True
+
+    def test_cli_default_embedding_router_is_true(self):
+        args = build_argparser().parse_args([])
+        assert args.use_embedding_router is True
+
+    def test_cli_parses_both_flags(self):
+        args = build_argparser().parse_args(["--no-clr", "--no-embedding-router"])
+        assert args.use_clr is False
+        assert args.use_embedding_router is False
+
+
+class TestEnvVarSupport:
+    """Tests for environment variable loading and CLI override precedence."""
+
+    def test_env_bool_parsing(self):
+        assert _env_bool("NONEXISTENT_VAR", True) is True
+        assert _env_bool("NONEXISTENT_VAR", False) is False
+        os.environ["TEST_BOOL_TRUE"] = "true"
+        assert _env_bool("TEST_BOOL_TRUE", False) is True
+        os.environ["TEST_BOOL_FALSE"] = "false"
+        assert _env_bool("TEST_BOOL_FALSE", True) is False
+        os.environ["TEST_BOOL_1"] = "1"
+        assert _env_bool("TEST_BOOL_1", False) is True
+        os.environ["TEST_BOOL_YES"] = "yes"
+        assert _env_bool("TEST_BOOL_YES", False) is True
+        for k in ("TEST_BOOL_TRUE", "TEST_BOOL_FALSE", "TEST_BOOL_1", "TEST_BOOL_YES"):
+            del os.environ[k]
+
+    def test_env_vibe_url_loaded(self, monkeypatch):
+        monkeypatch.setenv("VIBE_THINKER_URL", "http://env-specialist:9999")
+        args = build_argparser().parse_args([])
+        assert args.vibe == "http://env-specialist:9999"
+
+    def test_env_generalist_url_loaded(self, monkeypatch):
+        monkeypatch.setenv("GENERALIST_URL", "http://env-generalist:8888")
+        args = build_argparser().parse_args([])
+        assert args.generalist == "http://env-generalist:8888"
+
+    def test_cli_overrides_env(self, monkeypatch):
+        """CLI flags take precedence over environment variables."""
+        monkeypatch.setenv("VIBE_THINKER_URL", "http://env-specialist:9999")
+        args = build_argparser().parse_args(["--vibe", "http://cli-specialist:7777"])
+        assert args.vibe == "http://cli-specialist:7777"
+
+    def test_env_max_concurrent_loaded(self, monkeypatch):
+        monkeypatch.setenv("RFSN_MAX_CONCURRENT", "5")
+        args = build_argparser().parse_args([])
+        assert args.max_concurrent == 5
+
+    def test_env_use_clr_false(self, monkeypatch):
+        monkeypatch.setenv("RFSN_USE_CLR", "false")
+        args = build_argparser().parse_args([])
+        assert args.use_clr is False
+
+    def test_env_use_clr_true(self, monkeypatch):
+        monkeypatch.setenv("RFSN_USE_CLR", "true")
+        args = build_argparser().parse_args([])
+        assert args.use_clr is True
+
+    def test_env_clr_k_loaded(self, monkeypatch):
+        monkeypatch.setenv("RFSN_CLR_K", "16")
+        args = build_argparser().parse_args([])
+        assert args.clr_k == 16
+
+    def test_cli_overrides_env_clr(self, monkeypatch):
+        """CLI --no-clr overrides env RFSN_USE_CLR=true."""
+        monkeypatch.setenv("RFSN_USE_CLR", "true")
+        args = build_argparser().parse_args(["--no-clr"])
+        assert args.use_clr is False
+
+    def test_boolean_env_parsing_on(self, monkeypatch):
+        monkeypatch.setenv("RFSN_USE_EMBEDDING_ROUTER", "on")
+        args = build_argparser().parse_args([])
+        assert args.use_embedding_router is True
+
+
 
 
 class FakeResult:

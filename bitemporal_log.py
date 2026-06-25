@@ -58,6 +58,15 @@ from typing import Any, Dict, List, Optional, Tuple
 SCHEMA_VERSION = 2
 
 
+class AuditCorruptionError(Exception):
+    """Raised when the audit log fails strict integrity verification.
+
+    This is a hard error: the chain is broken or a record is malformed.
+    Callers should treat this as evidence of tampering or corruption, not
+    a transient read glitch.
+    """
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -163,35 +172,106 @@ class BiTemporalAuditLog:
         return entry
 
     # ----------------------- chain verification ----------------------- #
-    def verify_chain(self) -> Tuple[bool, List[str]]:
+    def iter_raw_records_strict(self) -> List[Dict[str, Any]]:
+        """Read every line as JSON, raising AuditCorruptionError on the first
+        malformed line. Unlike :meth:`read_all` (which skips malformed lines
+        for dashboard use), this is the strict reader used by verification.
+        """
+        if not os.path.exists(self.path):
+            return []
+        records: List[Dict[str, Any]] = []
+        with open(self.path, "r", encoding="utf-8") as f:
+            for line_no, line in enumerate(f, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as e:
+                    raise AuditCorruptionError(
+                        f"Malformed JSONL at line {line_no}: {e}"
+                    ) from e
+                records.append(record)
+        return records
+
+    def verify_chain(self, strict: bool = True) -> Tuple[bool, List[str]]:
         """Verify the integrity of the hash chain.
 
-        Returns (is_valid, list_of_errors). Each error describes a broken link.
+        Args:
+            strict: When True (default), malformed JSON, missing required
+                fields, duplicate/out-of-order sequence numbers, invalid
+                hashes, and invalid schema versions all count as failures.
+                When False, falls back to the lenient behavior that skips
+                malformed lines (useful only for quick dashboard reads).
+
+        Returns ``(is_valid, list_of_errors)``. Each error describes a
+        broken link. In strict mode, a malformed line raises
+        :class:`AuditCorruptionError` — callers should catch it if they
+        want the error list instead of an exception.
         """
-        entries = self.read_all()
-        errors = []
-        prev_hash = None
+        if strict:
+            try:
+                entries = self.iter_raw_records_strict()
+            except AuditCorruptionError as e:
+                return False, [str(e)]
+        else:
+            entries = self.read_all()
+
+        errors: List[str] = []
+        prev_hash: Optional[str] = None
         expected_seq = 1
+        seen_seqs: set = set()
 
         for i, entry in enumerate(entries):
-            # Check sequence number
+            line_label = f"line {i + 1}"
+
+            # --- Required field checks (strict only) ---
+            if strict:
+                if "record_hash" not in entry:
+                    errors.append(f"{line_label}: missing record_hash")
+                    # Can't continue hash verification for this entry
+                    prev_hash = entry.get("record_hash")
+                    expected_seq += 1
+                    continue
+                if "previous_hash" not in entry:
+                    errors.append(f"{line_label}: missing previous_hash")
+                if "sequence_number" not in entry:
+                    errors.append(f"{line_label}: missing sequence_number")
+                    expected_seq += 1
+                    continue
+                if "schema_version" not in entry:
+                    errors.append(f"{line_label}: missing schema_version")
+                elif entry["schema_version"] != SCHEMA_VERSION:
+                    errors.append(
+                        f"{line_label}: invalid schema_version="
+                        f"{entry['schema_version']}, expected {SCHEMA_VERSION}"
+                    )
+
+            # --- Sequence number checks ---
             seq = entry.get("sequence_number")
-            if seq != expected_seq:
-                errors.append(f"line {i+1}: sequence_number={seq}, expected={expected_seq}")
+            if seq is not None:
+                if strict and seq in seen_seqs:
+                    errors.append(f"{line_label}: duplicate sequence_number={seq}")
+                seen_seqs.add(seq)
+                if seq != expected_seq:
+                    errors.append(
+                        f"{line_label}: sequence_number={seq}, expected={expected_seq}"
+                    )
             expected_seq += 1
 
-            # Check previous_hash linkage
+            # --- previous_hash linkage ---
             if entry.get("previous_hash") != prev_hash:
                 errors.append(
-                    f"line {i+1}: previous_hash mismatch "
+                    f"{line_label}: previous_hash mismatch "
                     f"(got {entry.get('previous_hash')}, expected {prev_hash})"
                 )
 
-            # Verify record_hash
+            # --- record_hash verification ---
             stored_hash = entry.get("record_hash")
-            computed_hash = _hash_entry(entry)
-            if stored_hash != computed_hash:
-                errors.append(f"line {i+1}: record_hash mismatch (tampered content)")
+            if stored_hash is not None:
+                computed_hash = _hash_entry(entry)
+                if stored_hash != computed_hash:
+                    errors.append(f"{line_label}: record_hash mismatch (tampered content)")
 
             prev_hash = stored_hash
 
@@ -420,7 +500,7 @@ if __name__ == "__main__":
             print(f"{jid}\t{e['status']}\t{e['event']}\t{e['valid_time']}")
     elif args.cmd == "verify":
         log = BiTemporalAuditLog(args.path)
-        ok, errors = log.verify_chain()
+        ok, errors = log.verify_chain(strict=True)
         if ok:
             print("Chain integrity: OK")
         else:

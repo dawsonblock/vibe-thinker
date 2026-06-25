@@ -1,5 +1,6 @@
-# Core async HTTP (required)
+# Core async HTTP + env config (required)
 aiohttp>=3.9,<4
+python-dotenv>=1.0,<2
 
 # Optional: semantic routing + CLR result cache
 # Install these for the full experience (embedding-based routing + semantic cache).

@@ -37,7 +37,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import aiohttp
 
 from vibe_clr_async import CLRResult, VibeThinkerCLRAsync
-from persistent_cache import CLRResultCache, PersistentRouteCache
+from persistent_cache import CLRResultCache, PersistentRouteCache, should_cache
 
 # Optional dependency — gracefully degrade if not installed
 try:
@@ -275,6 +275,75 @@ class HybridReasoningOrchestrator:
     # ------------------------------------------------------------------ #
     # Routing
     # ------------------------------------------------------------------ #
+    # Non-programming "code" phrases that must NOT route to the code task.
+    # These are word-boundary phrase patterns checked before code keywords.
+    NON_PROGRAMMING_CODE_PATTERNS = [
+        r"\bcode of conduct\b",
+        r"\bcode of ethics\b",
+        r"\bdress code\b",
+        r"\bbuilding code\b",
+        r"\blegal code\b",
+        r"\bcode of honor\b",
+        r"\bcode of practice\b",
+        r"\barea code\b",
+        r"\bzip code\b",
+        r"\bbarcode\b",
+        r"\bqr code\b",
+        r"\bcode pink\b",
+        r"\bcode blue\b",
+        r"\bcode red\b",
+    ]
+
+    # Strong programming signals that override math intent. If any of these
+    # are present, the query is code regardless of math-like words.
+    STRONG_CODE_SIGNALS = [
+        r"\bleetcode\b",
+        r"\bhackerrank\b",
+        r"\bcodeforces\b",
+        r"\bgithub\b",
+        r"\bgitlab\b",
+        r"\bnpm\b",
+        r"\bpip install\b",
+        r"\bstack overflow\b",
+        r"\bunit test\b",
+        r"\bpytest\b",
+        r"\bcompile error\b",
+        r"\bsyntax error\b",
+        r"\bsegfault\b",
+        r"\bdebug\b.*\b(python|javascript|rust|java|c\+\+|go)\b",
+    ]
+
+    # Math should require computational intent, not just the word "sum" or
+    # "series" appearing in a non-math context (e.g. "sum of human knowledge",
+    # "world series", "TV series").
+    MATH_INTENT_PATTERNS = [
+        r"\bsolve\b.*\b(equation|integral|derivative|sum|series|system|inequality)\b",
+        r"\bcompute\b",
+        r"\bcalculate\b",
+        r"\bprove\b",
+        r"\bevaluate\b",
+        r"\bwhat is\s+\d+",
+        r"\bfind the value\b",
+        r"\bfind\s+\w+\s+of\b.*\d",
+        r"\b\d+\s*[+\-*/=]\s*\d+",
+        r"\\boxed",
+        r"\\frac",
+        r"\\int",
+        r"\\sum",
+        r"\bderivative of\b",
+        r"\bintegral of\b",
+        r"\bsum of\b.*\d",
+        r"\bgeometric series\b",
+        r"\brecurrence\b",
+        r"\bprobability of\b",
+        r"\bmatrix\b",
+        r"\bvector\b",
+        r"\btheorem\b",
+        r"\balgebra\b",
+        r"\bcalculus\b",
+        r"\bcombinatorics\b",
+    ]
+
     # Task-type keywords for structured routing. Maps task categories to
     # the tools they typically require for deterministic verification.
     _TASK_TYPE_KEYWORDS = {
@@ -282,7 +351,8 @@ class HybridReasoningOrchestrator:
             "keywords": {"solve", "calculate", "prove", "find the value", "sum",
                          "sequence", "series", "integral", "derivative", "probability",
                          "recurrence", "equation", "matrix", "vector", "theorem",
-                         "geometric", "algebra", "calculus", "combinatorics"},
+                         "geometric", "algebra", "calculus", "combinatorics",
+                         "compute", "evaluate"},
             "requires_tools": ["deterministic_check"],
             "requires_model": True,
         },
@@ -327,11 +397,50 @@ class HybridReasoningOrchestrator:
 
         Uses word-boundary matching to avoid false positives (e.g. "summarize"
         containing "sum" should NOT match the math keyword "sum").
+
+        Additional false-positive guards:
+          - Non-programming "code" phrases (code of conduct, dress code, etc.)
+            are excluded from the code task type.
+          - Math requires computational intent (not just the word "sum" or
+            "series" in a non-math context like "sum of human knowledge").
         """
         q_lower = query.lower()
+
+        # --- Guard: non-programming "code" phrases ---
+        # If the query matches a non-programming code pattern, do NOT classify
+        # it as "code" even if the word "code" appears.
+        is_non_programming_code = any(
+            re.search(pattern, q_lower)
+            for pattern in self.NON_PROGRAMMING_CODE_PATTERNS
+        )
+
+        # --- Guard: strong programming signals override math intent ---
+        # If "leetcode", "debug python", etc. are present, it's code regardless
+        # of math-like words like "sum" or "solve".
+        has_strong_code_signal = any(
+            re.search(pattern, q_lower)
+            for pattern in self.STRONG_CODE_SIGNALS
+        )
+
+        # --- Guard: math requires computational intent ---
+        has_math_intent = any(
+            re.search(pattern, q_lower)
+            for pattern in self.MATH_INTENT_PATTERNS
+        )
+        # If there's a strong code signal, suppress math intent
+        if has_strong_code_signal:
+            has_math_intent = False
+
         best_type = "unknown"
         best_score = 0
         for task_type, config in self._TASK_TYPE_KEYWORDS.items():
+            # Skip code task type if the query is a non-programming "code" phrase
+            if task_type == "code" and is_non_programming_code:
+                continue
+            # Skip math task type if there's no computational intent
+            if task_type == "math" and not has_math_intent:
+                continue
+
             score = 0
             for kw in config["keywords"]:
                 # Use word boundary matching for single words;
@@ -482,23 +591,59 @@ class HybridReasoningOrchestrator:
         "n/a",
     })
 
-    def _is_cacheable(self, clr_result: CLRResult) -> bool:
+    def _build_cache_result_dict(self, clr_result: CLRResult) -> dict:
+        """Build the result dict that should_cache() evaluates, enriched
+        with verification metadata from the best trajectory."""
+        best_traj = max(
+            (t for t in clr_result.all_trajectories if isinstance(t, dict)),
+            key=lambda x: x.get("score", 0),
+            default=None,
+        )
+        claim_count = (
+            len([c for c in (best_traj or {}).get("claims", [])
+                 if self.reasoner._is_meaningful_claim(c)])
+            if best_traj else 0
+        )
+        det_check = (best_traj or {}).get("deterministic_check")
+
+        # Determine verification method honestly.
+        # self_claims_only means the only "verification" was the model
+        # checking its own claims — that is NOT independent verification.
+        if det_check is True:
+            verification_method = "deterministic_check"
+        else:
+            verification_method = "self_claims_only"
+
+        return {
+            "answer": clr_result.best_answer,
+            "score": clr_result.best_score,
+            "answer_present": bool(clr_result.best_answer),
+            "claim_count": claim_count,
+            "verification_method": verification_method,
+            "failure": clr_result.failure_reason,
+            "transport_failures": clr_result.transport_failures,
+            "deterministic_check": det_check,
+        }
+
+    def _is_cacheable(self, clr_result: CLRResult, allow_weak_cache: bool = False) -> bool:
         """Return True only if a CLR result is safe to cache.
 
-        Rejects:
+        Uses the strict :func:`should_cache` policy by default:
           - No answer or sentinel failure strings
-          - Score below the cache's min_score threshold
-          - Zero trajectories (nothing was actually run)
+          - Score >= 0.75
+          - claim_count >= 5
+          - No transport failures
+          - self_claims_only verification is rejected unless allow_weak_cache
+
+        Args:
+            clr_result: the CLR result to evaluate.
+            allow_weak_cache: if True, allow self_claims_only verification
+                to be cached. Default is False.
         """
-        answer = (clr_result.best_answer or "").strip().lower()
-        if answer in self._UNCACHEABLE_ANSWERS:
+        result_dict = self._build_cache_result_dict(clr_result)
+        if not should_cache(result_dict, allow_weak_cache=allow_weak_cache):
             return False
-        if not clr_result.best_answer:
-            return False
-        if clr_result.best_score <= 0:
-            return False
-        if not clr_result.all_trajectories:
-            return False
+        # Also respect the cache's own min_score threshold if set higher
         if self.clr_cache is not None and clr_result.best_score < self.clr_cache.min_score:
             return False
         return True
@@ -531,17 +676,12 @@ class HybridReasoningOrchestrator:
 
         clr_result = await self.reasoner.run(query)
 
-        # Insert into cache ONLY if the result is cacheable
+        # Insert into cache ONLY if the result is cacheable per the strict
+        # should_cache policy. Weak self-verification is NOT cached by default.
         if self.use_clr_cache and self.clr_cache is not None and self._is_cacheable(clr_result):
-            # Count meaningful claims from the best trajectory
-            best_traj = max(
-                (t for t in clr_result.all_trajectories if isinstance(t, dict)),
-                key=lambda x: x.get("score", 0),
-                default=None,
-            )
-            claim_count = len([c for c in (best_traj or {}).get("claims", [])
-                              if self.reasoner._is_meaningful_claim(c)]) if best_traj else 0
-            det_check = (best_traj or {}).get("deterministic_check")
+            result_dict = self._build_cache_result_dict(clr_result)
+            det_check = result_dict["deterministic_check"]
+            claim_count = result_dict["claim_count"]
 
             self.clr_cache.insert(
                 problem=query,
@@ -549,18 +689,24 @@ class HybridReasoningOrchestrator:
                 best_score=clr_result.best_score,
                 k=clr_result.k,
                 trajectory_count=len(clr_result.all_trajectories),
-                verified=clr_result.best_score > 0,
-                verification_method="self_claims" if clr_result.best_score > 0 else "none",
+                verified=result_dict["verification_method"] != "self_claims_only",
+                verification_method=result_dict["verification_method"],
                 claim_count=claim_count,
                 answer_present=True,
                 deterministic_check=det_check,
-                failure=None,
+                failure=clr_result.failure_reason,
+                transport_failures=clr_result.transport_failures,
+                model_failures=clr_result.model_failures,
             )
             print(f"[CLRCache] Stored result (score={clr_result.best_score:.3f}, "
-                  f"claims={claim_count}, det_check={det_check})")
+                  f"claims={claim_count}, method={result_dict['verification_method']}, "
+                  f"det_check={det_check})")
         elif self.use_clr_cache and self.clr_cache is not None:
+            result_dict = self._build_cache_result_dict(clr_result)
             print(
                 f"[CLRCache] NOT caching (score={clr_result.best_score:.3f}, "
+                f"claims={result_dict['claim_count']}, "
+                f"method={result_dict['verification_method']}, "
                 f"answer={clr_result.best_answer[:40]!r}...)"
             )
 

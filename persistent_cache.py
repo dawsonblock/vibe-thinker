@@ -43,6 +43,59 @@ except ImportError:
 # ====================================================================== #
 # Atomic JSON write helper
 # ====================================================================== #
+# Answers that must NEVER be cached, regardless of score.
+BAD_ANSWERS = frozenset({
+    "no clear answer found",
+    "all trajectories failed",
+    "",
+    "none",
+    "null",
+    "n/a",
+})
+
+
+def should_cache(result: Dict[str, Any], allow_weak_cache: bool = False) -> bool:
+    """Decide whether a CLR result dict is safe to promote into the cache.
+
+    Default policy is strict (fail-closed): weak self-verification must NOT
+    enter the cache. The cache is a trust accelerator — caching uncertainty
+    as truth is the core epistemic hazard this system guards against.
+
+    Required keys in ``result``:
+      - answer: the final answer string
+      - score: reliability score (0.0–1.0)
+      - answer_present: whether a final answer was produced
+      - claim_count: number of meaningful claims that were scored
+      - verification_method: how the answer was verified
+      - failure: None if successful, error string if failed
+
+    Args:
+        result: the result dict to evaluate.
+        allow_weak_cache: if True, allow ``self_claims_only`` verification
+            to be cached. Default is False — self-agreement is NOT proof.
+
+    Returns:
+        True if the result is safe to cache, False otherwise.
+    """
+    if not result.get("answer_present"):
+        return False
+    if result.get("failure"):
+        return False
+    answer = (result.get("answer") or "").strip().lower()
+    if answer in BAD_ANSWERS:
+        return False
+    if result.get("claim_count", 0) < 5:
+        return False
+    if result.get("score", 0.0) < 0.75:
+        return False
+    method = result.get("verification_method", "self_claims_only")
+    if method == "self_claims_only" and not allow_weak_cache:
+        return False
+    if result.get("transport_failures", 0) > 0:
+        return False
+    return True
+
+
 def _atomic_write_json(path: str, data: Any) -> None:
     """Write JSON to a temp file in the same dir, then atomically rename."""
     d = os.path.dirname(os.path.abspath(path))
@@ -301,21 +354,27 @@ class CLRResultCache:
         k: int,
         trajectory_count: int,
         verified: bool = False,
-        verification_method: str = "self_claims",
+        verification_method: str = "self_claims_only",
         claim_count: int = 0,
         answer_present: bool = True,
         deterministic_check: Optional[bool] = None,
         failure: Optional[str] = None,
+        transport_failures: int = 0,
+        model_failures: int = 0,
     ) -> None:
         """Insert a CLR result into the semantic cache.
 
         Enriched entry format (per audit requirements):
           - verified: whether the answer was independently verified
-          - verification_method: how it was verified (self_claims, python_eval, etc.)
+          - verification_method: how it was verified (python_eval, unit_tests,
+            retrieval, or self_claims_only)
           - claim_count: number of meaningful claims that were scored
           - answer_present: whether a final answer was produced
           - deterministic_check: result of cross-trajectory deterministic check
           - failure: None if successful, error description if failed
+          - transport_failures: number of trajectories that failed at transport level
+          - model_failures: number of trajectories that failed at model level
+          - schema_version: cache entry format version (2)
         """
         embedding = self.model.encode([problem])[0].tolist()
         entry = {
@@ -332,6 +391,9 @@ class CLRResultCache:
             "answer_present": answer_present,
             "deterministic_check": deterministic_check,
             "failure": failure,
+            "transport_failures": int(transport_failures),
+            "model_failures": int(model_failures),
+            "schema_version": 2,
         }
         self.entries.append(entry)
         # Evict oldest low-score entries if over capacity (keep best scores)

@@ -37,10 +37,29 @@ Notes:
 
 import argparse
 import asyncio
+import os
 import shlex
 
 from hybrid_orchestrator import HybridReasoningOrchestrator
 from rfsn_job_queue import JobQueue
+
+# Optional: load .env file if python-dotenv is installed.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Parse a boolean environment variable.
+
+    Accepts: true/false, 1/0, yes/no (case-insensitive).
+    """
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("true", "1", "yes", "on")
 
 
 # ----------------------------- command parsing ----------------------------- #
@@ -268,19 +287,34 @@ class JobQueueREPL:
 # ----------------------------- entry point ----------------------------- #
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="RFSN job queue REPL.")
-    p.add_argument("--vibe", default="http://127.0.0.1:8080",
+    # Precedence: CLI flags > environment variables > defaults
+    p.add_argument("--vibe",
+                   default=os.environ.get("VIBE_THINKER_URL", "http://127.0.0.1:8080"),
                    help="VibeThinker specialist endpoint")
-    p.add_argument("--generalist", default="http://127.0.0.1:8081",
+    p.add_argument("--generalist",
+                   default=os.environ.get("GENERALIST_URL", "http://127.0.0.1:8081"),
                    help="Generalist model endpoint")
-    p.add_argument("--max-concurrent", type=int, default=2,
+    p.add_argument("--max-concurrent", type=int,
+                   default=int(os.environ.get("RFSN_MAX_CONCURRENT", "2")),
                    help="Max concurrent jobs")
-    p.add_argument("--clr/--no-clr", dest="use_clr", default=True,
-                   help="Use CLR on the specialist")
-    p.add_argument("--clr-k", type=int, default=8, help="CLR k")
-    p.add_argument("--audit-log", default="rfsn_jobs_bitemporal.jsonl",
+    p.add_argument("--clr", dest="use_clr", action="store_true",
+                   help="Use CLR on the specialist (default)")
+    p.add_argument("--no-clr", dest="use_clr", action="store_false",
+                   help="Disable CLR on the specialist")
+    p.set_defaults(use_clr=_env_bool("RFSN_USE_CLR", True))
+    p.add_argument("--clr-k", type=int,
+                   default=int(os.environ.get("RFSN_CLR_K", "8")),
+                   help="CLR k")
+    p.add_argument("--audit-log",
+                   default=os.environ.get("RFSN_AUDIT_LOG", "rfsn_jobs_bitemporal.jsonl"),
                    help="Bi-temporal audit log path (empty disables logging)")
-    p.add_argument("--embedding-router/--no-embedding-router",
-                   dest="use_embedding_router", default=True)
+    p.add_argument("--embedding-router", dest="use_embedding_router",
+                   action="store_true",
+                   help="Use embedding-based semantic router (default)")
+    p.add_argument("--no-embedding-router", dest="use_embedding_router",
+                   action="store_false",
+                   help="Disable embedding router, use keyword fallback")
+    p.set_defaults(use_embedding_router=_env_bool("RFSN_USE_EMBEDDING_ROUTER", True))
     return p
 
 

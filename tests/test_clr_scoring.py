@@ -1,8 +1,11 @@
 """Pytest tests for the CLR scoring logic (no model servers needed)."""
 
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
 
-from vibe_clr_async import VibeThinkerCLRAsync
+from vibe_clr_async import CLRResult, VibeThinkerCLRAsync
 
 
 @pytest.fixture
@@ -98,3 +101,65 @@ class TestIsMeaningfulClaim:
     ])
     def test_meaningful_claim_filter(self, clr, claim, expected):
         assert clr._is_meaningful_claim(claim) == expected
+
+
+class TestFailClosedRun:
+    """Tests for the fail-closed behavior of VibeThinkerCLRAsync.run().
+
+    A dead model server is infrastructure failure, not a low-confidence answer.
+    """
+
+    @pytest.mark.asyncio
+    async def test_all_trajectories_transport_fail_raises(self, clr):
+        """All trajectories fail with transport exceptions -> RuntimeError."""
+        async def boom(*args, **kwargs):
+            raise RuntimeError("Connection refused")
+        with patch.object(clr, "_generate_one_trajectory", new=AsyncMock(side_effect=boom)):
+            with pytest.raises(RuntimeError, match="All CLR trajectories failed"):
+                await clr.run("test problem")
+
+    @pytest.mark.asyncio
+    async def test_partial_trajectory_failure_still_returns_with_metadata(self):
+        """Some trajectories fail, some succeed -> continue with warning metadata."""
+        clr = VibeThinkerCLRAsync(server_url="http://localhost:0", k=4)
+        good_traj = {
+            "score": 1.0,
+            "answer": "42",
+            "claims": ["a" * 20, "b" * 20, "c" * 20, "d" * 20, "e" * 20],
+            "verdicts": [1, 1, 1, 1, 1],
+            "raw_trace": "reasoning \\boxed{42}",
+            "answer_present": True,
+        }
+
+        call_count = 0
+        async def mixed(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count % 2 == 0:
+                raise RuntimeError("Connection refused")
+            return good_traj
+
+        with patch.object(clr, "_generate_one_trajectory", new=AsyncMock(side_effect=mixed)):
+            result = await clr.run("test problem")
+        assert result.partial_failure is True
+        assert result.transport_failures > 0
+        assert result.best_answer == "42"
+
+    @pytest.mark.asyncio
+    async def test_successful_empty_answer_returns_zero_score_completed(self, clr):
+        """Trajectories succeed but none produce a final answer -> score 0, completed."""
+        empty_traj = {
+            "score": 0.0,
+            "answer": None,
+            "claims": [],
+            "verdicts": [],
+            "raw_trace": "reasoning with no boxed answer",
+            "answer_present": False,
+        }
+        with patch.object(clr, "_generate_one_trajectory",
+                          new=AsyncMock(return_value=empty_traj)):
+            result = await clr.run("test problem")
+        assert result.best_score == 0.0
+        assert result.best_answer == "No clear answer found"
+        assert result.failure_reason is None  # not an infrastructure failure
+

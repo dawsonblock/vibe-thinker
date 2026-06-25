@@ -215,3 +215,49 @@ class TestBitemporalIntegration:
         await q.stop()
         hist = q.job_history(j.job_id)
         assert any(e["event"] == "failed" for e in hist)
+
+
+class TestSpecialistDeadEndpoint:
+    """A dead specialist endpoint must mark the job FAILED, not return a
+    low-confidence 'No clear answer found' completed result."""
+
+    @pytest.mark.asyncio
+    async def test_specialist_dead_endpoint_marks_job_failed(self, log_path):
+        class DeadSpecialistOrchestrator:
+            """Simulates a dead specialist endpoint — all CLR trajectories
+            fail with a transport error, which must propagate as RuntimeError."""
+            async def run(self, query, force_route=None):
+                raise RuntimeError(
+                    "All CLR trajectories failed (8/8): "
+                    "Model call to http://127.0.0.1:8080 failed: "
+                    "Cannot connect to host"
+                )
+
+        orch = DeadSpecialistOrchestrator()
+        q = JobQueue(orch, max_concurrent=2, audit_log=log_path)
+        await q.start()
+        j = q.submit("Solve a math problem", priority=5, force_route="specialist")
+        with pytest.raises(RuntimeError, match="All CLR trajectories failed"):
+            await q.wait_for(j.job_id, timeout=5)
+        assert q.status(j.job_id) == JobStatus.FAILED
+        assert "All CLR trajectories failed" in j.error
+        await q.stop()
+
+    @pytest.mark.asyncio
+    async def test_dead_generalist_endpoint_marks_job_failed(self, log_path):
+        class DeadGeneralistOrchestrator:
+            async def run(self, query, force_route=None):
+                raise RuntimeError(
+                    "Generalist call failed (both endpoints): "
+                    "Cannot connect to host 127.0.0.1:8081"
+                )
+
+        orch = DeadGeneralistOrchestrator()
+        q = JobQueue(orch, max_concurrent=2, audit_log=log_path)
+        await q.start()
+        j = q.submit("Explain something", priority=1, force_route="generalist")
+        with pytest.raises(RuntimeError, match="Generalist call failed"):
+            await q.wait_for(j.job_id, timeout=5)
+        assert q.status(j.job_id) == JobStatus.FAILED
+        await q.stop()
+

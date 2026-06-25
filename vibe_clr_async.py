@@ -36,6 +36,13 @@ class CLRResult:
     best_raw_trace: str
     all_trajectories: List[Dict] = field(default_factory=list)
     k: int = 8
+    # Fail-closed metadata: lets callers distinguish infrastructure failure
+    # from a low-confidence answer. A dead model server is NOT a low-confidence
+    # answer — it is a transport/model failure that must propagate.
+    transport_failures: int = 0
+    model_failures: int = 0
+    partial_failure: bool = False
+    failure_reason: Optional[str] = None
 
 
 class VibeThinkerCLRAsync:
@@ -424,16 +431,40 @@ rather than silently proceeding with an empty string."""
             ]
             trajectories = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Filter out any failed trajectories (exceptions from gather)
-        valid_trajectories = [t for t in trajectories if isinstance(t, dict)]
+        # Separate successful trajectories from failures.
+        # Fail-closed rule: if ALL trajectories failed due to transport/model
+        # exceptions, that is an INFRASTRUCTURE failure, not a low-confidence
+        # answer. It must raise so the job queue marks the job FAILED.
+        successful = [t for t in trajectories if isinstance(t, dict)]
+        failures = [t for t in trajectories if isinstance(t, Exception)]
+
+        if not successful and failures:
+            # Every single trajectory failed — the model server is dead or
+            # unreachable. Raise so callers know it was infrastructure, not
+            # reasoning uncertainty.
+            raise RuntimeError(
+                f"All CLR trajectories failed ({len(failures)}/{self.k}): "
+                f"{failures[0]}"
+            )
+
+        valid_trajectories = successful
+        partial_failure = len(failures) > 0
+        if partial_failure:
+            print(
+                f"[CLR] WARNING: {len(failures)}/{self.k} trajectories failed "
+                f"(partial failure) — continuing with {len(successful)} successful"
+            )
 
         if not valid_trajectories:
+            # No failures but no successes either (shouldn't happen, but
+            # fail closed just in case).
             return CLRResult(
                 best_answer="No clear answer found",
                 best_score=0.0,
                 best_raw_trace="",
                 all_trajectories=[],
                 k=self.k,
+                failure_reason="no trajectories produced",
             )
 
         # Only consider trajectories that actually produced a final answer.
@@ -441,12 +472,17 @@ rather than silently proceeding with an empty string."""
         answered = [t for t in valid_trajectories if t.get("answer_present") and t.get("answer")]
 
         if not answered:
+            # Trajectories succeeded (model responded) but none produced a
+            # usable answer. This is a genuine score-0 completed result, NOT
+            # an infrastructure failure.
             return CLRResult(
                 best_answer="No clear answer found",
                 best_score=0.0,
                 best_raw_trace="",
                 all_trajectories=valid_trajectories,
                 k=self.k,
+                transport_failures=len(failures),
+                partial_failure=partial_failure,
             )
 
         # Apply deterministic cross-trajectory answer checking.
@@ -484,6 +520,8 @@ rather than silently proceeding with an empty string."""
             best_raw_trace=best["raw_trace"],
             all_trajectories=valid_trajectories,
             k=self.k,
+            transport_failures=len(failures),
+            partial_failure=partial_failure,
         )
 
         print(f"\nBest trajectory score: {best['score']:.4f}")
