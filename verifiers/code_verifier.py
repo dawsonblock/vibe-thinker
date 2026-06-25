@@ -1,42 +1,127 @@
 """Deterministic code verifier.
 
-Executes Python snippets in a bounded subprocess and captures stdout/stderr.
-Can run provided unit tests against a candidate solution. Fails closed on
-timeout or execution error.
+Executes Python snippets in an isolated sandbox and captures
+stdout/stderr. Can run provided unit tests against a candidate solution.
+Fails closed on timeout or execution error.
 
-Security: code is run in a subprocess with a timeout. This is NOT a full
-sandbox — for untrusted code, use a proper sandbox (Docker, nsjail, etc.).
-The subprocess approach prevents the verifier from hanging the main process
-on infinite loops, but does not isolate filesystem or network access.
+Security: code is run in a sandbox executor (Docker container by default,
+sbx microVM for maximum isolation). The verifier does NOT fall back to
+host execution for untrusted code — if no sandbox is available, it
+returns verified=False with an error explaining that no sandbox was found.
 
 Capabilities:
-  - run small Python snippets in subprocess
+  - run small Python snippets in sandbox
   - timeout execution (default 5 seconds)
   - capture stdout/stderr
   - run provided unit tests
   - fail closed on timeout/error
+  - fail closed if no sandbox executor available
+
+Sandbox selection order:
+  1. DockerSandboxExecutor (if Docker is available)
+  2. DockerSbxExecutor (if sbx is available)
+  3. LocalSubprocessExecutor (ONLY if allow_unsafe=True explicitly)
+  4. None -> refuse verification
 """
 
-import asyncio
 import textwrap
 from typing import Any, Dict, Optional
 
 from verifiers.base import VerificationResult
+from sandbox import DockerSandboxExecutor, DockerSbxExecutor, LocalSubprocessExecutor
+from sandbox.base import ExecutionResult, SandboxExecutor
+
+
+def select_executor(
+    allow_unsafe: bool = False,
+    prefer_sbx: bool = False,
+) -> Optional[SandboxExecutor]:
+    """Select the best available sandbox executor.
+
+    Selection order:
+      1. DockerSbxExecutor (if prefer_sbx=True and sbx available)
+      2. DockerSandboxExecutor (if Docker available)
+      3. DockerSbxExecutor (if sbx available)
+      4. LocalSubprocessExecutor (ONLY if allow_unsafe=True)
+      5. None (refuse verification)
+
+    Args:
+        allow_unsafe: if True, allow LocalSubprocessExecutor as a fallback.
+            Default False — do not run untrusted code on the host.
+        prefer_sbx: if True, prefer sbx microVM over Docker container.
+
+    Returns:
+        A SandboxExecutor instance, or None if no safe executor is available.
+    """
+    if prefer_sbx:
+        sbx = DockerSbxExecutor()
+        if sbx.is_available():
+            return sbx
+
+    docker = DockerSandboxExecutor()
+    if docker.is_available():
+        return docker
+
+    sbx = DockerSbxExecutor()
+    if sbx.is_available():
+        return sbx
+
+    if allow_unsafe:
+        return LocalSubprocessExecutor()
+
+    return None
 
 
 class CodeVerifier:
-    """Deterministic verifier that executes Python code in a subprocess."""
+    """Deterministic verifier that executes Python code in a sandbox.
+
+    The verifier uses a SandboxExecutor for isolation. By default, it
+    prefers Docker containers. If Docker is not available, it tries sbx.
+    If neither is available, it REFUSES to verify — it does not fall back
+    to host execution unless allow_unsafe=True is explicitly passed.
+    """
 
     name = "code_verifier"
 
-    def __init__(self, timeout: float = 5.0):
+    def __init__(
+        self,
+        timeout: float = 5.0,
+        executor: Optional[SandboxExecutor] = None,
+        allow_unsafe: bool = False,
+    ):
+        """Initialize the code verifier.
+
+        Args:
+            timeout: execution timeout in seconds.
+            executor: explicit sandbox executor to use. If None, one is
+                selected automatically via select_executor().
+            allow_unsafe: if True and no sandbox is available, fall back
+                to LocalSubprocessExecutor. Default False — refuse to
+                verify rather than running untrusted code on the host.
+        """
         self.timeout = timeout
+        self._explicit_executor = executor is not None
+        self.executor: Optional[SandboxExecutor] = executor or select_executor(
+            allow_unsafe=allow_unsafe,
+        )
 
     async def verify(
         self, query: str, answer: str, context: Dict[str, Any]
     ) -> VerificationResult:
         unit_tests = context.get("unit_tests")
         expected_output = context.get("expected_output")
+
+        # Check that we have a sandbox executor
+        if self.executor is None:
+            return VerificationResult(
+                verified=False,
+                score=0.0,
+                method="python_exec",
+                evidence={"candidate_code": answer[:200]},
+                error="no sandbox executor available; refusing to run "
+                      "untrusted code on host. Install Docker or sbx, "
+                      "or pass allow_unsafe=True explicitly.",
+            )
 
         # If unit tests are provided, run them against the candidate code.
         if unit_tests:
@@ -58,154 +143,93 @@ class CodeVerifier:
     async def _run_unit_tests(
         self, code: str, unit_tests: str
     ) -> VerificationResult:
-        """Run unit tests against the candidate code."""
-        # Dedent the candidate code and tests, then indent them under
-        # the try blocks. We strip leading/trailing blank lines first to
-        # avoid indentation errors from stray newlines.
-        code_clean = textwrap.dedent(code).strip()
-        tests_clean = textwrap.dedent(unit_tests).strip()
-        script = (
-            "import sys, traceback\n"
-            "try:\n"
-            + textwrap.indent(code_clean, "    ") + "\n"
-            "except Exception as e:\n"
-            "    print(f'IMPORT_ERROR: {e}')\n"
-            "    sys.exit(1)\n"
-            "try:\n"
-            + textwrap.indent(tests_clean, "    ") + "\n"
-            "    print('ALL_TESTS_PASSED')\n"
-            "except AssertionError as e:\n"
-            "    print(f'ASSERTION_FAILED: {e}')\n"
-            "    sys.exit(1)\n"
-            "except Exception as e:\n"
-            "    print(f'TEST_ERROR: {e}')\n"
-            "    traceback.print_exc()\n"
-            "    sys.exit(1)\n"
+        """Run unit tests against the candidate code in the sandbox."""
+        result = await self.executor.execute_tests(
+            code, unit_tests,
+            timeout=self.timeout,
+            network=False,
         )
-        return await self._execute(script, method="unit_tests",
-                                    success_marker="ALL_TESTS_PASSED",
-                                    evidence={"code_length": len(code),
-                                              "tests_length": len(unit_tests)})
+        return self._interpret_test_result(result, {
+            "code_length": len(code),
+            "tests_length": len(unit_tests),
+            "executor": result.executor,
+        })
 
     async def _run_and_compare_stdout(
         self, code: str, expected_output: str
     ) -> VerificationResult:
-        """Run code and compare stdout to expected output."""
-        script = code
-        result = await self._execute_raw(script)
-        if result.error:
-            return result
-        actual = result.evidence.get("stdout", "").strip()
+        """Run code in sandbox and compare stdout to expected output."""
+        result = await self.executor.execute(
+            code, timeout=self.timeout, network=False,
+        )
+        if result.timed_out:
+            return VerificationResult(
+                verified=False, score=0.0, method="python_exec",
+                evidence={"timeout": self.timeout, "executor": result.executor},
+                error=f"execution timed out after {self.timeout}s",
+            )
+        if result.error and "failed" in result.error:
+            return VerificationResult(
+                verified=False, score=0.0, method="python_exec",
+                evidence={"executor": result.executor},
+                error=result.error,
+            )
+        actual = result.stdout.strip()
         expected = expected_output.strip()
         if actual == expected:
             return VerificationResult(
-                verified=True,
-                score=1.0,
-                method="python_exec",
-                evidence={"stdout": actual, "expected": expected},
+                verified=True, score=1.0, method="python_exec",
+                evidence={"stdout": actual, "expected": expected,
+                          "executor": result.executor},
             )
         return VerificationResult(
-            verified=False,
-            score=0.0,
-            method="python_exec",
-            evidence={"stdout": actual, "expected": expected},
+            verified=False, score=0.0, method="python_exec",
+            evidence={"stdout": actual, "expected": expected,
+                      "executor": result.executor},
             error=f"stdout mismatch: got {actual!r}, expected {expected!r}",
         )
 
-    async def _execute(
-        self, script: str, method: str, success_marker: str,
-        evidence: Optional[Dict] = None
+    def _interpret_test_result(
+        self, result: ExecutionResult, evidence: Dict[str, Any]
     ) -> VerificationResult:
-        """Execute a script and check for a success marker in stdout.
-
-        Does NOT bail early on non-zero exit codes — assertion failures
-        exit with code 1 but still print useful messages to stdout.
-        """
-        raw = await self._execute_raw(script)
-        # Timeout or execution failure (no stdout at all) -> bail
-        if raw.error and "timed out" in raw.error:
-            return raw
-        if raw.error and "execution failed" in raw.error:
-            return raw
-        stdout = raw.evidence.get("stdout", "")
-        stderr = raw.evidence.get("stderr", "")
-        returncode = raw.evidence.get("returncode", 0)
-        if success_marker in stdout:
+        """Interpret a sandbox execution result for unit tests."""
+        if result.timed_out:
             return VerificationResult(
-                verified=True,
-                score=1.0,
-                method=method,
-                evidence={**(evidence or {}), "stdout": stdout,
+                verified=False, score=0.0, method="unit_tests",
+                evidence={**evidence, "timeout": self.timeout},
+                error=f"execution timed out after {self.timeout}s",
+            )
+        if result.error and "failed" in result.error.lower():
+            return VerificationResult(
+                verified=False, score=0.0, method="unit_tests",
+                evidence={**evidence, "error": result.error},
+                error=result.error,
+            )
+
+        stdout = result.stdout
+        stderr = result.stderr
+        returncode = result.exit_code
+
+        if "ALL_TESTS_PASSED" in stdout:
+            return VerificationResult(
+                verified=True, score=1.0, method="unit_tests",
+                evidence={**evidence, "stdout": stdout,
                           "returncode": returncode},
             )
+
         # Non-zero exit without success marker -> include the error detail
-        error_msg = f"success marker {success_marker!r} not found in stdout"
+        error_msg = "success marker 'ALL_TESTS_PASSED' not found in stdout"
         if returncode != 0:
-            # Include assertion/test error from stdout if present
             for marker in ("ASSERTION_FAILED", "IMPORT_ERROR", "TEST_ERROR"):
                 if marker in stdout:
                     error_msg = stdout.strip()
                     break
             else:
                 error_msg = f"process exited with code {returncode}: {error_msg}"
+
         return VerificationResult(
-            verified=False,
-            score=0.0,
-            method=method,
-            evidence={**(evidence or {}), "stdout": stdout,
+            verified=False, score=0.0, method="unit_tests",
+            evidence={**evidence, "stdout": stdout,
                       "stderr": stderr, "returncode": returncode},
             error=error_msg,
         )
-
-    async def _execute_raw(self, script: str) -> VerificationResult:
-        """Execute a Python script in a subprocess with timeout.
-
-        Returns a result with stdout/stderr in evidence. The ``verified``
-        field is always False here — callers check for success markers.
-        Non-zero exit codes are noted in the error but stdout is still
-        returned so callers can check for assertion failure messages.
-        """
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "python3", "-c", script,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    proc.communicate(), timeout=self.timeout
-                )
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                return VerificationResult(
-                    verified=False,
-                    score=0.0,
-                    method="python_exec",
-                    evidence={"timeout": self.timeout},
-                    error=f"execution timed out after {self.timeout}s",
-                )
-            stdout = stdout_bytes.decode("utf-8", errors="replace")
-            stderr = stderr_bytes.decode("utf-8", errors="replace")
-            returncode = proc.returncode
-            # Return stdout/stderr regardless of exit code — callers need
-            # to check for success markers or assertion failure messages.
-            error = None
-            if returncode != 0:
-                error = f"process exited with code {returncode}"
-            return VerificationResult(
-                verified=False,  # caller checks for success marker
-                score=0.0,
-                method="python_exec",
-                evidence={"stdout": stdout, "stderr": stderr,
-                          "returncode": returncode},
-                error=error,
-            )
-        except Exception as e:
-            return VerificationResult(
-                verified=False,
-                score=0.0,
-                method="python_exec",
-                evidence={},
-                error=f"execution failed: {e}",
-            )

@@ -46,4 +46,4 @@ py-modules = [
     "scoring",
     "math_solver",
 ]
-packages = ["verifiers"]
+packages = ["verifiers", "sandbox"]

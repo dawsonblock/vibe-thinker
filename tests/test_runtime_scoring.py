@@ -20,6 +20,7 @@ from verifiers import MathVerifier, CodeVerifier, FactualVerifier
 from verifiers.base import VerificationResult
 from hybrid_orchestrator import select_verifier
 from math_solver import solve as solve_math
+from sandbox import LocalSubprocessExecutor
 
 
 @pytest.fixture
@@ -145,7 +146,7 @@ class TestCodeVerifierHonesty:
     @pytest.mark.asyncio
     async def test_no_tests_returns_unverified(self):
         """Code without executable tests must NOT be verified."""
-        v = CodeVerifier()
+        v = CodeVerifier(executor=LocalSubprocessExecutor())
         result = await v.verify("Write a function", "def f(): pass", context={})
         assert result.verified is False
         assert "no unit_tests" in (result.error or "") or "no" in (result.error or "").lower()
@@ -153,7 +154,7 @@ class TestCodeVerifierHonesty:
     @pytest.mark.asyncio
     async def test_timeout_returns_unverified(self):
         """Infinite loop must timeout and return unverified."""
-        v = CodeVerifier(timeout=2.0)
+        v = CodeVerifier(timeout=2.0, executor=LocalSubprocessExecutor())
         result = await v.verify("Run this", "while True: pass",
                                 context={"expected_output": "anything"})
         assert result.verified is False
@@ -162,7 +163,7 @@ class TestCodeVerifierHonesty:
     @pytest.mark.asyncio
     async def test_execution_exception_returns_unverified(self):
         """Code that raises must return unverified."""
-        v = CodeVerifier()
+        v = CodeVerifier(executor=LocalSubprocessExecutor())
         result = await v.verify("Run this", "raise ValueError('boom')",
                                 context={"expected_output": "anything"})
         assert result.verified is False
@@ -170,7 +171,7 @@ class TestCodeVerifierHonesty:
     @pytest.mark.asyncio
     async def test_passing_tests_returns_verified(self):
         """Code that passes bounded unit tests is verified."""
-        v = CodeVerifier()
+        v = CodeVerifier(executor=LocalSubprocessExecutor())
         code = "def add(a, b):\n    return a + b\n"
         tests = "assert add(2, 3) == 5\nassert add(0, 0) == 0\n"
         result = await v.verify("Write add", code, context={"unit_tests": tests})

@@ -1,13 +1,25 @@
-"""Pytest tests for the code verifier."""
+"""Pytest tests for the code verifier.
+
+Tests use LocalSubprocessExecutor explicitly for speed and CI
+portability. The verifier's sandbox selection logic is tested
+separately to verify it refuses to run without a sandbox.
+"""
 
 import pytest
 
-from verifiers.code_verifier import CodeVerifier
+from verifiers.code_verifier import CodeVerifier, select_executor
+from sandbox import DockerSandboxExecutor, DockerSbxExecutor, LocalSubprocessExecutor
 
 
 @pytest.fixture
-def verifier():
-    return CodeVerifier(timeout=5.0)
+def executor():
+    """Use local subprocess executor for tests (trusted test code)."""
+    return LocalSubprocessExecutor(timeout=5.0)
+
+
+@pytest.fixture
+def verifier(executor):
+    return CodeVerifier(timeout=5.0, executor=executor)
 
 
 class TestCodeVerifier:
@@ -64,7 +76,11 @@ assert add(2, 3) == 5
             context={"expected_output": "anything"},
         )
         assert result.verified is False
-        assert "exited with code" in (result.error or "") or "IMPORT_ERROR" in (result.error or "")
+        # With the sandbox executor, an exception produces empty stdout,
+        # so the verifier reports a stdout mismatch (correct behavior).
+        assert "stdout mismatch" in (result.error or "") or \
+               "exited with code" in (result.error or "") or \
+               "IMPORT_ERROR" in (result.error or "")
 
     @pytest.mark.asyncio
     async def test_stdout_comparison_passes(self, verifier):
@@ -104,3 +120,105 @@ assert add(2, 3) == 5
             context={"unit_tests": tests},
         )
         assert result.verified is False
+
+
+class TestSandboxSelection:
+    """Tests for the sandbox executor selection logic.
+
+    The verifier must refuse to run untrusted code if no sandbox is
+    available — it must NOT fall back to host execution by default.
+    """
+
+    def test_select_executor_returns_none_by_default_if_no_docker(self):
+        """Without Docker or sbx, and without allow_unsafe, return None."""
+        # This test verifies the logic, not the actual availability.
+        # We mock is_available to simulate no Docker/sbx.
+        with pytest.MonkeyPatch().context() as m:
+            m.setattr(DockerSandboxExecutor, "is_available", lambda self: False)
+            m.setattr(DockerSbxExecutor, "is_available", lambda self: False)
+            result = select_executor(allow_unsafe=False)
+            assert result is None
+
+    def test_select_executor_allows_unsafe_with_flag(self):
+        """With allow_unsafe=True, fall back to LocalSubprocessExecutor."""
+        with pytest.MonkeyPatch().context() as m:
+            m.setattr(DockerSandboxExecutor, "is_available", lambda self: False)
+            m.setattr(DockerSbxExecutor, "is_available", lambda self: False)
+            result = select_executor(allow_unsafe=True)
+            assert isinstance(result, LocalSubprocessExecutor)
+
+    def test_select_executor_prefers_docker_over_sbx(self):
+        """Docker container is preferred over sbx (lighter weight)."""
+        with pytest.MonkeyPatch().context() as m:
+            m.setattr(DockerSandboxExecutor, "is_available", lambda self: True)
+            m.setattr(DockerSbxExecutor, "is_available", lambda self: True)
+            result = select_executor()
+            assert isinstance(result, DockerSandboxExecutor)
+
+    def test_select_executor_prefers_sbx_with_flag(self):
+        """With prefer_sbx=True, sbx is preferred over Docker."""
+        with pytest.MonkeyPatch().context() as m:
+            m.setattr(DockerSandboxExecutor, "is_available", lambda self: True)
+            m.setattr(DockerSbxExecutor, "is_available", lambda self: True)
+            result = select_executor(prefer_sbx=True)
+            assert isinstance(result, DockerSbxExecutor)
+
+    def test_select_executor_falls_back_to_sbx(self):
+        """If Docker is not available but sbx is, use sbx."""
+        with pytest.MonkeyPatch().context() as m:
+            m.setattr(DockerSandboxExecutor, "is_available", lambda self: False)
+            m.setattr(DockerSbxExecutor, "is_available", lambda self: True)
+            result = select_executor()
+            assert isinstance(result, DockerSbxExecutor)
+
+
+class TestRefuseWithoutSandbox:
+    """The verifier must refuse to run if no sandbox is available."""
+
+    @pytest.mark.asyncio
+    async def test_refuses_without_sandbox(self):
+        """Without a sandbox executor, the verifier returns verified=False
+        with an error explaining that no sandbox was found."""
+        with pytest.MonkeyPatch().context() as m:
+            m.setattr(DockerSandboxExecutor, "is_available", lambda self: False)
+            m.setattr(DockerSbxExecutor, "is_available", lambda self: False)
+            v = CodeVerifier(timeout=5.0)  # no executor, no allow_unsafe
+            assert v.executor is None
+
+            result = await v.verify(
+                "Run this", "print('hello')",
+                context={"expected_output": "hello"},
+            )
+            assert result.verified is False
+            assert "no sandbox executor available" in (result.error or "")
+            assert "refusing" in (result.error or "").lower()
+
+    @pytest.mark.asyncio
+    async def test_refuses_without_sandbox_even_with_tests(self):
+        """Even with unit tests, refuse without a sandbox."""
+        with pytest.MonkeyPatch().context() as m:
+            m.setattr(DockerSandboxExecutor, "is_available", lambda self: False)
+            m.setattr(DockerSbxExecutor, "is_available", lambda self: False)
+            v = CodeVerifier(timeout=5.0)
+
+            result = await v.verify(
+                "Write add", "def add(a,b): return a+b",
+                context={"unit_tests": "assert add(1,2)==3"},
+            )
+            assert result.verified is False
+            assert "no sandbox executor available" in (result.error or "")
+
+
+class TestExecutorEvidence:
+    """The verifier should record which executor ran the code."""
+
+    @pytest.mark.asyncio
+    async def test_evidence_includes_executor_name(self, verifier):
+        code = "print('hello')"
+        result = await verifier.verify(
+            "Print hello", code,
+            context={"expected_output": "hello"},
+        )
+        assert result.verified is True
+        assert "executor" in result.evidence
+        assert result.evidence["executor"] == "local_subprocess_unsafe"

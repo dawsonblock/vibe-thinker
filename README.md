@@ -100,6 +100,7 @@ python test_full_stack.py
 | `rfsn_cli.py` | Interactive CLI/REPL over the job queue (env var + CLI flag support) |
 | `scoring.py` | Separated confidence fields (model_confidence, claim_consistency, deterministic_verification) |
 | `verifiers/` | Deterministic verifier adapters (math, code, factual) |
+| `sandbox/` | Isolated code execution layer (Docker container, sbx microVM, local subprocess) |
 | `math_solver.py` | Deterministic solver for simple math (arithmetic, sums, recurrences) — derives expected_answer for MathVerifier |
 | `test_demo.py` | Comprehensive test suite (no model servers needed) |
 | `test_full_stack.py` | Full-stack integration test (needs live servers) |
@@ -174,6 +175,12 @@ python test_full_stack.py
 - The code verifier refuses to verify code without executable test
   specifications (`unit_tests` or `expected_output`). Running code without
   checking output is not verification.
+- The code verifier runs in a sandbox executor, not raw subprocess. By
+  default it uses Docker containers with `--network=none`, `--read-only`,
+  `--memory=128m`, and `--cap-drop=ALL`. If Docker is not available, it
+  tries sbx microVMs. If neither is available, it **refuses to verify**
+  rather than running untrusted code on the host. See `sandbox/README.md`
+  for the full isolation model and sbx setup instructions.
 - The job queue is in-process only. For multi-process/multi-node, swap the
   dispatcher for RQ/Celery/Dramatiq.
 - The bi-temporal log has hash-chain integrity with strict verification

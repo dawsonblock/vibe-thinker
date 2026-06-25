@@ -28,7 +28,7 @@ DIST_DIR = os.path.join(PROJECT_ROOT, "dist")
 ZIP_NAME = f"vibe-thinker-v{VERSION}.zip"
 
 # Files/dirs to include (everything else is excluded)
-INCLUDE_DIRS = ["verifiers", "tests", "examples", "scripts"]
+INCLUDE_DIRS = ["verifiers", "sandbox", "tests", "examples", "scripts"]
 INCLUDE_FILES = [
     "vibe_clr.py", "vibe_clr_async.py", "hybrid_orchestrator.py",
     "persistent_cache.py", "rfsn_job_queue.py", "bitemporal_log.py",
