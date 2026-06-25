@@ -28,6 +28,8 @@ from typing import Dict, List, Optional
 
 import aiohttp
 
+from scoring import compute_confidence
+
 
 @dataclass
 class CLRResult:
@@ -335,9 +337,13 @@ rather than silently proceeding with an empty string."""
           - No final answer -> 0.0
           - Fewer than MIN_CLAIMS_FOR_SCORING meaningful claims -> 0.0
           - Any unverified claim (verdict 0) heavily penalizes the score
-          - Deterministic check contradicts -> score halved
-          - Deterministic check confirms -> score boosted (capped at 1.0)
-          - The score is mean^5 but only over *meaningful* claims
+          - Self-claims-only confidence is HARD CAPPED at 0.65
+          - Deterministic verifier passes -> eligible above 0.65
+          - Deterministic verifier fails -> score 0.0
+
+        The raw claim-level score (mean^5 over meaningful claims) is passed
+        through :func:`compute_confidence` which enforces the self-claims-only
+        cap. This is the active runtime path — the cap is not advisory.
 
         Args:
             verdicts: list of 0/1 verdicts from the verifier.
@@ -369,15 +375,29 @@ rather than silently proceeding with an empty string."""
             mean = sum(verdicts) / len(verdicts)
             base = mean ** 5
 
-        # Apply deterministic check adjustment
-        if deterministic_check is False:
-            # Answer contradicts other trajectories — halve the score
-            base *= 0.5
-        elif deterministic_check is True:
-            # Answer confirmed by deterministic check — boost, cap at 1.0
-            base = min(base * 1.15, 1.0)
+        # Convert deterministic_check (bool|None) to a numeric verification
+        # score for compute_confidence: 1.0 (confirmed), 0.0 (refuted),
+        # None (no verifier run).
+        det_verification: Optional[float] = None
+        if deterministic_check is True:
+            det_verification = 1.0
+        elif deterministic_check is False:
+            det_verification = 0.0
 
-        return base
+        verification_method = (
+            "deterministic_check" if det_verification is not None
+            else "self_claims_only"
+        )
+
+        # Route through compute_confidence to enforce the self-claims-only cap.
+        # This is the trust model: self-agreement alone can never exceed 0.65.
+        confidence = compute_confidence(
+            model_score=base,
+            claim_consistency=base,
+            deterministic_verification=det_verification,
+            verification_method=verification_method,
+        )
+        return confidence.final_score
 
     # ------------------------------------------------------------------ #
     # One full trajectory

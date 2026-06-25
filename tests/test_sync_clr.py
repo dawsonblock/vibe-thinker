@@ -20,13 +20,13 @@ def clr():
 
 class TestSyncUsesAsyncScoring:
     def test_sync_clr_uses_async_scoring_rules(self, clr):
-        """The sync wrapper must use the same scoring as the async engine."""
+        """The sync wrapper must use the same scoring as the async engine.
+        Self-claims-only is capped at 0.65 — even with 5 verified claims."""
         claims = ["a" * 20, "b" * 20, "c" * 20, "d" * 20, "e" * 20]
-        # All verified, meaningful, answer present -> 1.0 (async rule)
         score = clr._calculate_reliability(
             [1, 1, 1, 1, 1], claims=claims, answer_present=True
         )
-        assert score == 1.0
+        assert score <= 0.65  # self-claims-only cap
 
     def test_sync_clr_rejects_single_garbage_claim(self, clr):
         """Single garbage claim must score 0, not 1.0 (the old bug)."""
@@ -60,9 +60,10 @@ class TestSyncDeadEndpoint:
                 clr.run("test problem")
 
     def test_sync_clr_returns_result_on_success(self, clr):
-        """Successful run returns a CLRResult with the best answer."""
+        """Successful run returns a CLRResult with the best answer.
+        Score is capped at 0.65 without a deterministic verifier."""
         good_traj = {
-            "score": 1.0,
+            "score": 0.65,
             "answer": "42",
             "claims": ["a" * 20, "b" * 20, "c" * 20, "d" * 20, "e" * 20],
             "verdicts": [1, 1, 1, 1, 1],
@@ -74,4 +75,4 @@ class TestSyncDeadEndpoint:
             result = clr.run("test problem")
         assert isinstance(result, CLRResult)
         assert result.best_answer == "42"
-        assert result.best_score == 1.0
+        assert result.best_score <= 0.65  # self-claims-only cap

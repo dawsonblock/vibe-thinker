@@ -51,35 +51,57 @@ class TestReliabilityScoring:
         assert score <= 0.3
         assert score > 0.0  # not zero, but heavily penalized
 
-    def test_all_verified_meaningful_claims_high_score(self, clr):
+    def test_self_claims_only_is_capped_at_065(self, clr):
+        """The most important test: 5 self-verified claims must NOT reach 1.0.
+        Self-verification alone is capped at 0.65 — model self-agreement is
+        not proof of correctness."""
+        claims = [
+            "This is a meaningful claim with enough detail one.",
+            "This is a meaningful claim with enough detail two.",
+            "This is a meaningful claim with enough detail three.",
+            "This is a meaningful claim with enough detail four.",
+            "This is a meaningful claim with enough detail five.",
+        ]
+        score = clr._calculate_reliability(
+            [1, 1, 1, 1, 1], claims=claims, answer_present=True,
+            deterministic_check=None,
+        )
+        assert score <= 0.65, f"Self-claims-only score {score} exceeds 0.65 cap"
+
+    def test_all_verified_meaningful_claims_capped_without_verifier(self, clr):
+        """Without a deterministic verifier, even perfect self-verification
+        cannot exceed 0.65."""
         claims = ["a" * 20, "b" * 20, "c" * 20, "d" * 20, "e" * 20]
         score = clr._calculate_reliability([1, 1, 1, 1, 1], claims=claims, answer_present=True)
-        assert score == 1.0
+        assert score <= 0.65
 
-    def test_mixed_garbage_and_real_claims(self, clr):
-        # 2 garbage + 5 real, all verified -> only 5 count, score 1.0
+    def test_deterministic_check_allows_above_065(self, clr):
+        """With deterministic verification, score CAN exceed 0.65."""
+        claims = ["a" * 20, "b" * 20, "c" * 20, "d" * 20, "e" * 20]
+        score = clr._calculate_reliability(
+            [1, 1, 1, 1, 1], claims=claims, answer_present=True,
+            deterministic_check=True,
+        )
+        # 1.0 * 0.7 + 1.0 * 0.3 = 1.0
+        assert score > 0.65
+
+    def test_deterministic_check_refutation_scores_zero(self, clr):
+        """If a deterministic verifier refutes the answer, score must be 0."""
+        claims = ["a" * 20, "b" * 20, "c" * 20, "d" * 20, "e" * 20]
+        score = clr._calculate_reliability(
+            [1, 1, 1, 1, 1], claims=claims, answer_present=True,
+            deterministic_check=False,
+        )
+        assert score == 0.0
+
+    def test_mixed_garbage_and_real_claims_capped(self, clr):
+        # 2 garbage + 5 real, all verified -> only 5 count, but capped at 0.65
         claims = ["by step.", "short",
                   "real claim one here", "real claim two here",
                   "real claim three here", "real claim four here",
                   "real claim five here"]
         score = clr._calculate_reliability([1, 1, 1, 1, 1, 1, 1], claims=claims, answer_present=True)
-        assert score == 1.0
-
-    def test_deterministic_check_boost(self, clr):
-        claims = ["a" * 20, "b" * 20, "c" * 20, "d" * 20, "e" * 20]
-        score_base = clr._calculate_reliability([1, 1, 1, 1, 1], claims=claims, answer_present=True)
-        score_boosted = clr._calculate_reliability(
-            [1, 1, 1, 1, 1], claims=claims, answer_present=True, deterministic_check=True
-        )
-        assert score_boosted > score_base or score_boosted == 1.0
-
-    def test_deterministic_check_contradiction_halves(self, clr):
-        claims = ["a" * 20, "b" * 20, "c" * 20, "d" * 20, "e" * 20]
-        score_base = clr._calculate_reliability([1, 1, 1, 1, 1], claims=claims, answer_present=True)
-        score_contradicted = clr._calculate_reliability(
-            [1, 1, 1, 1, 1], claims=claims, answer_present=True, deterministic_check=False
-        )
-        assert score_contradicted == score_base * 0.5
+        assert score <= 0.65
 
 
 class TestIsMeaningfulClaim:
