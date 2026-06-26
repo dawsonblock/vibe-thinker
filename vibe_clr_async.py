@@ -31,6 +31,16 @@ import aiohttp
 from scoring import compute_confidence
 
 
+# GBNF grammar for the JSON claim extraction format.
+# Forces the model to output valid JSON with "claims" (array of strings)
+# and "final_answer" (string or null). This prevents small models from
+# producing malformed JSON that causes trajectory scoring to fail.
+_CLAIMS_JSON_GRAMMAR = r"""root ::= "{" ws "\"claims\"" ws ":" ws "[" ws string ("," ws string)* ws "]" ws "," ws "\"final_answer\"" ws ":" ws (string | "null") ws "}"
+string ::= "\"" ([^"\\] | "\\" .)* "\""
+ws ::= [ \t\n]*
+"""
+
+
 @dataclass
 class AdaptivePolicy:
     """Policy for adaptive compute (dynamic sampling / early exiting).
@@ -170,11 +180,19 @@ class VibeThinkerCLRAsync:
         max_tokens: int = 8192,
         temperature: float = 1.0,
         stop: Optional[List[str]] = None,
+        grammar: Optional[str] = None,
     ) -> str:
         """Async call to llama-server /completion endpoint.
 
 Raises RuntimeError on any failure — callers must handle the exception
-rather than silently proceeding with an empty string."""
+rather than silently proceeding with an empty string.
+
+Args:
+    grammar: optional GBNF grammar string to constrain output format.
+        When set, llama-server enforces the grammar — the model physically
+        cannot output invalid JSON. Used for claim extraction to prevent
+        small models from producing malformed JSON.
+"""
         payload = {
             "prompt": prompt,
             "n_predict": max_tokens,
@@ -183,6 +201,8 @@ rather than silently proceeding with an empty string."""
             "top_k": -1,
             "stop": stop if stop is not None else ["<|im_end|>"],
         }
+        if grammar:
+            payload["grammar"] = grammar
         async with self.semaphore:
             try:
                 async with session.post(
@@ -233,7 +253,8 @@ rather than silently proceeding with an empty string."""
             "}\n<|im_end|>\n<|im_start|>assistant\n"
         )
         raw = await self._call_model(
-            session, extraction_prompt, max_tokens=2048, temperature=0.3
+            session, extraction_prompt, max_tokens=2048, temperature=0.3,
+            grammar=_CLAIMS_JSON_GRAMMAR,
         )
 
         try:

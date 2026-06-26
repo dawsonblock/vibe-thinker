@@ -313,3 +313,81 @@ class TestVerifierIntegration:
         assert result.verified is False
         assert result.best_score <= 0.65
 
+
+class TestGrammarEnforcement:
+    """Tests for GBNF grammar enforcement in claim extraction.
+
+    The grammar parameter is passed to llama-server's /completion endpoint
+    to constrain the model's output to valid JSON, preventing small models
+    from producing malformed JSON that causes trajectory scoring to fail.
+    """
+
+    def test_grammar_constant_exists(self):
+        from vibe_clr_async import _CLAIMS_JSON_GRAMMAR
+        assert "root ::=" in _CLAIMS_JSON_GRAMMAR
+        assert "claims" in _CLAIMS_JSON_GRAMMAR
+        assert "final_answer" in _CLAIMS_JSON_GRAMMAR
+
+    def test_grammar_requires_claims_array_and_answer(self):
+        from vibe_clr_async import _CLAIMS_JSON_GRAMMAR
+        # The grammar must enforce both "claims" (array) and "final_answer"
+        # The GBNF grammar uses escaped quotes: \"claims\" and \"final_answer\"
+        assert "claims" in _CLAIMS_JSON_GRAMMAR
+        assert "final_answer" in _CLAIMS_JSON_GRAMMAR
+        assert "string" in _CLAIMS_JSON_GRAMMAR  # strings in the array
+
+    @pytest.mark.asyncio
+    async def test_call_model_passes_grammar_in_payload(self, clr):
+        """When grammar is provided, it's included in the POST payload."""
+        import aiohttp
+        from unittest.mock import patch, AsyncMock
+
+        captured_payload = {}
+
+        class FakeResp:
+            def raise_for_status(self): pass
+            async def json(self):
+                return {"content": '{"claims": [], "final_answer": null}'}
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+
+        class FakeSession:
+            def post(self, url, json=None, **kw):
+                captured_payload.update(json or {})
+                return FakeResp()
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+
+        # We need to mock the semaphore context manager
+        with patch.object(clr, 'semaphore'):
+            result = await clr._call_model(
+                FakeSession(), "test prompt", max_tokens=100,
+                grammar='root ::= "test"',
+            )
+        assert captured_payload.get("grammar") == 'root ::= "test"'
+
+    @pytest.mark.asyncio
+    async def test_call_model_omits_grammar_when_not_provided(self, clr):
+        """When grammar is None, it's NOT included in the POST payload."""
+        from unittest.mock import patch
+
+        captured_payload = {}
+
+        class FakeResp:
+            def raise_for_status(self): pass
+            async def json(self):
+                return {"content": "some response"}
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+
+        class FakeSession:
+            def post(self, url, json=None, **kw):
+                captured_payload.update(json or {})
+                return FakeResp()
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+
+        with patch.object(clr, 'semaphore'):
+            await clr._call_model(FakeSession(), "test prompt", max_tokens=100)
+        assert "grammar" not in captured_payload
+

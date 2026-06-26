@@ -28,27 +28,35 @@ import textwrap
 from typing import Any, Dict, Optional
 
 from verifiers.base import VerificationResult
-from sandbox import DockerSandboxExecutor, DockerSbxExecutor, LocalSubprocessExecutor
+from sandbox import DockerSandboxExecutor, DockerSbxExecutor, LocalSubprocessExecutor, WarmDockerPool
 from sandbox.base import ExecutionResult, SandboxExecutor
 
 
 def select_executor(
     allow_unsafe: bool = False,
     prefer_sbx: bool = False,
+    prefer_warm_pool: bool = True,
+    warm_pool_size: int = 3,
 ) -> Optional[SandboxExecutor]:
     """Select the best available sandbox executor.
 
     Selection order:
       1. DockerSbxExecutor (if prefer_sbx=True and sbx available)
-      2. DockerSandboxExecutor (if Docker available)
-      3. DockerSbxExecutor (if sbx available)
-      4. LocalSubprocessExecutor (ONLY if allow_unsafe=True)
-      5. None (refuse verification)
+      2. WarmDockerPool (if prefer_warm_pool=True and Docker available)
+         — 5x faster than cold docker run for repeated verifications
+      3. DockerSandboxExecutor (if Docker available)
+      4. DockerSbxExecutor (if sbx available)
+      5. LocalSubprocessExecutor (ONLY if allow_unsafe=True)
+      6. None (refuse verification)
 
     Args:
         allow_unsafe: if True, allow LocalSubprocessExecutor as a fallback.
             Default False — do not run untrusted code on the host.
         prefer_sbx: if True, prefer sbx microVM over Docker container.
+        prefer_warm_pool: if True, prefer WarmDockerPool over cold
+            DockerSandboxExecutor. Default True — warm pools are 5x faster
+            for the multi-candidate code loop.
+        warm_pool_size: number of warm containers to keep running.
 
     Returns:
         A SandboxExecutor instance, or None if no safe executor is available.
@@ -57,6 +65,11 @@ def select_executor(
         sbx = DockerSbxExecutor()
         if sbx.is_available():
             return sbx
+
+    if prefer_warm_pool:
+        pool = WarmDockerPool(pool_size=warm_pool_size)
+        if pool.is_available():
+            return pool
 
     docker = DockerSandboxExecutor()
     if docker.is_available():

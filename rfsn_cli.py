@@ -299,9 +299,10 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Dedicated code-specialist endpoint (e.g. ruvltra on "
                         "8082). Empty disables code-specialist routing.")
     p.add_argument("--code-candidates", type=int,
-                   default=int(os.environ.get("CODE_CANDIDATES", "3")),
+                   default=int(os.environ.get("CODE_CANDIDATES", "6")),
                    help="Number of parallel code candidates to generate and "
-                        "verify in the sandbox (default 3).")
+                        "verify in the sandbox (default 6 — higher for fast "
+                        "0.5B models, lower for slower models).")
     p.add_argument("--no-trajectory-store", dest="use_trajectory_store",
                    action="store_false",
                    help="Disable the verified-trajectory store (self-improving "

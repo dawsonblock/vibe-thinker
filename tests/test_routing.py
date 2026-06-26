@@ -222,8 +222,9 @@ class TestCodeSpecialistRouting:
             vibe_endpoint="http://localhost:0",
             generalist_endpoint="http://localhost:0",
             use_clr=False, use_embedding_router=False, use_clr_cache=False,
+            use_trajectory_store=False,
         )
-        assert o.code_candidates == 3
+        assert o.code_candidates == 6  # default raised for fast 0.5B models
 
     @pytest.mark.asyncio
     async def test_code_task_verified_loop_first_candidate_passes(self):

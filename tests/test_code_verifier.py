@@ -8,7 +8,7 @@ separately to verify it refuses to run without a sandbox.
 import pytest
 
 from verifiers.code_verifier import CodeVerifier, select_executor
-from sandbox import DockerSandboxExecutor, DockerSbxExecutor, LocalSubprocessExecutor
+from sandbox import DockerSandboxExecutor, DockerSbxExecutor, LocalSubprocessExecutor, WarmDockerPool
 
 
 @pytest.fixture
@@ -132,10 +132,11 @@ class TestSandboxSelection:
     def test_select_executor_returns_none_by_default_if_no_docker(self):
         """Without Docker or sbx, and without allow_unsafe, return None."""
         # This test verifies the logic, not the actual availability.
-        # We mock is_available to simulate no Docker/sbx.
+        # We mock is_available to simulate no Docker/sbx/warm-pool.
         with pytest.MonkeyPatch().context() as m:
             m.setattr(DockerSandboxExecutor, "is_available", lambda self: False)
             m.setattr(DockerSbxExecutor, "is_available", lambda self: False)
+            m.setattr(WarmDockerPool, "is_available", lambda self: False)
             result = select_executor(allow_unsafe=False)
             assert result is None
 
@@ -144,30 +145,43 @@ class TestSandboxSelection:
         with pytest.MonkeyPatch().context() as m:
             m.setattr(DockerSandboxExecutor, "is_available", lambda self: False)
             m.setattr(DockerSbxExecutor, "is_available", lambda self: False)
+            m.setattr(WarmDockerPool, "is_available", lambda self: False)
             result = select_executor(allow_unsafe=True)
             assert isinstance(result, LocalSubprocessExecutor)
 
-    def test_select_executor_prefers_docker_over_sbx(self):
-        """Docker container is preferred over sbx (lighter weight)."""
+    def test_select_executor_prefers_warm_pool_by_default(self):
+        """Warm pool is preferred over cold Docker (5x faster)."""
         with pytest.MonkeyPatch().context() as m:
             m.setattr(DockerSandboxExecutor, "is_available", lambda self: True)
             m.setattr(DockerSbxExecutor, "is_available", lambda self: True)
+            m.setattr(WarmDockerPool, "is_available", lambda self: True)
             result = select_executor()
+            assert isinstance(result, WarmDockerPool)
+
+    def test_select_executor_prefers_docker_when_warm_pool_disabled(self):
+        """With prefer_warm_pool=False, Docker container is used."""
+        with pytest.MonkeyPatch().context() as m:
+            m.setattr(DockerSandboxExecutor, "is_available", lambda self: True)
+            m.setattr(DockerSbxExecutor, "is_available", lambda self: True)
+            m.setattr(WarmDockerPool, "is_available", lambda self: True)
+            result = select_executor(prefer_warm_pool=False)
             assert isinstance(result, DockerSandboxExecutor)
 
     def test_select_executor_prefers_sbx_with_flag(self):
-        """With prefer_sbx=True, sbx is preferred over Docker."""
+        """With prefer_sbx=True, sbx is preferred over Docker and warm pool."""
         with pytest.MonkeyPatch().context() as m:
             m.setattr(DockerSandboxExecutor, "is_available", lambda self: True)
             m.setattr(DockerSbxExecutor, "is_available", lambda self: True)
+            m.setattr(WarmDockerPool, "is_available", lambda self: True)
             result = select_executor(prefer_sbx=True)
             assert isinstance(result, DockerSbxExecutor)
 
     def test_select_executor_falls_back_to_sbx(self):
-        """If Docker is not available but sbx is, use sbx."""
+        """If Docker and warm pool are not available but sbx is, use sbx."""
         with pytest.MonkeyPatch().context() as m:
             m.setattr(DockerSandboxExecutor, "is_available", lambda self: False)
             m.setattr(DockerSbxExecutor, "is_available", lambda self: True)
+            m.setattr(WarmDockerPool, "is_available", lambda self: False)
             result = select_executor()
             assert isinstance(result, DockerSbxExecutor)
 
@@ -182,6 +196,7 @@ class TestRefuseWithoutSandbox:
         with pytest.MonkeyPatch().context() as m:
             m.setattr(DockerSandboxExecutor, "is_available", lambda self: False)
             m.setattr(DockerSbxExecutor, "is_available", lambda self: False)
+            m.setattr(WarmDockerPool, "is_available", lambda self: False)
             v = CodeVerifier(timeout=5.0)  # no executor, no allow_unsafe
             assert v.executor is None
 
@@ -199,6 +214,7 @@ class TestRefuseWithoutSandbox:
         with pytest.MonkeyPatch().context() as m:
             m.setattr(DockerSandboxExecutor, "is_available", lambda self: False)
             m.setattr(DockerSbxExecutor, "is_available", lambda self: False)
+            m.setattr(WarmDockerPool, "is_available", lambda self: False)
             v = CodeVerifier(timeout=5.0)
 
             result = await v.verify(

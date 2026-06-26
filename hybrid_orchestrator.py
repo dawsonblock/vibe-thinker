@@ -44,6 +44,7 @@ from persistent_cache import (
     should_cache,
 )
 from verifiers import MathVerifier, CodeVerifier, FactualVerifier
+from sandbox import WarmDockerPool
 from math_solver import solve as solve_math
 
 # Sentinel for "argument not provided" — distinct from an explicit None
@@ -239,7 +240,7 @@ class HybridReasoningOrchestrator:
         vibe_endpoint: str = "http://127.0.0.1:8080",
         generalist_endpoint: str = "http://127.0.0.1:8081",
         code_specialist_endpoint: Optional[str] = None,
-        code_candidates: int = 3,
+        code_candidates: int = 6,
         code_verifier: Optional["CodeVerifier"] = _UNSET,
         use_clr: bool = True,
         clr_k: int = 8,
@@ -274,6 +275,16 @@ class HybridReasoningOrchestrator:
         # _UNSET -> default CodeVerifier (safe, fail-closed sandbox).
         # None -> explicitly disabled (plain generation, no verification).
         self.code_verifier = CodeVerifier() if code_verifier is _UNSET else code_verifier
+        # If the verifier's executor is a WarmDockerPool, start it eagerly so
+        # the first code task doesn't pay the cold-start cost.
+        if self.code_verifier is not None and hasattr(self.code_verifier, "executor"):
+            executor = self.code_verifier.executor
+            if isinstance(executor, WarmDockerPool):
+                self._warm_pool = executor
+            else:
+                self._warm_pool = None
+        else:
+            self._warm_pool = None
         self.use_clr = use_clr
 
         self.reasoner = VibeThinkerCLRAsync(
@@ -828,6 +839,10 @@ class HybridReasoningOrchestrator:
         """
         tests = await self._generate_test_spec(query)
 
+        # Ensure the warm Docker pool is started before sandbox verification.
+        if self._warm_pool is not None and not self._warm_pool._started:
+            await self._warm_pool.start()
+
         # Without tests or a verifier, we cannot verify — fall back to plain.
         if tests is None:
             print("[CodeLoop] No test spec — single-candidate unverified generation")
@@ -1166,6 +1181,26 @@ class HybridReasoningOrchestrator:
         if not self.use_trajectory_store or self.trajectory_store is None:
             return ""
         return self.trajectory_store.build_few_shot_prefix(query, task_type=task_type)
+
+    # ------------------------------------------------------------------ #
+    # Lifecycle: warm pool start/cleanup
+    # ------------------------------------------------------------------ #
+    async def start(self) -> None:
+        """Start background resources (warm Docker pool).
+
+        Call this before submitting code tasks to pre-warm the sandbox
+        containers. If no warm pool is configured, this is a no-op.
+        """
+        if self._warm_pool is not None:
+            await self._warm_pool.start()
+
+    async def cleanup(self) -> None:
+        """Clean up background resources (warm Docker pool).
+
+        Call this when shutting down to remove warm containers.
+        """
+        if self._warm_pool is not None:
+            await self._warm_pool.cleanup()
 
     # ------------------------------------------------------------------ #
     # Main entry point

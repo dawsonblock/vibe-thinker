@@ -36,6 +36,7 @@ from sandbox.base import ExecutionResult, SandboxExecutor
 from sandbox.docker_executor import DockerSandboxExecutor
 from sandbox.local_executor import LocalSubprocessExecutor
 from sandbox.sbx_executor import DockerSbxExecutor
+from sandbox.warm_pool_executor import WarmDockerPool
 
 __all__ = [
     "ExecutionResult",
@@ -43,4 +44,5 @@ __all__ = [
     "DockerSandboxExecutor",
     "DockerSbxExecutor",
     "LocalSubprocessExecutor",
+    "WarmDockerPool",
 ]

@@ -13,6 +13,7 @@ clr_trace.json
 rfsn_jobs.jsonl
 rfsn_jobs_bitemporal.jsonl
 orchestrator_memory.jsonl
+verified_trajectories.json
 
 # Virtual environments
 .venv/
