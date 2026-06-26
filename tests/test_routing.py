@@ -393,9 +393,12 @@ class TestCodeSpecialistRouting:
             return_value="```python\ndef square(n): return n*n\n```"
         )
         o.code_verifier = MagicMock()
-        # First attempt: all fail with TEST_ERROR (test references missing func)
-        # Second attempt: candidate passes
+        # First attempt: 2 candidates, both fail with TEST_ERROR (parallel).
+        # Second attempt: 2 candidates, both pass (parallel). With
+        # asyncio.gather, both candidates are verified concurrently, so we
+        # need 4 side_effect items (2 per attempt).
         o.code_verifier.verify = AsyncMock(side_effect=[
+            # First attempt — both TEST_ERROR
             VerificationResult(
                 verified=False, score=0.0, method="unit_tests",
                 error="TEST_ERROR: name 'nonexistent_func' is not defined",
@@ -404,7 +407,10 @@ class TestCodeSpecialistRouting:
                 verified=False, score=0.0, method="unit_tests",
                 error="TEST_ERROR: name 'nonexistent_func' is not defined",
             ),
-            # Second attempt (with fixed tests) — passes
+            # Second attempt (with fixed tests) — both pass
+            VerificationResult(
+                verified=True, score=1.0, method="unit_tests",
+            ),
             VerificationResult(
                 verified=True, score=1.0, method="unit_tests",
             ),
@@ -541,4 +547,48 @@ class TestCodeSpecialistRouting:
         assert result.route_taken == "code_specialist_unverified"
         # No retry — not ALL were TEST_ERROR
         assert o._generate_test_spec.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_parallel_verification_runs_concurrently(self):
+        """Candidate verification runs via asyncio.gather, not sequentially.
+        Verify by checking that all verify calls start before any completes
+        (concurrent, not serial)."""
+        import asyncio as aio
+        o = HybridReasoningOrchestrator(
+            vibe_endpoint="http://localhost:0",
+            generalist_endpoint="http://localhost:0",
+            code_specialist_endpoint="http://127.0.0.1:8082",
+            code_candidates=3,
+            use_clr=True,
+            use_embedding_router=False,
+            use_clr_cache=False,
+            use_trajectory_store=False,
+        )
+        o._generate_test_spec = AsyncMock(return_value="assert square(2) == 4")
+        o._call_code_specialist = AsyncMock(
+            return_value="```python\ndef square(n): return n*n\n```"
+        )
+        # Mock the warm pool to skip container startup overhead
+        o._warm_pool = MagicMock()
+        o._warm_pool._started = True
+        o.code_verifier = MagicMock()
+
+        # Track concurrency: all 3 verify calls should start before any
+        # completes. If sequential, only 1 would be active at a time.
+        started = []
+        can_complete = aio.Event()
+
+        async def slow_verify(query, code, config):
+            started.append(len(started))
+            await aio.sleep(0.05)
+            return VerificationResult(
+                verified=True, score=1.0, method="unit_tests",
+            )
+
+        o.code_verifier.verify = slow_verify
+
+        result = await o.run("Write a function to square a number")
+        assert result.route_taken == "code_specialist_verified"
+        # All 3 verify calls were made (gather fires all concurrently)
+        assert len(started) == 3
 

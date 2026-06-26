@@ -13,6 +13,7 @@ Tests that need Docker are marked with @pytest.mark.skipif.
 
 import asyncio
 import pytest
+from unittest.mock import patch, MagicMock, AsyncMock
 
 from sandbox import WarmDockerPool
 from sandbox.warm_pool_executor import WarmDockerPool as _WarmDockerPool
@@ -61,14 +62,121 @@ class TestWarmPoolUnit:
             {"name": "c1", "uses": 0},
             {"name": "c2", "uses": 0},
         ]
-        c0 = pool._get_container()
-        c1 = pool._get_container()
-        c2 = pool._get_container()
-        c3 = pool._get_container()  # wraps around
-        assert c0["name"] == "c0"
-        assert c1["name"] == "c1"
-        assert c2["name"] == "c2"
-        assert c3["name"] == "c0"  # round-robin
+        # Round-robin: c0, c1, c2, c0, c1, ...
+        names = [pool._get_container()["name"] for _ in range(7)]
+        assert names == ["c0", "c1", "c2", "c0", "c1", "c2", "c0"]
+
+    @pytest.mark.asyncio
+    async def test_cleanup_uses_docker_command(self):
+        """Regression test: cleanup() must include 'docker' in the command.
+
+        Before the fix, cleanup() passed ["rm", "-f", name] to
+        _run_docker, which tried to execute the binary "rm" instead of
+        "docker rm -f name". Containers leaked on every shutdown.
+        """
+        pool = WarmDockerPool(pool_size=2, container_prefix="test_vt_regression")
+        pool._containers = [
+            {"name": "test_container_0", "uses": 0},
+            {"name": "test_container_1", "uses": 0},
+        ]
+        # Mock _run_docker to capture the commands
+        commands = []
+
+        async def mock_run_docker(cmd, timeout=10.0):
+            commands.append(cmd)
+            from sandbox.base import ExecutionResult
+            return ExecutionResult(
+                exit_code=0, stdout="", stderr="",
+                executor="warm_docker_pool", duration_ms=10,
+            )
+
+        pool._run_docker = mock_run_docker
+        await pool.cleanup()
+        # Must have called "docker rm -f" for each container, not just "rm -f"
+        assert len(commands) == 2
+        for cmd in commands:
+            assert cmd[0] == "docker", f"Expected 'docker' as first arg, got {cmd[0]}"
+            assert cmd[1] == "rm"
+            assert cmd[2] == "-f"
+        assert len(pool._containers) == 0
+        assert pool._started is False
+
+    @pytest.mark.asyncio
+    async def test_recycle_failure_removes_from_pool(self):
+        """If container restart fails twice, the container is removed from the
+        pool rather than leaving an invalid entry."""
+        pool = WarmDockerPool(pool_size=2, container_prefix="test_vt_recycle")
+        pool._containers = [
+            {"name": "good_container", "uses": 0},
+            {"name": "bad_container", "uses": 5},
+        ]
+        call_count = 0
+
+        async def mock_run_docker(cmd, timeout=10.0):
+            nonlocal call_count
+            call_count += 1
+            from sandbox.base import ExecutionResult
+            # rm succeeds, but docker run always fails
+            if "run" in cmd:
+                return ExecutionResult(
+                    exit_code=1, stdout="", stderr="docker run failed",
+                    executor="warm_docker_pool", duration_ms=10,
+                )
+            return ExecutionResult(
+                exit_code=0, stdout="", stderr="",
+                executor="warm_docker_pool", duration_ms=10,
+            )
+
+        pool._run_docker = mock_run_docker
+        # Recycle the bad container (index 1)
+        await pool._recycle_container(1)
+        # The bad container should be removed from the pool
+        assert len(pool._containers) == 1
+        assert pool._containers[0]["name"] == "good_container"
+
+    @pytest.mark.asyncio
+    async def test_timeout_triggers_recycle(self):
+        """When an execution times out, the container is recycled (not left
+        in an unknown state)."""
+        pool = WarmDockerPool(pool_size=1, container_prefix="test_vt_timeout")
+        pool._containers = [{"name": "timeout_container", "uses": 0}]
+        recycle_called = False
+
+        async def mock_recycle(idx):
+            nonlocal recycle_called
+            recycle_called = True
+
+        pool._recycle_container = mock_recycle
+
+        # Mock _run_docker for /tmp clean (called before execution)
+        async def mock_run_docker(cmd, timeout=10.0):
+            from sandbox.base import ExecutionResult
+            return ExecutionResult(
+                exit_code=0, stdout="", stderr="",
+                executor="warm_docker_pool", duration_ms=10,
+            )
+
+        pool._run_docker = mock_run_docker
+
+        # Mock create_subprocess_exec to return a fake process whose
+        # communicate() times out (matching the real code path)
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+
+        async def mock_communicate():
+            raise asyncio.TimeoutError()
+
+        mock_proc.communicate = mock_communicate
+        mock_proc.kill = MagicMock()
+        mock_proc.wait = AsyncMock(return_value=0)
+
+        with patch("asyncio.create_subprocess_exec",
+                   return_value=mock_proc), \
+             patch("asyncio.wait_for", side_effect=asyncio.TimeoutError()):
+            result = await pool.execute("print('hello')", timeout=0.1)
+
+        assert result.timed_out is True
+        assert recycle_called is True
 
 
 @pytest.mark.skipif(not HAS_DOCKER, reason="Docker not available")

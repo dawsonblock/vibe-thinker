@@ -5,7 +5,7 @@ high-precision reasoning specialist (VibeThinker-3B with Claim-Level
 Reliability) and a generalist model, with a priority async job queue,
 bi-temporal audit logging, deterministic verifiers, and an interactive CLI.
 
-## Status: ALPHA SOFTWARE (v0.3.6)
+## Status: ALPHA SOFTWARE (v0.3.7)
 
 **This is alpha software.** It is a local reasoning control plane prototype,
 not a production reasoning engine. The following limitations are real and

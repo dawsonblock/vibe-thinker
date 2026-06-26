@@ -147,7 +147,12 @@ class WarmDockerPool:
         return container
 
     async def _recycle_container(self, idx: int) -> None:
-        """Recycle a container that exceeded max_uses."""
+        """Recycle a container that exceeded max_uses or timed out.
+
+        If the restart fails, retries once. If the retry also fails, removes
+        the container from the pool entirely (shrinking the pool by one) rather
+        than leaving an invalid entry that would cause errors on next use.
+        """
         container = self._containers[idx]
         name = container["name"]
         await self._run_docker(["docker", "rm", "-f", name], timeout=10.0)
@@ -168,6 +173,21 @@ class WarmDockerPool:
         if result.exit_code == 0:
             self._containers[idx] = {"name": name, "uses": 0}
             print(f"[WarmPool] Recycled container {name}")
+            return
+
+        # Retry once — transient Docker errors happen.
+        print(f"[WarmPool] Container {name} restart failed (exit {result.exit_code}), retrying...")
+        result = await self._run_docker(cmd, timeout=30.0)
+        if result.exit_code == 0:
+            self._containers[idx] = {"name": name, "uses": 0}
+            print(f"[WarmPool] Recycled container {name} (on retry)")
+            return
+
+        # Both attempts failed — remove the invalid entry from the pool.
+        # Shrinking the pool is safer than leaving a dead container that would
+        # cause errors on every subsequent use.
+        print(f"[WarmPool] Container {name} restart failed twice — removing from pool")
+        self._containers.pop(idx)
 
     async def execute(
         self,
@@ -228,6 +248,12 @@ class WarmDockerPool:
                 proc.kill()
                 await proc.wait()
                 elapsed = int((time.monotonic() - start) * 1000)
+                # Recycle the container after a timeout — the killed process
+                # may have left zombie children or held file handles that the
+                # /tmp clean won't catch. A fresh container is safer than
+                # reusing one in an unknown state.
+                idx = self._containers.index(container)
+                await self._recycle_container(idx)
                 return ExecutionResult(
                     exit_code=-1, stdout="", stderr="",
                     timed_out=True, executor=self.name,
@@ -310,7 +336,7 @@ class WarmDockerPool:
         """Remove all warm containers."""
         for container in self._containers:
             await self._run_docker(
-                ["rm", "-f", container["name"]], timeout=10.0
+                ["docker", "rm", "-f", container["name"]], timeout=10.0
             )
             print(f"[WarmPool] Removed container {container['name']}")
         self._containers = []

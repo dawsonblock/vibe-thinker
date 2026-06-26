@@ -21,6 +21,7 @@ Bug fixes vs. the original walkthrough version:
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import queue
@@ -608,12 +609,15 @@ class VibeThinkerCLRAsync:
     async def _verify_claims(
         self, session: aiohttp.ClientSession, claims: List[str]
     ) -> List[int]:
-        verdicts = []
-        for claim in claims:
+        # Parallel verification: all claims verified concurrently via
+        # asyncio.gather. This is a major speedup over sequential await —
+        # with 5 claims, the HTTP backend fires 5 concurrent requests and
+        # the in-process pool checks out 5 instances (if pool_size >= 5).
+        # The asyncio semaphore (HTTP) and the queue.Queue (pool) handle
+        # concurrency limits naturally.
+        async def _verify_one(claim: str) -> int:
             if not claim or len(claim.strip()) < 5:
-                verdicts.append(0)
-                continue
-
+                return 0
             verify_prompt = (
                 "<|im_start|>user\n"
                 "Verify whether this claim is correct based on logical reasoning "
@@ -623,11 +627,17 @@ class VibeThinkerCLRAsync:
                 "0 if it is incorrect or uncertain.\n"
                 "<|im_end|>\n<|im_start|>assistant\n"
             )
-            raw = await self._call_model(
-                session, verify_prompt, max_tokens=128, temperature=0.2
-            )
-            verdicts.append(self._parse_verdict(raw))
-        return verdicts
+            try:
+                raw = await self._call_model(
+                    session, verify_prompt, max_tokens=128, temperature=0.2
+                )
+                return self._parse_verdict(raw)
+            except Exception:
+                # A single claim verification failure should not kill the
+                # entire trajectory. Treat as unverified (verdict 0).
+                return 0
+
+        return await asyncio.gather(*[_verify_one(c) for c in claims])
 
     # ------------------------------------------------------------------ #
     # Scoring
@@ -1001,7 +1011,16 @@ class VibeThinkerCLRAsync:
         early_exit_reason: Optional[str] = None
         branch_reason: Optional[str] = None
 
-        async with aiohttp.ClientSession() as session:
+        # In-process mode bypasses HTTP entirely, so skip creating an
+        # aiohttp session (avoids wasted socket/connection-pool overhead).
+        # nullcontext yields None, which _call_model handles correctly
+        # (it checks self._local_llm / self._local_llm_pool before session).
+        session_ctx = (
+            contextlib.nullcontext()
+            if self.backend != "http"
+            else aiohttp.ClientSession()
+        )
+        async with session_ctx as session:
             # === Phase 1: Fast Path ===
             # If a verifier exists, use lightweight generation (answer only)
             # and verify immediately. This saves 6 LLM calls per trajectory.
@@ -1212,7 +1231,13 @@ class VibeThinkerCLRAsync:
             f"(max_concurrent={self.max_concurrent})..."
         )
 
-        async with aiohttp.ClientSession() as session:
+        # In-process mode bypasses HTTP — skip session creation.
+        session_ctx = (
+            contextlib.nullcontext()
+            if self.backend != "http"
+            else aiohttp.ClientSession()
+        )
+        async with session_ctx as session:
             tasks = [
                 self._generate_one_trajectory(session, problem, max_tokens_per_trace)
                 for _ in range(self.k)

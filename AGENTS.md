@@ -1,7 +1,7 @@
 # vibe-thinker — project notes for agents
 
 ## Verify / test
-- Full suite: `python3 -m pytest -q` (385 tests, ~95s, no live servers needed)
+- Full suite: `python3 -m pytest -q` (393 tests, ~75s, no live servers needed)
 - Routing + REPL only: `python3 -m pytest tests/test_routing.py tests/test_repl.py -q`
 - Warm pool + code verifier: `python3 -m pytest tests/test_warm_pool.py tests/test_code_verifier.py -q`
 - Trajectory store: `python3 -m pytest tests/test_trajectory_store.py -q`

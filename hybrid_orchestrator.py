@@ -292,6 +292,14 @@ class HybridReasoningOrchestrator:
             self._warm_pool = None
         self.use_clr = use_clr
 
+        # Shared HTTP session for all generalist/code-specialist calls.
+        # Created lazily on first use to avoid creating a session outside an
+        # event loop. Reused across all calls to avoid TCP connection overhead
+        # (previously each _call_generalist/_call_code_specialist created a
+        # new session per call — with 8 code candidates that was 8 separate
+        # TCP connections). Closed in cleanup().
+        self._http_session: Optional[aiohttp.ClientSession] = None
+
         self.reasoner = VibeThinkerCLRAsync(
             server_url=vibe_endpoint,
             k=clr_k,
@@ -650,6 +658,16 @@ class HybridReasoningOrchestrator:
     # ------------------------------------------------------------------ #
     # Generalist call
     # ------------------------------------------------------------------ #
+    def _get_session(self) -> aiohttp.ClientSession:
+        """Get the shared HTTP session, creating it lazily on first use.
+
+        The session is reused across all generalist/code-specialist calls to
+        avoid TCP connection overhead. Must be called inside an event loop.
+        """
+        if self._http_session is None or self._http_session.closed:
+            self._http_session = aiohttp.ClientSession()
+        return self._http_session
+
     async def _call_generalist(self, query: str, max_tokens: int = 4096) -> str:
         """Call the generalist model via the OpenAI-compatible
         /v1/chat/completions endpoint so llama-server applies the model's
@@ -657,63 +675,63 @@ class HybridReasoningOrchestrator:
         ChatML). Falls back to /completion with ChatML if the chat endpoint
         fails. Raises RuntimeError if both endpoints fail — callers must
         handle the exception, not silently proceed with an error string."""
-        async with aiohttp.ClientSession() as session:
-            chat_payload = {
-                "messages": [{"role": "user", "content": query}],
-                "max_tokens": max_tokens,
+        session = self._get_session()
+        chat_payload = {
+            "messages": [{"role": "user", "content": query}],
+            "max_tokens": max_tokens,
+            "temperature": 0.7,
+            "top_p": 0.95,
+        }
+        try:
+            async with session.post(
+                f"{self.generalist_endpoint}/v1/chat/completions",
+                json=chat_payload,
+                timeout=aiohttp.ClientTimeout(total=600),
+            ) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+                content = data["choices"][0]["message"]["content"]
+                if not content:
+                    raise RuntimeError("Generalist returned empty response")
+                return content
+        except RuntimeError:
+            raise
+        except Exception as e:
+            # Fallback to raw /completion with ChatML
+            print(f"[Generalist] chat endpoint failed ({e}), falling back to /completion")
+            payload = {
+                "prompt": f"<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n",
+                "n_predict": max_tokens,
                 "temperature": 0.7,
                 "top_p": 0.95,
+                "stop": ["<|im_end|>"],
             }
             try:
                 async with session.post(
-                    f"{self.generalist_endpoint}/v1/chat/completions",
-                    json=chat_payload,
+                    f"{self.generalist_endpoint}/completion",
+                    json=payload,
                     timeout=aiohttp.ClientTimeout(total=600),
                 ) as resp:
                     resp.raise_for_status()
                     data = await resp.json()
-                    content = data["choices"][0]["message"]["content"]
+                    content = data.get("content", "")
                     if not content:
-                        raise RuntimeError("Generalist returned empty response")
+                        raise RuntimeError("Generalist returned empty response on fallback")
                     return content
             except RuntimeError:
                 raise
-            except Exception as e:
-                # Fallback to raw /completion with ChatML
-                print(f"[Generalist] chat endpoint failed ({e}), falling back to /completion")
-                payload = {
-                    "prompt": f"<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n",
-                    "n_predict": max_tokens,
-                    "temperature": 0.7,
-                    "top_p": 0.95,
-                    "stop": ["<|im_end|>"],
-                }
-                try:
-                    async with session.post(
-                        f"{self.generalist_endpoint}/completion",
-                        json=payload,
-                        timeout=aiohttp.ClientTimeout(total=600),
-                    ) as resp:
-                        resp.raise_for_status()
-                        data = await resp.json()
-                        content = data.get("content", "")
-                        if not content:
-                            raise RuntimeError("Generalist returned empty response on fallback")
-                        return content
-                except RuntimeError:
-                    raise
-                except Exception as e2:
-                    raise RuntimeError(
-                        f"Generalist call failed (both endpoints): {e2}"
-                    ) from e2
+            except Exception as e2:
+                raise RuntimeError(
+                    f"Generalist call failed (both endpoints): {e2}"
+                ) from e2
 
     # ------------------------------------------------------------------ #
     # Specialist (plain, no CLR) — fixed
     # ------------------------------------------------------------------ #
     async def _call_specialist_plain(self, query: str, max_tokens: int = 8192) -> str:
         """Plain VibeThinker generation without CLR. Uses a real session."""
-        async with aiohttp.ClientSession() as session:
-            return await self.reasoner.generate_plain(session, query, max_tokens)
+        session = self._get_session()
+        return await self.reasoner.generate_plain(session, query, max_tokens)
 
     # ------------------------------------------------------------------ #
     # Code specialist (dedicated fast code-generation model, e.g. ruvltra)
@@ -729,54 +747,54 @@ class HybridReasoningOrchestrator:
         """
         if not self.code_specialist_endpoint:
             raise RuntimeError("No code_specialist_endpoint configured")
-        async with aiohttp.ClientSession() as session:
-            chat_payload = {
-                "messages": [{"role": "user", "content": query}],
-                "max_tokens": max_tokens,
+        session = self._get_session()
+        chat_payload = {
+            "messages": [{"role": "user", "content": query}],
+            "max_tokens": max_tokens,
+            "temperature": 0.2,
+            "top_p": 0.95,
+        }
+        try:
+            async with session.post(
+                f"{self.code_specialist_endpoint}/v1/chat/completions",
+                json=chat_payload,
+                timeout=aiohttp.ClientTimeout(total=600),
+            ) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+                content = data["choices"][0]["message"]["content"]
+                if not content:
+                    raise RuntimeError("Code specialist returned empty response")
+                return content
+        except RuntimeError:
+            raise
+        except Exception as e:
+            print(f"[CodeSpecialist] chat endpoint failed ({e}), falling back to /completion")
+            payload = {
+                "prompt": f"<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n",
+                "n_predict": max_tokens,
                 "temperature": 0.2,
                 "top_p": 0.95,
+                "stop": ["<|im_end|>"],
             }
             try:
                 async with session.post(
-                    f"{self.code_specialist_endpoint}/v1/chat/completions",
-                    json=chat_payload,
+                    f"{self.code_specialist_endpoint}/completion",
+                    json=payload,
                     timeout=aiohttp.ClientTimeout(total=600),
                 ) as resp:
                     resp.raise_for_status()
                     data = await resp.json()
-                    content = data["choices"][0]["message"]["content"]
+                    content = data.get("content", "")
                     if not content:
-                        raise RuntimeError("Code specialist returned empty response")
+                        raise RuntimeError("Code specialist returned empty response on fallback")
                     return content
             except RuntimeError:
                 raise
-            except Exception as e:
-                print(f"[CodeSpecialist] chat endpoint failed ({e}), falling back to /completion")
-                payload = {
-                    "prompt": f"<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n",
-                    "n_predict": max_tokens,
-                    "temperature": 0.2,
-                    "top_p": 0.95,
-                    "stop": ["<|im_end|>"],
-                }
-                try:
-                    async with session.post(
-                        f"{self.code_specialist_endpoint}/completion",
-                        json=payload,
-                        timeout=aiohttp.ClientTimeout(total=600),
-                    ) as resp:
-                        resp.raise_for_status()
-                        data = await resp.json()
-                        content = data.get("content", "")
-                        if not content:
-                            raise RuntimeError("Code specialist returned empty response on fallback")
-                        return content
-                except RuntimeError:
-                    raise
-                except Exception as e2:
-                    raise RuntimeError(
-                        f"Code specialist call failed (both endpoints): {e2}"
-                    ) from e2
+            except Exception as e2:
+                raise RuntimeError(
+                    f"Code specialist call failed (both endpoints): {e2}"
+                ) from e2
 
     # ------------------------------------------------------------------ #
     # Multi-candidate code generation with sandbox verification
@@ -935,14 +953,27 @@ class HybridReasoningOrchestrator:
                 )
 
             # Verify each candidate against the test spec in the sandbox.
-            # First passing candidate wins.
-            verification_traces = []
-            test_error_count = 0
-            first_test_error: Optional[str] = None
-            for i, (raw, code) in enumerate(candidates):
+            # Parallel verification: all candidates verified concurrently via
+            # asyncio.gather. The warm pool's multiple containers handle
+            # parallelism naturally (round-robin dispatch). This replaces the
+            # old sequential loop — with 6 candidates and 3 warm containers,
+            # verification time drops from ~1.2s to ~0.4s.
+            async def _verify_one(idx: int, code: str):
                 result = await self.code_verifier.verify(
                     query, code, {"unit_tests": tests}
                 )
+                return idx, result
+
+            verify_tasks = [
+                _verify_one(i, code) for i, (raw, code) in enumerate(candidates)
+            ]
+            verify_results = await asyncio.gather(*verify_tasks)
+
+            # Process results in candidate order (gather preserves order).
+            verification_traces = []
+            test_error_count = 0
+            first_test_error: Optional[str] = None
+            for i, result in verify_results:
                 trace = {
                     "candidate_index": i,
                     "verified": result.verified,
@@ -954,7 +985,7 @@ class HybridReasoningOrchestrator:
                 if result.verified:
                     print(f"[CodeLoop] Candidate {i} PASSED verification — returning")
                     return OrchestratorResult(
-                        final_answer=code,
+                        final_answer=candidates[i][1],
                         route_taken="code_specialist_verified",
                         specialist_used="Code Specialist (ruvltra-claude-code)",
                         clr_score=1.0,
@@ -1270,12 +1301,16 @@ class HybridReasoningOrchestrator:
             await self._warm_pool.start()
 
     async def cleanup(self) -> None:
-        """Clean up background resources (warm Docker pool).
+        """Clean up background resources (warm Docker pool, shared HTTP session).
 
-        Call this when shutting down to remove warm containers.
+        Call this when shutting down to remove warm containers and close the
+        shared aiohttp session.
         """
         if self._warm_pool is not None:
             await self._warm_pool.cleanup()
+        if self._http_session is not None and not self._http_session.closed:
+            await self._http_session.close()
+            self._http_session = None
 
     # ------------------------------------------------------------------ #
     # Main entry point

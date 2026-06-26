@@ -784,3 +784,96 @@ class TestInProcessPool:
             await clr._call_model(MagicMock(), "prompt", max_tokens=10)
 
 
+class TestParallelVerifyClaims:
+    """Tests for parallel claim verification (asyncio.gather).
+
+    _verify_claims was previously sequential (for claim in claims: await).
+    Now it uses asyncio.gather to verify all claims concurrently.
+    """
+
+    @pytest.mark.asyncio
+    async def test_verify_claims_runs_concurrently(self, clr):
+        """All claims are verified in parallel, not sequentially."""
+        import asyncio as aio
+        import time
+
+        call_times = []
+
+        async def slow_call_model(session, prompt, **kwargs):
+            call_times.append(time.monotonic())
+            await aio.sleep(0.05)  # Simulate 50ms LLM call
+            return "1"  # Verdict: correct
+
+        clr._call_model = slow_call_model
+        clr.backend = "http"
+
+        claims = ["claim 1 is true", "claim 2 is true", "claim 3 is true"]
+        start = time.monotonic()
+        verdicts = await clr._verify_claims(MagicMock(), claims)
+        elapsed = time.monotonic() - start
+
+        assert verdicts == [1, 1, 1]
+        # If sequential: 3 x 50ms = 150ms. With gather: ~50ms.
+        assert elapsed < 0.12, f"Took {elapsed:.3f}s — expected parallel (<0.12s)"
+
+    @pytest.mark.asyncio
+    async def test_verify_claims_short_claim_returns_zero(self, clr):
+        """Claims shorter than 5 chars get verdict 0 without an LLM call."""
+        clr._call_model = AsyncMock(return_value="1")
+        clr.backend = "http"
+
+        verdicts = await clr._verify_claims(MagicMock(), ["ok", "", "  "])
+        assert verdicts == [0, 0, 0]
+        clr._call_model.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_verify_claims_one_failure_doesnt_kill_all(self, clr):
+        """If one claim verification raises, it returns 0 (not crash)."""
+        call_count = 0
+
+        async def flaky_call_model(session, prompt, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise RuntimeError("LLM crashed")
+            return "1"
+
+        clr._call_model = flaky_call_model
+        clr.backend = "http"
+
+        claims = ["claim 1 is true", "claim 2 is true", "claim 3 is true"]
+        verdicts = await clr._verify_claims(MagicMock(), claims)
+        # Second claim failed → verdict 0, but others still got verified
+        assert verdicts == [1, 0, 1]
+
+
+class TestInProcessSessionSkip:
+    """Tests for skipping aiohttp session creation in in-process mode."""
+
+    @pytest.mark.asyncio
+    async def test_run_static_skips_session_in_inprocess_mode(self, clr):
+        """In-process mode: _run_static uses nullcontext, not aiohttp session."""
+        clr.backend = "in-process"
+        clr._local_llm = MagicMock(return_value={"choices": [{"text": "answer"}]})
+        clr._local_grammar = None
+        clr.k = 2
+
+        # Mock _generate_one_trajectory to verify session is None
+        received_sessions = []
+
+        async def mock_gen(session, problem, max_tokens):
+            received_sessions.append(session)
+            return {"answer": "42", "claims": [], "verdicts": [], "raw": "",
+                    "raw_trace": ""}
+
+        clr._generate_one_trajectory = mock_gen
+        clr._score_trajectories = MagicMock(return_value=[
+            {"answer": "42", "score": 0.9, "claims": [], "verdicts": [],
+             "raw": "", "raw_trace": ""}
+        ])
+
+        await clr._run_static("test problem", 512, None, "math", None)
+        # In in-process mode, session should be None (nullcontext)
+        assert all(s is None for s in received_sessions)
+
+
