@@ -238,3 +238,58 @@ class TestExecutorEvidence:
         assert result.verified is True
         assert "executor" in result.evidence
         assert result.evidence["executor"] == "local_subprocess_unsafe"
+
+
+class TestNonceAntiSpoofing:
+    """Security: a candidate that prints the old success marker string
+    must NOT be verified. The verifier requires a per-execution nonce
+    that candidate code cannot know."""
+
+    @pytest.mark.asyncio
+    async def test_candidate_printing_old_marker_not_verified(self, verifier):
+        """A candidate that prints 'ALL_TESTS_PASSED' and then fails the
+        tests must NOT be verified (the old bypass vulnerability)."""
+        code = (
+            "def add(a, b):\n"
+            "    return a - b  # wrong\n"
+            "print('ALL_TESTS_PASSED')  # spoof attempt\n"
+        )
+        tests = "assert add(2, 3) == 5\n"
+        result = await verifier.verify(
+            "Write add", code,
+            context={"unit_tests": tests},
+        )
+        assert result.verified is False
+        assert result.score == 0.0
+
+    @pytest.mark.asyncio
+    async def test_candidate_overriding_sys_exit_not_verified(self, verifier):
+        """A candidate that neutralizes sys.exit so a failing test still
+        exits 0 must NOT be verified — the nonce marker is only printed
+        if the test block completes without raising."""
+        code = (
+            "import sys\n"
+            "sys.exit = lambda code=0: None  # neutralize exit\n"
+            "def add(a, b):\n"
+            "    return a - b  # wrong\n"
+        )
+        tests = "assert add(2, 3) == 5\n"
+        result = await verifier.verify(
+            "Write add", code,
+            context={"unit_tests": tests},
+        )
+        assert result.verified is False
+        assert result.score == 0.0
+
+    @pytest.mark.asyncio
+    async def test_legitimate_pass_still_verified(self, verifier):
+        """A correct solution must still pass verification with the nonce."""
+        code = "def add(a, b):\n    return a + b\n"
+        tests = "assert add(2, 3) == 5\nassert add(0, 0) == 0\n"
+        result = await verifier.verify(
+            "Write add", code,
+            context={"unit_tests": tests},
+        )
+        assert result.verified is True
+        assert result.score == 1.0
+        assert result.evidence.get("nonce_verified") is True

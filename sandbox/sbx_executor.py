@@ -111,9 +111,14 @@ class DockerSbxExecutor:
                 "sbx", "run", "--clone",
                 "--name", sandbox_name,
                 "--no-attach",
-                "shell", "--",
-                "python3", "/workspace/verify_script.py",
             ]
+            # Forward environment variables into the sandbox (e.g. the
+            # verification nonce). sbx forwards these to the agent process.
+            if env:
+                for key, value in env.items():
+                    sbx_cmd.extend(["--env", f"{key}={value}"])
+            sbx_cmd.extend(["shell", "--",
+                "python3", "/workspace/verify_script.py"])
 
             try:
                 proc = await asyncio.create_subprocess_exec(
@@ -179,30 +184,14 @@ class DockerSbxExecutor:
         memory_limit: str = "128m",
     ) -> ExecutionResult:
         """Execute unit tests against candidate code in an sbx microVM."""
-        import textwrap
-        code_clean = textwrap.dedent(code).strip()
-        tests_clean = textwrap.dedent(tests).strip()
-        script = (
-            "import sys, traceback\n"
-            "try:\n"
-            + textwrap.indent(code_clean, "    ") + "\n"
-            "except Exception as e:\n"
-            "    print(f'IMPORT_ERROR: {e}')\n"
-            "    sys.exit(1)\n"
-            "try:\n"
-            + textwrap.indent(tests_clean, "    ") + "\n"
-            "    print('ALL_TESTS_PASSED')\n"
-            "except AssertionError as e:\n"
-            "    print(f'ASSERTION_FAILED: {e}')\n"
-            "    sys.exit(1)\n"
-            "except Exception as e:\n"
-            "    print(f'TEST_ERROR: {e}')\n"
-            "    traceback.print_exc()\n"
-            "    sys.exit(1)\n"
-        )
-        return await self.execute(
+        from sandbox.base import VT_TEST_NONCE_ENV, build_test_harness
+        script, nonce = build_test_harness(code, tests)
+        result = await self.execute(
             script, timeout=timeout, network=network, memory_limit=memory_limit,
+            env={VT_TEST_NONCE_ENV: nonce},
         )
+        result.evidence["test_nonce"] = nonce
+        return result
 
     async def _run_command(
         self, cmd: list, cwd: Optional[str] = None, timeout: float = 10.0,

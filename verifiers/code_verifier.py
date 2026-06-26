@@ -205,7 +205,17 @@ class CodeVerifier:
     def _interpret_test_result(
         self, result: ExecutionResult, evidence: Dict[str, Any]
     ) -> VerificationResult:
-        """Interpret a sandbox execution result for unit tests."""
+        """Interpret a sandbox execution result for unit tests.
+
+        Security: verification requires BOTH (a) the cryptographic nonce
+        marker ``VT_PASS_<nonce>`` in stdout AND (b) exit code 0. The nonce
+        is generated per-execution and passed via an environment variable
+        that candidate code cannot read without deliberately calling
+        ``os.environ``. This prevents a candidate from forging the success
+        marker by simply printing it (the old ``ALL_TESTS_PASSED`` string
+        was trivially spoofable, and a candidate that overrode
+        ``sys.exit`` could force a 0 exit code while tests failed).
+        """
         if result.timed_out:
             return VerificationResult(
                 verified=False, score=0.0, method="unit_tests",
@@ -223,22 +233,34 @@ class CodeVerifier:
         stderr = result.stderr
         returncode = result.exit_code
 
-        if "ALL_TESTS_PASSED" in stdout:
+        # Look for the per-execution nonce marker in stdout. The nonce is
+        # stored in evidence by execute_tests(). If absent (e.g. a custom
+        # executor that doesn't use build_test_harness), fail closed.
+        nonce = result.evidence.get("test_nonce")
+        from sandbox.base import VT_TEST_PASS_PREFIX
+        pass_marker = f"{VT_TEST_PASS_PREFIX}{nonce}" if nonce else None
+
+        if pass_marker and pass_marker in stdout and returncode == 0:
             return VerificationResult(
                 verified=True, score=1.0, method="unit_tests",
                 evidence={**evidence, "stdout": stdout,
-                          "returncode": returncode},
+                          "returncode": returncode,
+                          "nonce_verified": True},
             )
 
-        # Non-zero exit without success marker -> include the error detail
-        error_msg = "success marker 'ALL_TESTS_PASSED' not found in stdout"
-        if returncode != 0:
+        # Non-zero exit or missing nonce marker -> include the error detail
+        if pass_marker is None:
+            error_msg = ("no test_nonce in evidence — executor did not use "
+                         "build_test_harness; refusing to verify")
+        elif returncode != 0:
+            error_msg = f"exit code {returncode}; nonce marker not confirmed"
             for marker in ("ASSERTION_FAILED", "IMPORT_ERROR", "TEST_ERROR"):
                 if marker in stdout:
                     error_msg = stdout.strip()
                     break
-            else:
-                error_msg = f"process exited with code {returncode}: {error_msg}"
+        else:
+            error_msg = ("nonce marker present in evidence but not found in "
+                         "stdout (tests raised before harness could print it)")
 
         return VerificationResult(
             verified=False, score=0.0, method="unit_tests",

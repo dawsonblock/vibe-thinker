@@ -261,3 +261,104 @@ class TestSpecialistDeadEndpoint:
         assert q.status(j.job_id) == JobStatus.FAILED
         await q.stop()
 
+
+class TestDiskPersistence:
+    """Tests for crash-recoverable pending job persistence."""
+
+    @pytest.fixture
+    def persist_path(self):
+        path = tempfile.mktemp(suffix=".pending.jsonl")
+        yield path
+        if os.path.exists(path):
+            os.unlink(path)
+
+    @pytest.mark.asyncio
+    async def test_pending_job_persisted(self, log_path, persist_path):
+        """A pending job is written to the persist file."""
+        orch = MockOrchestrator(delay=2.0)
+        q = JobQueue(orch, max_concurrent=1, audit_log=log_path,
+                     persist_path=persist_path)
+        await q.start()
+        j1 = q.submit("running", priority=10)
+        j2 = q.submit("pending", priority=1)
+        await asyncio.sleep(0.1)
+        # Both jobs should be in the persist file (one running, one pending)
+        with open(persist_path) as f:
+            lines = f.readlines()
+        ids = [__import__("json").loads(l)["job_id"] for l in lines]
+        assert j1.job_id in ids
+        assert j2.job_id in ids
+        await q.stop()
+
+    @pytest.mark.asyncio
+    async def test_completed_job_removed_from_persist(self, log_path, persist_path):
+        """A completed job is removed from the persist file."""
+        orch = MockOrchestrator(delay=0.01)
+        q = JobQueue(orch, max_concurrent=1, audit_log=log_path,
+                     persist_path=persist_path)
+        await q.start()
+        j = q.submit("fast", priority=1)
+        await q.wait_for(j.job_id, timeout=5)
+        # Persist file should be empty (job completed and was removed)
+        with open(persist_path) as f:
+            lines = [l for l in f.readlines() if l.strip()]
+        assert len(lines) == 0
+        await q.stop()
+
+    @pytest.mark.asyncio
+    async def test_crash_recovery(self, log_path, persist_path):
+        """Jobs persisted before a 'crash' are recovered on restart."""
+        orch = MockOrchestrator(delay=0.01)
+        q1 = JobQueue(orch, max_concurrent=1, audit_log=log_path,
+                      persist_path=persist_path)
+        # Submit jobs without starting the dispatcher (simulates crash
+        # before jobs run)
+        j1 = q1.submit("recovered query 1", priority=5)
+        j2 = q1.submit("recovered query 2", priority=1)
+        # Don't start or stop — just abandon (simulates crash)
+
+        # New queue instance with same persist path — should recover jobs
+        q2 = JobQueue(orch, max_concurrent=2, audit_log=log_path,
+                      persist_path=persist_path)
+        await q2.start()
+        # Both jobs should be recovered and re-queued
+        assert q2.get(j1.job_id) is not None
+        assert q2.get(j2.job_id) is not None
+        assert q2.status(j1.job_id) == JobStatus.PENDING
+        # Wait for them to complete
+        r1 = await q2.wait_for(j1.job_id, timeout=5)
+        r2 = await q2.wait_for(j2.job_id, timeout=5)
+        assert r1.final_answer == "42"
+        assert r2.final_answer == "42"
+        await q2.stop()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_job_removed_from_persist(self, log_path, persist_path):
+        """A cancelled pending job is removed from the persist file."""
+        orch = MockOrchestrator(delay=2.0)
+        q = JobQueue(orch, max_concurrent=1, audit_log=log_path,
+                     persist_path=persist_path)
+        await q.start()
+        j1 = q.submit("running", priority=10)
+        j2 = q.submit("to_cancel", priority=1)
+        await asyncio.sleep(0.1)
+        q.cancel(j2.job_id)
+        # j2 should be removed from persist file
+        with open(persist_path) as f:
+            lines = [l for l in f.readlines() if l.strip()]
+        ids = [__import__("json").loads(l)["job_id"] for l in lines]
+        assert j2.job_id not in ids
+        await q.stop()
+
+    @pytest.mark.asyncio
+    async def test_no_persist_path_no_file(self, log_path):
+        """Without persist_path, no file is created."""
+        orch = MockOrchestrator(delay=0.01)
+        q = JobQueue(orch, max_concurrent=1, audit_log=log_path,
+                     persist_path=None)
+        await q.start()
+        q.submit("test", priority=1)
+        await asyncio.sleep(0.2)
+        await q.stop()
+        # No persist file should exist (audit_log is separate)
+

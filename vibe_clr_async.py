@@ -224,18 +224,40 @@ class VibeThinkerCLRAsync:
           - "repo_id/filename"            -> Llama.from_pretrained(...)
           - "repo_id" with filename in env -> Llama.from_pretrained(...)
         """
+        # --- RuvLLM in-process binding (v0.3.9, optional) ---
+        # When ruvllm_py is installed (PyO3 wrapper around the Rust ruvllm
+        # crate), prefer it over llama-cpp-python for TurboQuant KV cache
+        # compression. Falls back to llama-cpp-python if not installed.
         try:
-            from llama_cpp import Llama, LlamaGrammar
+            from ruvllm_adapter import is_ruvllm_binding_available, RuvLLMBinding
         except ImportError:
-            print(
-                f"[CLR] Warning: local specialist '{local_model}' requested but "
-                f"llama-cpp-python is not installed. Falling back to HTTP at "
-                f"{self.server_url}. Install with: pip install llama-cpp-python"
-            )
-            return
+            is_ruvllm_binding_available = lambda: False  # type: ignore
+            RuvLLMBinding = None  # type: ignore
+
+        use_ruvllm = is_ruvllm_binding_available()
+        if use_ruvllm:
+            print(f"[CLR] RuvLLM PyO3 binding detected — preferring over "
+                  f"llama-cpp-python for TurboQuant KV cache compression.")
+        else:
+            try:
+                from llama_cpp import Llama, LlamaGrammar
+            except ImportError:
+                print(
+                    f"[CLR] Warning: local specialist '{local_model}' requested but "
+                    f"llama-cpp-python is not installed. Falling back to HTTP at "
+                    f"{self.server_url}. Install with: pip install llama-cpp-python"
+                )
+                return
 
         def _load_one() -> Any:
-            """Load a single Llama instance from local_model."""
+            """Load a single inference engine instance from local_model."""
+            if use_ruvllm:
+                # RuvLLMBinding has the same __call__ contract as Llama.
+                return RuvLLMBinding(
+                    model_path=local_model,
+                    n_ctx=n_ctx,
+                    n_threads=n_threads,
+                )
             if os.path.exists(local_model):
                 return Llama(
                     model_path=local_model,
@@ -318,7 +340,16 @@ class VibeThinkerCLRAsync:
             # If this assumption is wrong, symptoms would be corrupted JSON
             # output under concurrent pool access — switch to per-instance
             # grammars if that occurs.
-            self._local_grammar = LlamaGrammar.from_string(_CLAIMS_JSON_GRAMMAR)
+            #
+            # RuvLLM (v0.3.9): the RuvLLMBinding.__call__ accepts a grammar
+            # string directly (no LlamaGrammar object). When use_ruvllm is
+            # True, we store the raw grammar string instead of a compiled
+            # LlamaGrammar. _call_model_inprocess handles both cases.
+            if use_ruvllm:
+                # RuvLLM takes the raw GBNF string; no pre-compilation needed.
+                self._local_grammar = _CLAIMS_JSON_GRAMMAR  # type: ignore
+            else:
+                self._local_grammar = LlamaGrammar.from_string(_CLAIMS_JSON_GRAMMAR)
         except Exception as e:
             print(
                 f"[CLR] Warning: failed to load in-process specialist "
@@ -422,10 +453,20 @@ class VibeThinkerCLRAsync:
 
         # Resolve the grammar object: reuse the pre-compiled claims grammar when
         # the caller asked for it; compile any other grammar on demand.
+        #
+        # RuvLLM (v0.3.9): when self._local_grammar is a raw string (RuvLLM
+        # mode), pass it directly — RuvLLMBinding.__call__ accepts a grammar
+        # string. When it's a LlamaGrammar object (llama-cpp mode), pass the
+        # compiled object as before.
         grammar_obj = None
         if grammar is not None:
             if grammar == _CLAIMS_JSON_GRAMMAR and self._local_grammar is not None:
                 grammar_obj = self._local_grammar
+            elif isinstance(self._local_grammar, str):
+                # RuvLLM mode: grammar is a raw GBNF string. Use it directly
+                # for the claims grammar; for any other grammar, pass the
+                # requested string.
+                grammar_obj = grammar if grammar != _CLAIMS_JSON_GRAMMAR else self._local_grammar
             else:
                 try:
                     from llama_cpp import LlamaGrammar

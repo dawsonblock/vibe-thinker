@@ -15,10 +15,87 @@ an expected answer. The verifier will then return verified=False with
 
 This is a deterministic computation, not a model call. The whole point
 is that it provides INDEPENDENT evidence the model answer is correct.
+
+Security: arithmetic expressions are evaluated with a strict AST
+whitelist (``_safe_eval``) instead of ``eval()``. Only numbers, the
+four binary operators, unary +/-, parenthesization, exponentiation
+(``**``), and a single variable name (for recurrences) are permitted.
+Any other AST node (calls, attributes, comprehensions, etc.) causes
+the expression to be rejected (returns None).
 """
 
+import ast
 import re
 from typing import Optional
+
+
+# AST node types allowed in safe arithmetic evaluation.
+_SAFE_BINOPS = (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow, ast.Mod, ast.FloorDiv)
+_SAFE_UNARYOPS = (ast.UAdd, ast.USub)
+
+
+def _safe_eval(expr: str, names: Optional[dict] = None) -> Optional[float]:
+    """Evaluate a strictly arithmetic expression without ``eval()``.
+
+    Only the following are permitted:
+      - numeric literals (int/float)
+      - binary +, -, *, /, **, %, //
+      - unary +, -
+      - parenthesization
+      - a single variable name (when ``names`` is provided, e.g. {"x": 2.0})
+
+    Any other construct (function calls, attribute access, subscripts,
+    comprehensions, boolean ops, comparisons, etc.) is rejected and
+    ``None`` is returned. This is a defense-in-depth replacement for
+    ``eval(expr, {"__builtins__": {}}, {})`` which is unsafe even with
+    stripped builtins.
+    """
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError:
+        return None
+    return _eval_node(tree.body, names or {})
+
+
+def _eval_node(node, names: dict) -> Optional[float]:
+    """Recursively evaluate an AST node, returning None on any disallowed node."""
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, (int, float)):
+            return node.value
+        return None
+    if isinstance(node, ast.Name):
+        if node.id in names:
+            return names[node.id]
+        return None
+    if isinstance(node, ast.BinOp) and isinstance(node.op, _SAFE_BINOPS):
+        left = _eval_node(node.left, names)
+        right = _eval_node(node.right, names)
+        if left is None or right is None:
+            return None
+        try:
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if isinstance(node.op, ast.Div):
+                return left / right
+            if isinstance(node.op, ast.Pow):
+                return left ** right
+            if isinstance(node.op, ast.Mod):
+                return left % right
+            if isinstance(node.op, ast.FloorDiv):
+                return left // right
+        except (ZeroDivisionError, OverflowError):
+            return None
+        return None
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, _SAFE_UNARYOPS):
+        operand = _eval_node(node.operand, names)
+        if operand is None:
+            return None
+        return +operand if isinstance(node.op, ast.UAdd) else -operand
+    return None
 
 
 def solve(problem: str) -> Optional[str]:
@@ -96,10 +173,10 @@ def _try_recurrence(problem: str) -> Optional[str]:
     # Iterate the recurrence
     current = a0
     for i in range(1, target_n):
-        try:
-            current = eval(expr, {"x": current, "__builtins__": {}}, {})
-        except Exception:
+        val = _safe_eval(expr, {"x": current})
+        if val is None:
             return None
+        current = val
         # Safety: prevent overflow
         if abs(current) > 1e15:
             return None
@@ -169,10 +246,9 @@ def _try_arithmetic(problem: str) -> Optional[str]:
     if not re.match(r"^[\d\s+\-*/().]+$", expr):
         return None
 
-    try:
-        result = eval(expr, {"__builtins__": {}}, {})
-        if result == int(result):
-            return str(int(result))
-        return str(result)
-    except Exception:
+    result = _safe_eval(expr)
+    if result is None:
         return None
+    if result == int(result):
+        return str(int(result))
+    return str(result)

@@ -206,7 +206,9 @@ class TestWarmPoolIntegration:
             tests = "assert double(5) == 10\nassert double(0) == 0\n"
             result = await pool.execute_tests(code, tests, timeout=10.0)
             assert result.exit_code == 0
-            assert "ALL_TESTS_PASSED" in result.stdout
+            nonce = result.evidence.get("test_nonce")
+            assert nonce is not None
+            assert f"VT_PASS_{nonce}" in result.stdout
         finally:
             await pool.cleanup()
 
@@ -219,7 +221,9 @@ class TestWarmPoolIntegration:
             tests = "assert double(5) == 10\n"
             result = await pool.execute_tests(code, tests, timeout=10.0)
             assert result.exit_code != 0
-            assert "ALL_TESTS_PASSED" not in result.stdout
+            nonce = result.evidence.get("test_nonce")
+            assert nonce is not None
+            assert f"VT_PASS_{nonce}" not in result.stdout
         finally:
             await pool.cleanup()
 

@@ -25,9 +25,12 @@ Design notes:
 import json
 import os
 import tempfile
+import uuid as _uuid
 from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+
+from vector_store import VectorStore, LocalVectorStore, make_vector_store
 
 # Optional deps for semantic CLR cache
 try:
@@ -335,6 +338,9 @@ class CLRResultCache:
         min_score: float = 0.7,
         max_entries: int = 256,
         autosave: bool = True,
+        vector_store: Optional[VectorStore] = None,
+        agentdb_url: Optional[str] = None,
+        agentdb_collection: str = "clr_results",
     ):
         if not EMBEDDINGS_AVAILABLE:
             raise ImportError(
@@ -350,6 +356,23 @@ class CLRResultCache:
         self.model = SentenceTransformer(model_name)
         self.entries: List[Dict[str, Any]] = []
         self._embeddings_matrix: Optional[Any] = None  # np.ndarray, rebuilt on load
+
+        # Vector store backend (v0.3.9). When provided, similarity search
+        # is delegated to it (AgentDB sidecar) instead of the in-memory
+        # numpy matrix. When None, the in-memory matrix is used (default,
+        # unchanged behavior). The agentdb_url convenience parameter
+        # builds an AgentDBVectorStore (or ShadowVectorStore wrapping the
+        # local matrix) automatically.
+        self._vector_store: Optional[VectorStore] = vector_store
+        if self._vector_store is None and agentdb_url:
+            # Build a shadow store: local matrix as primary (source of
+            # truth), AgentDB as secondary (shadow writes). This is the
+            # integration plan's "Shadow Mode" migration step.
+            self._vector_store = make_vector_store(
+                agentdb_url=agentdb_url,
+                collection=agentdb_collection,
+                shadow_primary=LocalVectorStore(),
+            )
 
         self._load()
 
@@ -407,6 +430,10 @@ class CLRResultCache:
                 continue
             if not is_cache_entry_trustworthy(entry, allow_weak_cache=allow_weak_cache):
                 continue
+            # Track access frequency for LRU eviction.
+            entry["access_count"] = entry.get("access_count", 0) + 1
+            if self.autosave:
+                self.save()
             return {
                 "best_answer": entry["best_answer"],
                 "best_score": entry["best_score"],
@@ -473,9 +500,12 @@ class CLRResultCache:
             "schema_version": CURRENT_CACHE_SCHEMA_VERSION,
         }
         self.entries.append(entry)
-        # Evict oldest low-score entries if over capacity (keep best scores)
+        # Evict least-recently-accessed entries if over capacity (LRU + score).
         if len(self.entries) > self.max_entries:
-            self.entries.sort(key=lambda e: e.get("best_score", 0), reverse=True)
+            self.entries.sort(
+                key=lambda e: (e.get("access_count", 0), e.get("best_score", 0)),
+                reverse=True,
+            )
             self.entries = self.entries[: self.max_entries]
         self._rebuild_embeddings_matrix()
         if self.autosave:
@@ -544,6 +574,9 @@ class VerifiedTrajectoryStore:
         max_entries: int = 512,
         max_few_shot: int = 3,
         autosave: bool = True,
+        vector_store: Optional[VectorStore] = None,
+        agentdb_url: Optional[str] = None,
+        agentdb_collection: str = "trajectories",
     ):
         if not EMBEDDINGS_AVAILABLE:
             raise ImportError(
@@ -560,6 +593,18 @@ class VerifiedTrajectoryStore:
         self.model = SentenceTransformer(model_name)
         self.entries: List[Dict[str, Any]] = []
         self._embeddings_matrix: Optional[Any] = None
+
+        # Vector store backend (v0.3.9). See CLRResultCache.__init__ for
+        # the same pattern: when provided, similarity search is delegated
+        # to the vector store (AgentDB sidecar) instead of the in-memory
+        # numpy matrix. Default is None (in-memory, unchanged behavior).
+        self._vector_store: Optional[VectorStore] = vector_store
+        if self._vector_store is None and agentdb_url:
+            self._vector_store = make_vector_store(
+                agentdb_url=agentdb_url,
+                collection=agentdb_collection,
+                shadow_primary=LocalVectorStore(),
+            )
 
         self._load()
 
@@ -635,8 +680,13 @@ class VerifiedTrajectoryStore:
                 "task_type": entry.get("task_type", ""),
                 "similarity": sim,
             })
+            # Track access frequency for LRU eviction.
+            entry["access_count"] = entry.get("access_count", 0) + 1
             if len(candidates) >= self.max_few_shot:
                 break
+        # Save if access counts changed (for LRU persistence across restarts).
+        if candidates and self.autosave:
+            self.save()
         return candidates
 
     def build_few_shot_prefix(self, query: str, task_type: Optional[str] = None) -> str:
@@ -711,9 +761,16 @@ class VerifiedTrajectoryStore:
             "claim_count": 10,  # verified entries pass the claim_count check
         }
         self.entries.append(entry)
-        # Evict lowest-score entries if over capacity
+        # Evict least-recently-accessed entries if over capacity (LRU + score).
+        # Entries that are never retrieved are evicted before frequently-
+        # retrieved ones, even if their score is higher — a stale high-score
+        # entry that nobody looks up is less valuable than a medium-score
+        # entry that's retrieved often. Ties are broken by score.
         if len(self.entries) > self.max_entries:
-            self.entries.sort(key=lambda e: e.get("score", 0), reverse=True)
+            self.entries.sort(
+                key=lambda e: (e.get("access_count", 0), e.get("score", 0)),
+                reverse=True,
+            )
             self.entries = self.entries[: self.max_entries]
         self._rebuild_embeddings_matrix()
         if self.autosave:

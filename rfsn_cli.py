@@ -42,6 +42,7 @@ import shlex
 
 from hybrid_orchestrator import HybridReasoningOrchestrator
 from rfsn_job_queue import JobQueue
+from federated_queue import make_job_queue
 
 # Optional: load .env file if python-dotenv is installed.
 try:
@@ -351,9 +352,91 @@ def build_argparser() -> argparse.ArgumentParser:
                         "For a 0.5B model (~398MB each), 4 instances cost ~1.6GB "
                         "and enable 4 concurrent trajectories. Each instance gets "
                         "n_threads/pool_size CPU threads.")
+    # --- RuvLLM integration (v0.3.9) ---
+    # RuvLLM is a Rust inference engine with TurboQuant KV cache compression.
+    # It exposes the same OpenAI-compatible HTTP API as llama-server, so the
+    # simplest integration is to point --vibe at the RuvLLM port. This flag
+    # is a convenience that overrides --vibe with the RuvLLM URL and documents
+    # the integration. See ruvllm_adapter.py for details.
+    p.add_argument("--ruvllm-url",
+                   default=os.environ.get("RUVLLM_URL", ""),
+                   help="RuvLLM HTTP endpoint (e.g. http://127.0.0.1:8080). "
+                        "When set, overrides --vibe to use the RuvLLM server "
+                        "with TurboQuant KV cache compression. The orchestrator's "
+                        "existing HTTP path handles it — no other changes needed. "
+                        "See ruvllm_adapter.RuvLLMHTTPBackend for the recommended "
+                        "start command with TurboQuant flags.")
+    # --- Fast code-specialist preset (v0.3.9) ---
+    # Bumps CODE_CANDIDATES to 15 for ultra-fast 0.5B code models (ruvltra).
+    # Does NOT hardcode a model path — pair with --code-specialist and/or
+    # --local-specialist-model pointing at ruvltra-claude-code-0.5b.
+    p.add_argument("--fast-code-specialist", dest="fast_code_specialist",
+                   action="store_true",
+                   help="Preset for ultra-fast 0.5B code specialists (ruvltra): "
+                        "sets CODE_CANDIDATES=15 so the multi-candidate loop "
+                        "shotgun-samples 15 candidates in parallel. At 0.5B "
+                        "speed (~100+ tok/s), 15 candidates cost roughly what 2 "
+                        "cost on a 3B model. Pair with --code-specialist pointing "
+                        "at a ruvltra-claude-code server, or --local-specialist-"
+                        "model pointing at the ruvltra .gguf. Do NOT use with a "
+                        "3B+ code model — 15 parallel candidates will thrash.")
+    p.set_defaults(fast_code_specialist=_env_bool("RFSN_FAST_CODE_SPECIALIST", False))
     p.add_argument("--audit-log",
                    default=os.environ.get("RFSN_AUDIT_LOG", "rfsn_jobs_bitemporal.jsonl"),
                    help="Bi-temporal audit log path (empty disables logging)")
+    # --- Audit-log signing (v0.3.9) ---
+    # HMAC-SHA256 (symmetric, stdlib) or Ed25519 (asymmetric, SLSA L2).
+    # Ed25519 takes precedence when both are set. When neither is set,
+    # the log is tamper-evident only (hash chain, no signatures).
+    p.add_argument("--signing-key",
+                   default=os.environ.get("RFSN_SIGNING_KEY", ""),
+                   help="HMAC-SHA256 shared secret for audit-log signatures "
+                        "(symmetric, stdlib). When set, each log entry is "
+                        "tamper-proof — an attacker cannot forge signatures "
+                        "without the key. Empty = no signing (tamper-evident only).")
+    p.add_argument("--ed25519-private-key",
+                   default=os.environ.get("RFSN_ED25519_PRIVATE_KEY", ""),
+                   help="Hex-encoded Ed25519 private key for asymmetric audit-log "
+                        "signatures (SLSA L2 compliant). Stronger than HMAC: the "
+                        "public key can verify but cannot forge. Requires the "
+                        "'cryptography' package. Takes precedence over --signing-key. "
+                        "Generate with: python3 -c \"from signers import Ed25519Signer; "
+                        "s=Ed25519Signer.generate(); print(s.private_key_hex)\"")
+    p.add_argument("--ed25519-public-key",
+                   default=os.environ.get("RFSN_ED25519_PUBLIC_KEY", ""),
+                   help="Hex-encoded Ed25519 public key for verify-only mode "
+                        "(nodes that read but don't write the log). Takes "
+                        "precedence over --signing-key for verification.")
+    # --- AgentDB vector store (v0.3.9) ---
+    # When set, CLRResultCache and VerifiedTrajectoryStore delegate similarity
+    # search to a RuFlo/AgentDB HTTP sidecar (with shadow-mode dual-write to
+    # the local JSON file for zero-downtime migration).
+    p.add_argument("--agentdb-url",
+                   default=os.environ.get("AGENTDB_URL", ""),
+                   help="RuFlo/AgentDB HTTP endpoint for vector similarity search "
+                        "(e.g. http://127.0.0.1:8088). When set, the CLR result cache "
+                        "and trajectory store dual-write to both the local JSON file "
+                        "and AgentDB (shadow mode). Reads fall back to local if AgentDB "
+                        "is down. Empty = in-memory numpy (default, unchanged).")
+    # --- Federated job queue (v0.3.9) ---
+    # When set, jobs are published to an exo-federation swarm network over mTLS.
+    # Any idle node can claim pending jobs. Fail-closed-fallback to local when
+    # the federation is unreachable.
+    p.add_argument("--federation-url",
+                   default=os.environ.get("FEDERATION_URL", ""),
+                   help="exo-federation HTTP endpoint for multi-node job distribution "
+                        "(e.g. https://swarm.local:7443). When set, jobs are published "
+                        "to the swarm; any idle node can claim them. Requires mTLS certs. "
+                        "Empty = local-only single-node queue (default).")
+    p.add_argument("--mtls-cert",
+                   default=os.environ.get("FEDERATION_MTLS_CERT", ""),
+                   help="Path to the mTLS client certificate (PEM) for exo-federation.")
+    p.add_argument("--mtls-key",
+                   default=os.environ.get("FEDERATION_MTLS_KEY", ""),
+                   help="Path to the mTLS client private key (PEM) for exo-federation.")
+    p.add_argument("--mtls-ca",
+                   default=os.environ.get("FEDERATION_MTLS_CA", ""),
+                   help="Path to the mTLS CA certificate (PEM) that signed all node certs.")
     p.add_argument("--embedding-router", dest="use_embedding_router",
                    action="store_true",
                    help="Use embedding-based semantic router (default)")
@@ -366,11 +449,30 @@ def build_argparser() -> argparse.ArgumentParser:
 
 async def _amain() -> None:
     args = build_argparser().parse_args()
+
+    # --- RuvLLM URL override (v0.3.9) ---
+    # When --ruvllm-url is set, it takes precedence over --vibe. The
+    # orchestrator's HTTP path handles RuvLLM unchanged (same OpenAI API).
+    vibe_endpoint = args.ruvllm_url or args.vibe
+    if args.ruvllm_url:
+        print(f"[CLI] RuvLLM backend enabled: --vibe overridden to {args.ruvllm_url}")
+
+    # --- Fast code-specialist preset (v0.3.9) ---
+    # Bumps code_candidates to 15 for ultra-fast 0.5B code models.
+    code_candidates = args.code_candidates
+    if args.fast_code_specialist:
+        code_candidates = max(args.code_candidates, 15)
+        print(f"[CLI] Fast code-specialist preset: CODE_CANDIDATES -> {code_candidates}")
+        if not (args.code_specialist or args.local_specialist_model):
+            print("[CLI] Warning: --fast-code-specialist is set but no code specialist "
+                  "is configured. Pair with --code-specialist <ruvltra-url> or "
+                  "--local-specialist-model <ruvltra.gguf> for it to take effect.")
+
     orchestrator = HybridReasoningOrchestrator(
-        vibe_endpoint=args.vibe,
+        vibe_endpoint=vibe_endpoint,
         generalist_endpoint=args.generalist,
         code_specialist_endpoint=args.code_specialist or None,
-        code_candidates=args.code_candidates,
+        code_candidates=code_candidates,
         use_clr=args.use_clr,
         clr_k=args.clr_k,
         use_embedding_router=args.use_embedding_router,
@@ -381,11 +483,35 @@ async def _amain() -> None:
         local_specialist_n_ctx=args.local_specialist_n_ctx,
         local_specialist_n_threads=args.local_specialist_n_threads,
         local_specialist_pool_size=args.local_specialist_pool_size,
+        agentdb_url=args.agentdb_url or None,
     )
-    queue = JobQueue(
+
+    # --- Audit-log signing (v0.3.9) ---
+    # Ed25519 (asymmetric) takes precedence over HMAC-SHA256 (symmetric).
+    signing_key = args.signing_key or None
+    ed25519_private = args.ed25519_private_key or None
+    ed25519_public = args.ed25519_public_key or None
+    if ed25519_private:
+        print("[CLI] Ed25519 audit-log signing enabled (asymmetric, SLSA L2)")
+    elif signing_key:
+        print("[CLI] HMAC-SHA256 audit-log signing enabled (symmetric)")
+
+    # --- Queue construction (v0.3.9) ---
+    # Uses make_job_queue so --federation-url switches to FederatedJobQueue
+    # (with local fallback). Without --federation-url, a LocalJobQueue is
+    # used (wraps JobQueue, same behavior). Signing keys are threaded
+    # through to the inner JobQueue's BiTemporalAuditLog.
+    queue = make_job_queue(
         orchestrator,
+        federation_url=args.federation_url or None,
         max_concurrent=args.max_concurrent,
+        mtls_cert=args.mtls_cert or None,
+        mtls_key=args.mtls_key or None,
+        mtls_ca=args.mtls_ca or None,
         audit_log=args.audit_log or None,
+        signing_key=signing_key,
+        ed25519_private_key_hex=ed25519_private,
+        ed25519_public_key_hex=ed25519_public,
     )
     await queue.start()
     repl = JobQueueREPL(queue)

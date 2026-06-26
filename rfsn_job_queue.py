@@ -8,11 +8,17 @@ A lightweight, in-process async job queue with:
   - Status tracking + result retrieval by job_id
   - Optional completion callback per job
   - Optional JSONL audit log of every job state transition
+  - Optional disk persistence of pending jobs (crash recovery)
 
 This is intentionally dependency-free (stdlib only) and designed to plug
 directly into the HybridReasoningOrchestrator. It is NOT a distributed
 queue — for multi-process/multi-node, swap the dispatcher for something
 like RQ/Celery/Dramatiq. The Job/JobStatus/JobQueue API stays the same.
+
+Crash recovery: when ``persist_path`` is set, pending and running jobs are
+persisted to a JSONL file. On restart, ``start()`` reloads non-terminal jobs
+and re-queues them as pending. This prevents job loss on process crash
+without requiring an external service like Redis.
 
 Usage:
     from hybrid_orchestrator import HybridReasoningOrchestrator
@@ -31,6 +37,7 @@ Usage:
 
 import asyncio
 import json
+import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -101,14 +108,28 @@ class JobQueue:
         orchestrator,
         max_concurrent: int = 2,
         audit_log: Optional[str] = "rfsn_jobs_bitemporal.jsonl",
+        persist_path: Optional[str] = None,
+        signing_key=None,
+        ed25519_private_key_hex: Optional[str] = None,
+        ed25519_public_key_hex: Optional[str] = None,
     ):
         self.orchestrator = orchestrator
         self.max_concurrent = max_concurrent
         self.audit_log = audit_log
+        self.persist_path = persist_path
         # Bi-temporal log: records both valid_time (event time) and
         # transaction_time (record time) for every state transition.
+        # Signing (v0.3.9): Ed25519 (asymmetric, SLSA L2) takes precedence
+        # over HMAC-SHA256 (symmetric, stdlib). When neither is set, the log
+        # is tamper-evident only (hash chain, no signatures).
         self.bitemporal: Optional[BiTemporalAuditLog] = (
-            BiTemporalAuditLog(audit_log) if audit_log else None
+            BiTemporalAuditLog(
+                audit_log,
+                signing_key=signing_key or None,
+                ed25519_private_key_hex=ed25519_private_key_hex or None,
+                ed25519_public_key_hex=ed25519_public_key_hex or None,
+            )
+            if audit_log else None
         )
 
         self._pending: List[Job] = []  # kept sorted by priority desc
@@ -120,6 +141,73 @@ class JobQueue:
         self._wakeup = asyncio.Event()
         self._job_tasks: set = set()  # tracks in-flight job tasks for clean shutdown
         self._job_task_map: Dict[str, asyncio.Task] = {}  # job_id -> task for cancellation
+
+    # ----------------------- disk persistence ----------------------- #
+    def _persist_job(self, job: Job) -> None:
+        """Append a non-terminal job to the persistence file."""
+        if not self.persist_path:
+            return
+        try:
+            with open(self.persist_path, "a") as f:
+                f.write(json.dumps({
+                    "job_id": job.job_id,
+                    "query": job.query,
+                    "priority": job.priority,
+                    "force_route": job.force_route,
+                    "created_at": job.created_at,
+                }) + "\n")
+        except OSError as e:
+            print(f"[JobQueue] persist write failed: {e}")
+
+    def _unpersist_job(self, job_id: str) -> None:
+        """Remove a job from the persistence file (it reached a terminal state)."""
+        if not self.persist_path or not os.path.exists(self.persist_path):
+            return
+        try:
+            with open(self.persist_path, "r") as f:
+                lines = f.readlines()
+            remaining = [
+                line for line in lines
+                if json.loads(line.strip()).get("job_id") != job_id
+            ]
+            # Atomic rewrite
+            tmp = self.persist_path + ".tmp"
+            with open(tmp, "w") as f:
+                f.writelines(remaining)
+            os.replace(tmp, self.persist_path)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"[JobQueue] persist cleanup failed: {e}")
+
+    def _load_persisted_jobs(self) -> List[Job]:
+        """Load non-terminal jobs from the persistence file (crash recovery)."""
+        if not self.persist_path or not os.path.exists(self.persist_path):
+            return []
+        jobs: List[Job] = []
+        seen_ids: set = set()
+        try:
+            with open(self.persist_path, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    jid = data.get("job_id")
+                    if jid and jid not in seen_ids:
+                        seen_ids.add(jid)
+                        jobs.append(Job(
+                            query=data["query"],
+                            priority=data.get("priority", 0),
+                            force_route=data.get("force_route"),
+                            job_id=jid,
+                            created_at=data.get("created_at",
+                                datetime.now(timezone.utc).isoformat()),
+                        ))
+        except OSError as e:
+            print(f"[JobQueue] persist load failed: {e}")
+        return jobs
 
     # ----------------------- audit log ----------------------- #
     def _log(self, job: Job, event: str, extra: Optional[Dict] = None) -> None:
@@ -135,9 +223,31 @@ class JobQueue:
 
     # ----------------------- public API ----------------------- #
     async def start(self) -> None:
-        """Start the background dispatcher loop."""
+        """Start the background dispatcher loop.
+
+        If disk persistence is enabled, recovers non-terminal jobs from the
+        persistence file and re-queues them as pending (crash recovery).
+        """
         if self._running:
             return
+        # Recover persisted jobs before starting the dispatcher.
+        if self.persist_path:
+            recovered = self._load_persisted_jobs()
+            for job in recovered:
+                self._jobs[job.job_id] = job
+                self._events[job.job_id] = asyncio.Event()
+                # Re-insert into pending queue (sorted by priority)
+                inserted = False
+                for i, existing in enumerate(self._pending):
+                    if job.priority > existing.priority:
+                        self._pending.insert(i, job)
+                        inserted = True
+                        break
+                if not inserted:
+                    self._pending.append(job)
+            if recovered:
+                print(f"[JobQueue] Recovered {len(recovered)} persisted jobs")
+                self._wakeup.set()
         self._running = True
         self._dispatcher_task = asyncio.create_task(self._dispatch_loop())
         print(f"[JobQueue] Started (max_concurrent={self.max_concurrent})")
@@ -180,6 +290,7 @@ class JobQueue:
         if not inserted:
             self._pending.append(job)
         self._log(job, "submitted")
+        self._persist_job(job)
         self._wakeup.set()
         return job
 
@@ -245,6 +356,7 @@ class JobQueue:
             job.finished_at = datetime.now(timezone.utc).isoformat()
             self._events[job.job_id].set()
             self._log(job, "cancelled")
+            self._unpersist_job(job.job_id)
             return True
 
         if job.status == JobStatus.RUNNING:
@@ -299,6 +411,7 @@ class JobQueue:
                         "clr_score": result.clr_score,
                     },
                 )
+                self._unpersist_job(job.job_id)
                 if job.callback is not None:
                     try:
                         cb = job.callback(result)
@@ -311,11 +424,13 @@ class JobQueue:
                 job.error = "cancelled by user"
                 job.status = JobStatus.CANCELLED
                 self._log(job, "cancelled", extra={"reason": "user_cancelled"})
+                self._unpersist_job(job.job_id)
                 raise  # re-raise so the task is properly marked as cancelled
             except Exception as e:
                 job.error = str(e)
                 job.status = JobStatus.FAILED
                 self._log(job, "failed", extra={"error": str(e)})
+                self._unpersist_job(job.job_id)
             finally:
                 job.finished_at = datetime.now(timezone.utc).isoformat()
                 self._events[job.job_id].set()

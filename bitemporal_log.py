@@ -44,15 +44,36 @@ Integrity: each entry includes a SHA-256 hash of its content and the hash of
 the previous entry, forming a tamper-evident chain. The ``verify_chain()``
 method checks that the chain is intact.
 
-Dependency-free (stdlib only), matching the rest of the project.
+Tamper-proofing (optional): when a ``signing_key`` is provided to the
+constructor, each entry is additionally signed with HMAC-SHA256. Unlike the
+plain hash chain (which an attacker can recompute after tampering), the HMAC
+signature cannot be forged without the key. ``verify_chain(strict=True)``
+with a key configured mathematically proves the log was written by a process
+holding the key. When no key is configured, behavior is unchanged
+(tamper-evident only).
+
+Asymmetric provenance (v0.3.9, optional): for SLSA L2 compliant Ed25519
+signatures, pass ``ed25519_private_key_hex`` (sign+verify) or
+``ed25519_public_key_hex`` (verify-only) to the constructor. Ed25519 is
+asymmetric — the public key can verify but cannot forge — so publishing the
+public key proves authorship without sharing the signing capability. This
+requires the optional ``cryptography`` package. When neither Ed25519 nor an
+HMAC key is configured, behavior is unchanged (tamper-evident only). The
+``signer=`` parameter accepts any object implementing the :class:`signers.Signer`
+protocol for custom schemes.
+
+Dependency-free (stdlib only) by default; Ed25519 needs ``cryptography``.
 """
 
 import hashlib
+import hmac
 import json
 import os
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+
+from signers import Signer, HmacSigner, Ed25519Signer, make_signer
 
 
 SCHEMA_VERSION = 2
@@ -72,11 +93,23 @@ def _now_iso() -> str:
 
 
 def _hash_entry(entry: Dict[str, Any]) -> str:
-    """Compute SHA-256 hash of an entry's content (excluding record_hash itself)."""
-    # Create a copy without record_hash for hashing
-    content = {k: v for k, v in entry.items() if k != "record_hash"}
+    """Compute SHA-256 hash of an entry's content (excluding record_hash and signature)."""
+    # Create a copy without record_hash and signature for hashing
+    content = {k: v for k, v in entry.items() if k not in ("record_hash", "signature")}
     raw = json.dumps(content, sort_keys=True, default=str)
     return "sha256:" + hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _sign_entry(entry: Dict[str, Any], key: bytes) -> str:
+    """Compute HMAC-SHA256 signature of an entry's content.
+
+    The signature covers the same content as :func:`_hash_entry` (excluding
+    ``record_hash`` and ``signature`` itself). Unlike the plain hash, an
+    attacker cannot recompute this without the secret key.
+    """
+    content = {k: v for k, v in entry.items() if k not in ("record_hash", "signature")}
+    raw = json.dumps(content, sort_keys=True, default=str)
+    return "hmac-sha256:" + hmac.new(key, raw.encode(), hashlib.sha256).hexdigest()
 
 
 class BiTemporalAuditLog:
@@ -87,11 +120,53 @@ class BiTemporalAuditLog:
         clock: optional callable returning a (valid_time, transaction_time)
             pair of ISO strings. Defaults to "now" for both. Useful for
             injecting clocks in tests or for back-filling migrated data.
+        signing_key: optional secret key (bytes or str) for HMAC-SHA256
+            signatures. When set, each entry gets a ``signature`` field
+            that ``verify_chain`` checks. This upgrades the chain from
+            tamper-evident to tamper-proof (an attacker cannot forge
+            signatures without the key). When None (default), behavior
+            is unchanged — the hash chain is still tamper-evident.
+        ed25519_private_key_hex: optional hex-encoded Ed25519 private key
+            for asymmetric signatures (v0.3.9). Stronger than HMAC: the
+            public key can verify but cannot forge. Requires the optional
+            ``cryptography`` package. Takes precedence over signing_key.
+        ed25519_public_key_hex: optional hex-encoded Ed25519 public key
+            for verify-only mode (nodes that read but don't write the log).
+            Takes precedence over signing_key for verification.
+        signer: optional pre-constructed :class:`signers.Signer` instance.
+            Takes precedence over all key-based parameters — use this for
+            custom signer schemes. When provided, the key parameters are
+            ignored.
     """
 
-    def __init__(self, path: str, clock=None):
+    def __init__(
+        self,
+        path: str,
+        clock=None,
+        signing_key=None,
+        ed25519_private_key_hex: Optional[str] = None,
+        ed25519_public_key_hex: Optional[str] = None,
+        signer: Optional[Signer] = None,
+    ):
         self.path = path
         self._clock = clock
+        if signer is not None:
+            # Caller provided a fully-constructed signer — use it directly.
+            self._signer: Optional[Signer] = signer
+            self._signing_key = None  # legacy field, kept for compat
+        else:
+            # Build from key parameters via the factory. Precedence:
+            # Ed25519 private > Ed25519 public > HMAC key > none.
+            self._signer = make_signer(
+                signing_key=signing_key,
+                ed25519_private_key_hex=ed25519_private_key_hex,
+                ed25519_public_key_hex=ed25519_public_key_hex,
+            )
+            # Keep the legacy _signing_key field for backward compat with
+            # code that inspects it (e.g. tests checking "is signing on?").
+            if signing_key is not None and not isinstance(signing_key, bytes):
+                signing_key = signing_key.encode("utf-8")
+            self._signing_key: Optional[bytes] = signing_key
 
     def _last_entry(self) -> Optional[Dict[str, Any]]:
         """Read the last entry from the log file (for chain continuation)."""
@@ -163,6 +238,12 @@ class BiTemporalAuditLog:
         }
         # Compute and add this entry's hash
         entry["record_hash"] = _hash_entry(entry)
+        # If a signer is configured, add a cryptographic signature.
+        # This makes the chain tamper-proof (not just tamper-evident):
+        # an attacker who modifies content cannot recompute the signature
+        # without the signing key (HMAC) or private key (Ed25519).
+        if self._signer is not None:
+            entry["signature"] = self._signer.sign(entry)
 
         try:
             with open(self.path, "a") as f:
@@ -272,6 +353,22 @@ class BiTemporalAuditLog:
                 computed_hash = _hash_entry(entry)
                 if stored_hash != computed_hash:
                     errors.append(f"{line_label}: record_hash mismatch (tampered content)")
+
+            # --- Cryptographic signature verification (tamper-proofing) ---
+            # Only checked when a signer is configured. An entry without a
+            # signature when a signer is set, or a signature that doesn't
+            # match, indicates tampering or an unsigned injection. The signer
+            # may be HMAC-SHA256 (symmetric, stdlib) or Ed25519 (asymmetric,
+            # optional cryptography package).
+            if self._signer is not None:
+                stored_sig = entry.get("signature")
+                if stored_sig is None:
+                    errors.append(f"{line_label}: missing signature (signer configured "
+                                  "but entry is unsigned)")
+                else:
+                    if not self._signer.verify(entry, stored_sig):
+                        errors.append(f"{line_label}: signature mismatch (forged or "
+                                      "tampered content)")
 
             prev_hash = stored_hash
 

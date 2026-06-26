@@ -592,3 +592,64 @@ class TestCodeSpecialistRouting:
         # All 3 verify calls were made (gather fires all concurrently)
         assert len(started) == 3
 
+
+class TestTestSpecValidation:
+    """Tests for _validate_test_spec — rejects vacuous test specs."""
+
+    def test_rejects_assert_true(self):
+        assert HybridReasoningOrchestrator._validate_test_spec("assert True") is False
+
+    def test_rejects_assert_one_equals_one(self):
+        assert HybridReasoningOrchestrator._validate_test_spec("assert 1 == 1") is False
+
+    def test_rejects_bare_constant(self):
+        assert HybridReasoningOrchestrator._validate_test_spec('assert "yes"') is False
+
+    def test_rejects_all_vacuous_mixed(self):
+        spec = "assert True\nassert 1 == 1\nassert 0 or 1"
+        assert HybridReasoningOrchestrator._validate_test_spec(spec) is False
+
+    def test_accepts_function_call_assert(self):
+        spec = "assert add(2, 3) == 5\nassert add(0, 0) == 0"
+        assert HybridReasoningOrchestrator._validate_test_spec(spec) is True
+
+    def test_accepts_variable_reference_assert(self):
+        spec = "result = add(2, 3)\nassert result == 5"
+        assert HybridReasoningOrchestrator._validate_test_spec(spec) is True
+
+    def test_accepts_mixed_with_at_least_one_real(self):
+        spec = "assert True\nassert square(4) == 16"
+        assert HybridReasoningOrchestrator._validate_test_spec(spec) is True
+
+    def test_rejects_unparseable(self):
+        assert HybridReasoningOrchestrator._validate_test_spec("assert ++++") is False
+
+    def test_rejects_empty(self):
+        assert HybridReasoningOrchestrator._validate_test_spec("") is False
+
+
+class TestExtractPythonBlock:
+    """Tests for _extract_python_block — hardened fence parsing."""
+
+    def test_standard_python_fence(self):
+        text = "Here are the tests:\n```python\nassert add(1,2)==3\n```\nDone."
+        assert HybridReasoningOrchestrator._extract_python_block(text) == "assert add(1,2)==3"
+
+    def test_abbreviated_py_fence(self):
+        text = "```py\nassert add(1,2)==3\n```"
+        assert HybridReasoningOrchestrator._extract_python_block(text) == "assert add(1,2)==3"
+
+    def test_no_language_tag_fence(self):
+        text = "```\nassert add(1,2)==3\n```"
+        assert HybridReasoningOrchestrator._extract_python_block(text) == "assert add(1,2)==3"
+
+    def test_bare_code_no_fence(self):
+        text = "assert add(1,2)==3"
+        assert HybridReasoningOrchestrator._extract_python_block(text) == "assert add(1,2)==3"
+
+    def test_multiline_block(self):
+        text = "```python\nassert add(1,2)==3\nassert add(0,0)==0\n```"
+        result = HybridReasoningOrchestrator._extract_python_block(text)
+        assert "assert add(1,2)==3" in result
+        assert "assert add(0,0)==0" in result
+

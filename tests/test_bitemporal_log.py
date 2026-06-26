@@ -447,3 +447,87 @@ class TestStrictChainVerification:
         ok, errors = log.verify_chain(strict=True)
         assert ok, f"Chain should be valid in strict mode: {errors}"
 
+
+class TestHmacSignatures:
+    """Tests for optional HMAC-SHA256 tamper-proofing."""
+
+    @pytest.fixture
+    def signed_log(self, log_path):
+        return BiTemporalAuditLog(log_path, signing_key="secret-key-123")
+
+    def test_signed_entry_has_signature_field(self, signed_log):
+        signed_log.record(FakeJob(), "submitted")
+        entry = signed_log.read_all()[0]
+        assert "signature" in entry
+        assert entry["signature"].startswith("hmac-sha256:")
+
+    def test_unsigned_log_has_no_signature(self, log):
+        log.record(FakeJob(), "submitted")
+        entry = log.read_all()[0]
+        assert "signature" not in entry
+
+    def test_signed_chain_verifies(self, signed_log):
+        for evt in ["submitted", "started", "completed"]:
+            signed_log.record(FakeJob(), evt,
+                              valid_time=f"2026-01-01T00:00:0{evt[0]}+00:00",
+                              transaction_time=f"2026-01-01T00:00:0{evt[0]}+00:00")
+        ok, errors = signed_log.verify_chain(strict=True)
+        assert ok, f"Signed chain should be valid: {errors}"
+
+    def test_tampered_content_detected_by_signature(self, log_path):
+        log = BiTemporalAuditLog(log_path, signing_key="secret-key-123")
+        log.record(FakeJob(), "submitted",
+                   valid_time="2026-01-01T00:00:00+00:00",
+                   transaction_time="2026-01-01T00:00:01+00:00")
+        # Tamper: change status but recompute record_hash (simulating an
+        # attacker who knows to fix the hash chain). The HMAC signature
+        # should still catch this because the attacker doesn't have the key.
+        with open(log_path, "r") as f:
+            lines = f.readlines()
+        entry = json.loads(lines[0])
+        entry["status"] = "tampered"
+        # Attacker recomputes record_hash to hide the tampering
+        from bitemporal_log import _hash_entry
+        entry["record_hash"] = _hash_entry(entry)
+        lines[0] = json.dumps(entry) + "\n"
+        with open(log_path, "w") as f:
+            f.writelines(lines)
+        log2 = BiTemporalAuditLog(log_path, signing_key="secret-key-123")
+        ok, errors = log2.verify_chain(strict=True)
+        assert not ok
+        assert any("signature mismatch" in e for e in errors)
+
+    def test_unsigned_entry_rejected_when_key_configured(self, log_path):
+        """An entry without a signature is rejected when a key is set."""
+        log = BiTemporalAuditLog(log_path, signing_key="secret-key-123")
+        log.record(FakeJob(), "submitted")
+        # Strip the signature from the entry
+        with open(log_path, "r") as f:
+            lines = f.readlines()
+        entry = json.loads(lines[0])
+        del entry["signature"]
+        lines[0] = json.dumps(entry) + "\n"
+        with open(log_path, "w") as f:
+            f.writelines(lines)
+        log2 = BiTemporalAuditLog(log_path, signing_key="secret-key-123")
+        ok, errors = log2.verify_chain(strict=True)
+        assert not ok
+        assert any("missing signature" in e for e in errors)
+
+    def test_wrong_key_fails_verification(self, log_path):
+        log = BiTemporalAuditLog(log_path, signing_key="correct-key")
+        log.record(FakeJob(), "submitted")
+        # Verify with a different key
+        log2 = BiTemporalAuditLog(log_path, signing_key="wrong-key")
+        ok, errors = log2.verify_chain(strict=True)
+        assert not ok
+        assert any("signature mismatch" in e for e in errors)
+
+    def test_str_key_and_bytes_key_equivalent(self):
+        """A str key and its bytes equivalent produce the same signature."""
+        from bitemporal_log import _sign_entry
+        entry = {"record_id": "r1", "status": "pending", "record_hash": "x"}
+        sig_from_str = _sign_entry(entry, "mykey".encode("utf-8"))
+        sig_from_bytes = _sign_entry(entry, b"mykey")
+        assert sig_from_str == sig_from_bytes
+

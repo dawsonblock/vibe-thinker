@@ -1,16 +1,185 @@
 # vibe-thinker — project notes for agents
 
 ## Verify / test
-- Full suite: `python3 -m pytest -q` (393 tests, ~75s, no live servers needed)
+- Full suite: `python3 -m pytest -q` (502 tests, ~90s, no live servers needed)
 - Routing + REPL only: `python3 -m pytest tests/test_routing.py tests/test_repl.py -q`
 - Warm pool + code verifier: `python3 -m pytest tests/test_warm_pool.py tests/test_code_verifier.py -q`
 - Trajectory store: `python3 -m pytest tests/test_trajectory_store.py -q`
 - Grammar enforcement: `python3 -m pytest tests/test_clr_scoring.py::TestGrammarEnforcement -q`
 - In-process backend + pool + fast-specialist: `python3 -m pytest tests/test_clr_scoring.py::TestInProcessBackend tests/test_clr_scoring.py::TestInProcessPool tests/test_clr_scoring.py::TestFastSpecialistPolicy -q`
 - Test-feedback loop: `python3 -m pytest tests/test_routing.py::TestCodeSpecialistRouting -q`
+- Sandbox nonce anti-spoofing: `python3 -m pytest tests/test_code_verifier.py::TestNonceAntiSpoofing -q`
+- Bi-temporal log HMAC signatures: `python3 -m pytest tests/test_bitemporal_log.py::TestHmacSignatures -q`
+- Ed25519 + signer abstraction: `python3 -m pytest tests/test_signers.py -q`
+- Vector store + AgentDB abstraction: `python3 -m pytest tests/test_vector_store.py -q`
+- RuvLLM adapter + CLI flags: `python3 -m pytest tests/test_ruvllm_adapter.py -q`
+- Federated job queue: `python3 -m pytest tests/test_federated_queue.py -q`
+- Factual verifier NLI + negation: `python3 -m pytest tests/test_factual_verifier.py -q`
+- Job queue disk persistence: `python3 -m pytest tests/test_job_queue.py::TestDiskPersistence -q`
 - Full-stack integration (needs live model servers): `python test_full_stack.py`
 - A benign `ResourceTracker.__del__` AttributeError prints after pytest exits on
   macOS Python 3.12 — it is multiprocessing teardown noise, NOT a test failure.
+
+## RuFlo integration abstractions (v0.3.9)
+Four pluggable abstractions from the Vibe-Thinker + RuFlo Integration Plan.
+All are opt-in with backward-compatible defaults — no behavior change unless
+the new parameters/flags are used. External ruvnet repos (ruflo/AgentDB,
+ruvllm, exo-federation) are NOT required; the abstractions fail-closed to
+the existing local behavior when the sidecars/bindings are absent.
+
+### Ed25519 audit-log signatures (signers.py)
+Upgrades the bi-temporal log from HMAC-SHA256 (symmetric, stdlib) to
+Ed25519 (asymmetric, SLSA L2 compliant) — the plan's Phase 1.1. The
+`Signer` protocol abstracts the signature scheme:
+- `HmacSigner` — the v0.3.8 default (stdlib, unchanged behavior).
+- `Ed25519Signer` — asymmetric via the optional `cryptography` package.
+  Each node has a private key; the public key can verify but NOT forge.
+  `Ed25519Signer.generate()` creates a keypair; `.from_private_key_hex()`
+  loads a persisted key; `.from_public_key_hex()` is verify-only.
+- `make_signer()` factory: precedence Ed25519 private > Ed25519 public >
+  HMAC key > none.
+`BiTemporalAuditLog` accepts `signer=`, `ed25519_private_key_hex=`, or
+`ed25519_public_key_hex=`. The old `signing_key=` parameter still works
+(builds an HmacSigner). The signature field uses a scheme prefix
+(`ed25519:` or `hmac-sha256:`) so `verify_chain` dispatches correctly
+even during a migration. The old `_sign_entry()` function is retained
+for backward compat (tests import it directly).
+
+### Vector store abstraction (vector_store.py)
+Abstracts the semantic similarity search behind a `VectorStore` protocol
+— the plan's Phase 1.2. Moves the embedding matrix out of the
+orchestrator process into a purpose-built vector index (AgentDB):
+- `LocalVectorStore` — in-memory numpy + sklearn cosine similarity.
+  The default; reproduces the exact existing behavior.
+- `AgentDBVectorStore` — HTTP sidecar (RuFlo/AgentDB,
+  `POST /v1/vector/search`). Fail-closed: returns `[]` when the sidecar
+  is down (caller falls back). Moves lookups from ms to <25µs with zero
+  RAM bloat on the Python side.
+- `ShadowVectorStore` — dual-write, primary-read-with-fallback. The
+  plan's "Shadow Mode" migration step: write to both local JSON and
+  AgentDB, read from local first; once AgentDB recall is verified, cut
+  over to AgentDB-only.
+`CLRResultCache` and `VerifiedTrajectoryStore` accept `vector_store=`
+or `agentdb_url=` (convenience: builds a ShadowVectorStore wrapping the
+local matrix). Default is None = unchanged in-memory behavior.
+
+### RuvLLM inference backend (ruvllm_adapter.py)
+Documents and wires the RuvLLM Rust inference engine with TurboQuant KV
+cache compression — the plan's Phase 2.1. Two integration modes:
+- **HTTP sidecar** (zero-code, recommended start): RuvLLM exposes the
+  same OpenAI-compatible API as llama-server. The `--ruvllm-url` CLI
+  flag (or `RUVLLM_URL` env) overrides `--vibe` to point at the RuvLLM
+  port. The existing HTTP path handles it unchanged.
+  `RuvLLMHTTPBackend.recommended_start_command()` prints the start
+  command with TurboQuant flags (`--cache-type-k q8_0 --cache-type-v
+  turbo3`). TurboQuantConfig presets: `TURBOQUANT_SAFE` (f16/turbo4),
+  `TURBOQUANT_CONSERVATIVE` (q8_0/turbo4), `TURBOQUANT_DEFAULT`
+  (q8_0/turbo3), `TURBOQUANT_AGGRESSIVE_V` (q8_0/turbo2).
+- **In-process PyO3 binding** (zero-HTTP-overhead, optional):
+  `RuvLLMBinding` wraps a hypothetical `ruvllm_py` extension built from
+  the Rust crate via PyO3/maturin. When installed, `vibe_clr_async.
+  _init_local_backend` prefers it over llama-cpp-python (same pool
+  mode). When not installed (current state), it raises ImportError and
+  the llama-cpp-python path is used unchanged.
+`is_ruvllm_binding_available()` checks for the extension.
+
+### Fast code-specialist preset (CLI flag)
+`--fast-code-specialist` (or `RFSN_FAST_CODE_SPECIALIST` env) — the
+plan's Phase 2.2. Bumps `CODE_CANDIDATES` to 15 for ultra-fast 0.5B
+code models (ruvltra). At 0.5B speed (~100+ tok/s), 15 parallel
+candidates cost roughly what 2 cost on a 3B model. Does NOT hardcode a
+model path — pair with `--code-specialist <ruvltra-url>` or
+`--local-specialist-model <ruvltra.gguf>`. Warns if no code specialist
+is configured.
+
+### Federated job queue (federated_queue.py)
+Abstracts the job queue behind a `BaseJobQueue` protocol — the plan's
+Phase 4.1. Enables multi-node reasoning swarms via exo-federation:
+- `LocalJobQueue` — thin wrapper around the existing `JobQueue`. The
+  default; zero behavior change.
+- `FederatedJobQueue` — pushes jobs to an exo-federation network
+  (ruvnet/exo-federation, Rust crate) over mTLS. Any idle node on the
+  network can claim and run pending jobs. Fail-closed-fallback: when
+  the federation is unreachable (sidecar down, mTLS certs missing),
+  jobs still run locally via the wrapped `LocalJobQueue`. mTLS config
+  via `mtls_cert`, `mtls_key`, `mtls_ca` params.
+- `make_job_queue()` factory: `federation_url` non-empty →
+  FederatedJobQueue; empty/None → LocalJobQueue.
+The existing `JobQueue` satisfies `BaseJobQueue` structurally
+(runtime_checkable Protocol) — no changes needed to use it as a
+`BaseJobQueue`.
+
+## Security hardening (v0.3.8)
+Ten fixes from a full codebase audit. All stdlib-only, no new dependencies.
+
+## Security hardening (v0.3.8)
+Ten fixes from a full codebase audit. All stdlib-only, no new dependencies.
+
+### Sandbox nonce anti-spoofing (CRITICAL)
+The old test harness printed a hardcoded `ALL_TESTS_PASSED` string that
+candidate code could trivially forge (just `print("ALL_TESTS_PASSED")`).
+Worse, a candidate that overrode `sys.exit = lambda x: None` could force
+a 0 exit code while tests failed, and the verifier checked only stdout.
+Fix: `sandbox/base.py:build_test_harness()` generates a per-execution
+nonce (`secrets.token_hex(8)`) passed via the `VT_TEST_NONCE` env var.
+The harness prints `VT_PASS_<nonce>` only if the test block completes
+without raising. The verifier (`code_verifier.py:_interpret_test_result`)
+requires BOTH the exact nonce marker in stdout AND exit_code 0. The nonce
+is not in the script source, so candidate code cannot guess it. All four
+executors (docker, warm_pool, local, sbx) use the centralized harness.
+
+### Safe AST math evaluator
+`math_solver.py` no longer uses `eval()`. Replaced with `_safe_eval()`,
+a whitelisting AST evaluator that permits only `BinOp`, `UnaryOp`,
+`Constant`, and `Name` nodes. The plan's suggestion of `ast.literal_eval()`
+was incorrect — it rejects arithmetic expressions.
+
+### Test-spec vacuity rejection
+`_generate_test_spec` now validates the test spec via `_validate_test_spec`
+(AST check): every `assert` must reference a `Name` or `Call` node.
+`assert True`, `assert 1 == 1`, etc. are rejected. If the first attempt
+produces a vacuous spec, the generalist gets one retry with feedback.
+
+### Bi-temporal log HMAC signatures (optional)
+`BiTemporalAuditLog(signing_key=...)` adds an `hmac-sha256:` signature
+field to each entry. `verify_chain(strict=True)` with a key configured
+mathematically proves the log was written by a process holding the key
+(tamper-proof, not just tamper-evident). No key = unchanged behavior.
+
+### Factual verifier NLI judge + negation detection
+`FactualVerifier(llm_judge=...)` uses the orchestrator's generalist as an
+NLI judge (ENTAILMENT/CONTRADICTION/NEUTRAL). The lexical fallback now
+detects negation polarity mismatches ("Paris is NOT the capital" vs a
+source saying "Paris is the capital") and rejects them. The orchestrator
+wires `self._call_generalist` as the judge automatically.
+
+### Session init race fix
+`_get_session()` is now async with a double-checked `asyncio.Lock`. The
+shared `aiohttp.ClientSession` is eagerly created in `start()` to avoid
+concurrent first-requests creating overlapping sessions.
+
+### Warm pool zombie reaping
+Before each execution, the warm pool kills all processes except PID 1
+and the reaping shell itself, using `/proc` + shell builtins (no
+`ps`/`pkill` needed in `python:3.12-slim`). Prevents leftover background
+processes from consuming the `--pids-limit=64` budget.
+
+### Hardened Python block extraction
+`_extract_python_block` now handles `py` (abbreviated) and no-tag fences
+in addition to `python`. Test-spec generation retries once with feedback
+if extraction/validation fails.
+
+### LRU eviction for trajectory store + CLR cache
+Both `VerifiedTrajectoryStore` and `CLRResultCache` now evict by
+`(access_count, score)` instead of score alone. Access counts are
+persisted to disk, so rarely-retrieved entries are evicted across
+restarts. Both stores already had disk persistence + bounded size
+(since v0.3.4) — this adds access-frequency awareness.
+
+### Job queue disk persistence (crash recovery)
+`JobQueue(persist_path=...)` persists pending/running jobs to a JSONL
+file. On `start()`, non-terminal jobs are recovered and re-queued. No
+Redis needed — same durability pattern as the bi-temporal log.
 
 ## Model servers (OpenAI-compatible HTTP)
 The orchestrator talks to llama-server / mlx_lm.server over HTTP. Three endpoints:

@@ -52,19 +52,25 @@ from math_solver import solve as solve_math
 _UNSET = object()
 
 
-def select_verifier(task_type: str):
+def select_verifier(task_type: str, llm_judge=None):
     """Select a deterministic verifier based on the detected task type.
 
     Returns None if no verifier applies (conversation, summarization, etc.).
     Conversation and summarization tasks do NOT get a verifier — there is
     no deterministic way to verify "explain X" or "summarize Y".
+
+    Args:
+        task_type: the routed task type ("math", "code", "factual", etc.).
+        llm_judge: optional async callable (prompt -> response str) used
+            by FactualVerifier as an NLI judge. Typically the
+            orchestrator's ``_call_generalist``.
     """
     if task_type == "math":
         return MathVerifier()
     if task_type == "code":
         return CodeVerifier()
     if task_type == "factual":
-        return FactualVerifier()
+        return FactualVerifier(llm_judge=llm_judge)
     return None
 
 # Optional dependency — gracefully degrade if not installed
@@ -261,6 +267,7 @@ class HybridReasoningOrchestrator:
         local_specialist_n_ctx: int = 4096,
         local_specialist_n_threads: int = 8,
         local_specialist_pool_size: int = 1,
+        agentdb_url: Optional[str] = None,
     ):
         self.vibe_endpoint = vibe_endpoint.rstrip("/")
         self.generalist_endpoint = generalist_endpoint.rstrip("/")
@@ -293,12 +300,13 @@ class HybridReasoningOrchestrator:
         self.use_clr = use_clr
 
         # Shared HTTP session for all generalist/code-specialist calls.
-        # Created lazily on first use to avoid creating a session outside an
-        # event loop. Reused across all calls to avoid TCP connection overhead
-        # (previously each _call_generalist/_call_code_specialist created a
-        # new session per call — with 8 code candidates that was 8 separate
-        # TCP connections). Closed in cleanup().
+        # Eagerly created in start() (inside the event loop) to avoid a
+        # lazy-init race where multiple concurrent first-requests each
+        # create overlapping sessions. A lock guards the fallback lazy
+        # path for callers that skip start(). Reused across all calls to
+        # avoid TCP connection overhead. Closed in cleanup().
         self._http_session: Optional[aiohttp.ClientSession] = None
+        self._session_lock = asyncio.Lock()
 
         self.reasoner = VibeThinkerCLRAsync(
             server_url=vibe_endpoint,
@@ -331,6 +339,7 @@ class HybridReasoningOrchestrator:
                     model_name=embedding_model,
                     similarity_threshold=clr_cache_similarity,
                     min_score=clr_cache_min_score,
+                    agentdb_url=agentdb_url,
                 )
             except Exception as e:
                 print(f"[Warning] Could not load CLR result cache: {e}")
@@ -352,6 +361,7 @@ class HybridReasoningOrchestrator:
                     model_name=embedding_model,
                     retrieval_threshold=trajectory_retrieval_threshold,
                     max_few_shot=trajectory_max_few_shot,
+                    agentdb_url=agentdb_url,
                 )
             except Exception as e:
                 print(f"[Warning] Could not load trajectory store: {e}")
@@ -658,14 +668,20 @@ class HybridReasoningOrchestrator:
     # ------------------------------------------------------------------ #
     # Generalist call
     # ------------------------------------------------------------------ #
-    def _get_session(self) -> aiohttp.ClientSession:
-        """Get the shared HTTP session, creating it lazily on first use.
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Get the shared HTTP session, creating it lazily if needed.
 
         The session is reused across all generalist/code-specialist calls to
-        avoid TCP connection overhead. Must be called inside an event loop.
+        avoid TCP connection overhead. Creation is guarded by a lock to
+        prevent concurrent first-requests from creating overlapping sessions.
+        Prefer calling ``start()`` before any requests to create the session
+        eagerly.
         """
         if self._http_session is None or self._http_session.closed:
-            self._http_session = aiohttp.ClientSession()
+            async with self._session_lock:
+                # Double-check after acquiring the lock.
+                if self._http_session is None or self._http_session.closed:
+                    self._http_session = aiohttp.ClientSession()
         return self._http_session
 
     async def _call_generalist(self, query: str, max_tokens: int = 4096) -> str:
@@ -675,7 +691,7 @@ class HybridReasoningOrchestrator:
         ChatML). Falls back to /completion with ChatML if the chat endpoint
         fails. Raises RuntimeError if both endpoints fail — callers must
         handle the exception, not silently proceed with an error string."""
-        session = self._get_session()
+        session = await self._get_session()
         chat_payload = {
             "messages": [{"role": "user", "content": query}],
             "max_tokens": max_tokens,
@@ -730,7 +746,7 @@ class HybridReasoningOrchestrator:
     # ------------------------------------------------------------------ #
     async def _call_specialist_plain(self, query: str, max_tokens: int = 8192) -> str:
         """Plain VibeThinker generation without CLR. Uses a real session."""
-        session = self._get_session()
+        session = await self._get_session()
         return await self.reasoner.generate_plain(session, query, max_tokens)
 
     # ------------------------------------------------------------------ #
@@ -747,7 +763,7 @@ class HybridReasoningOrchestrator:
         """
         if not self.code_specialist_endpoint:
             raise RuntimeError("No code_specialist_endpoint configured")
-        session = self._get_session()
+        session = await self._get_session()
         chat_payload = {
             "messages": [{"role": "user", "content": query}],
             "max_tokens": max_tokens,
@@ -822,9 +838,57 @@ class HybridReasoningOrchestrator:
     @staticmethod
     def _extract_python_block(text: str) -> str:
         """Extract the first ```python ... ``` block from text, or the whole
-        text if no fenced block is found."""
-        match = re.findall(r"```(?:python)?\n(.*?)```", text, re.DOTALL)
-        return match[0].strip() if match else text.strip()
+        text if no fenced block is found.
+
+        Handles common model output variants:
+          - ```python\n...```  (standard)
+          - ```py\n...```      (abbreviated language tag)
+          - ```\n...```        (no language tag)
+          - bare code with no fence (returns the stripped text)
+        """
+        # Match fenced blocks with optional language tag (python, py, or none).
+        # The tag must be immediately after the opening backticks, no space.
+        match = re.findall(r"```(?:python|py)?\n(.*?)```", text, re.DOTALL)
+        if match:
+            return match[0].strip()
+        # No fenced block found — return the stripped text as-is (the model
+        # may have emitted bare code without fences).
+        return text.strip()
+
+    @staticmethod
+    def _validate_test_spec(tests: str) -> bool:
+        """Reject vacuous test specs that would pass any candidate.
+
+        A test spec is vacuous if every ``assert`` statement tests only a
+        constant expression (e.g. ``assert True``, ``assert 1 == 1``,
+        ``assert "yes"``) without referencing any function call or variable
+        from the solution. Such tests would mark garbage code as verified
+        (score 1.0), defeating the entire verification loop.
+
+        Returns True if the spec contains at least one non-vacuous assert
+        (one whose test expression contains a Call or Name node), False
+        otherwise (including unparseable specs).
+        """
+        import ast as _ast
+        try:
+            tree = _ast.parse(tests)
+        except SyntaxError:
+            return False
+
+        def _contains_ref(node):
+            """True if the expression contains a Name or Call node."""
+            for child in _ast.walk(node):
+                if isinstance(child, (_ast.Name, _ast.Call)):
+                    return True
+            return False
+
+        has_nonvacuous = False
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Assert):
+                if _contains_ref(node.test):
+                    has_nonvacuous = True
+                    break
+        return has_nonvacuous
 
     async def _generate_test_spec(self, query: str) -> Optional[str]:
         """Ask the generalist to produce unit-test asserts for the query.
@@ -833,18 +897,50 @@ class HybridReasoningOrchestrator:
         failed or produced nothing parseable. This is the "Software Architect"
         step: the generalist defines correctness before the code specialist
         writes any code.
+
+        Validates the spec with :meth:`_validate_test_spec` to reject
+        vacuous tests (e.g. ``assert True``) that would pass any candidate.
+        If the first attempt fails validation, retries once with feedback
+        telling the generalist what was wrong (up to 2 attempts total).
         """
-        prompt = self._TEST_SPEC_PROMPT.format(query=query)
-        try:
-            raw = await self._call_generalist(prompt, max_tokens=1024)
-        except Exception as e:
-            print(f"[CodeLoop] Test-spec generation failed: {e}")
-            return None
-        tests = self._extract_python_block(raw)
-        if not tests or "assert" not in tests:
-            print(f"[CodeLoop] Generalist produced no usable asserts — skipping verification")
-            return None
-        return tests
+        feedback: Optional[str] = None
+        for attempt in range(2):
+            if feedback is not None:
+                prompt = (
+                    self._TEST_SPEC_PROMPT.format(query=query)
+                    + f"\n\n--- FEEDBACK ---\n"
+                    f"The previous test spec was rejected because: {feedback}\n"
+                    f"Write tests that actually call the functions/classes "
+                    f"the solution should define. Do NOT use vacuous asserts "
+                    f"like `assert True`."
+                )
+            else:
+                prompt = self._TEST_SPEC_PROMPT.format(query=query)
+            try:
+                raw = await self._call_generalist(prompt, max_tokens=1024)
+            except Exception as e:
+                print(f"[CodeLoop] Test-spec generation failed (attempt "
+                      f"{attempt + 1}): {e}")
+                return None
+            tests = self._extract_python_block(raw)
+            if not tests or "assert" not in tests:
+                feedback = "no assert statements found in the output"
+                print(f"[CodeLoop] Generalist produced no usable asserts "
+                      f"(attempt {attempt + 1}) — {'retrying' if attempt == 0 else 'giving up'}")
+                if attempt == 0:
+                    continue
+                return None
+            if not self._validate_test_spec(tests):
+                feedback = ("all asserts are vacuous (e.g. `assert True`) — "
+                            "they must reference functions or variables from "
+                            "the solution")
+                print(f"[CodeLoop] Generalist produced vacuous test spec "
+                      f"(attempt {attempt + 1}) — {'retrying' if attempt == 0 else 'giving up'}")
+                if attempt == 0:
+                    continue
+                return None
+            return tests
+        return None
 
     async def _run_code_specialist_verified(
         self, query: str
@@ -1171,7 +1267,7 @@ class HybridReasoningOrchestrator:
         # This is what allows math/code tasks to exceed the 0.65 cap.
         decision = self.route_structured(query)
         task_type = decision["task_type"]
-        verifier = select_verifier(task_type)
+        verifier = select_verifier(task_type, llm_judge=self._call_generalist)
         verifier_context = self._build_verifier_context(query, task_type)
         if verifier is not None:
             ctx_desc = ", ".join(f"{k}={v!r}" for k, v in verifier_context.items() if v)
@@ -1292,11 +1388,17 @@ class HybridReasoningOrchestrator:
     # Lifecycle: warm pool start/cleanup
     # ------------------------------------------------------------------ #
     async def start(self) -> None:
-        """Start background resources (warm Docker pool).
+        """Start background resources (warm Docker pool, shared HTTP session).
 
-        Call this before submitting code tasks to pre-warm the sandbox
-        containers. If no warm pool is configured, this is a no-op.
+        Call this before submitting tasks to pre-warm the sandbox containers
+        and eagerly create the shared aiohttp session inside the event loop.
+        Eager session creation avoids a lazy-init race where multiple
+        concurrent first-requests each create overlapping sessions.
         """
+        # Eagerly create the shared HTTP session (must be inside the event loop).
+        async with self._session_lock:
+            if self._http_session is None or self._http_session.closed:
+                self._http_session = aiohttp.ClientSession()
         if self._warm_pool is not None:
             await self._warm_pool.start()
 
