@@ -510,6 +510,27 @@ class CLRResultCache:
         self._rebuild_embeddings_matrix()
         if self.autosave:
             self.save()
+        # Shadow-mode dual-write: if a vector store is configured (e.g.
+        # via --agentdb-url), mirror the insert to it. The local
+        # embeddings matrix remains the primary read path; the vector
+        # store is the shadow that receives writes for migration to
+        # AgentDB. Failures are non-fatal (shadow is best-effort).
+        if self._vector_store is not None:
+            try:
+                self._vector_store.upsert(
+                    f"clr_{len(self.entries) - 1}",
+                    embedding,
+                    {
+                        "problem": problem,
+                        "best_answer": best_answer,
+                        "best_score": float(best_score),
+                        "verified": verified,
+                        "verification_method": verification_method,
+                        "task_type": entry.get("task_type", "unknown"),
+                    },
+                )
+            except Exception:
+                pass  # shadow write failure is non-fatal
 
     def clear(self) -> None:
         self.entries = []
@@ -775,6 +796,23 @@ class VerifiedTrajectoryStore:
         self._rebuild_embeddings_matrix()
         if self.autosave:
             self.save()
+        # Shadow-mode dual-write: mirror to the vector store (e.g. AgentDB)
+        # for migration. Non-fatal on failure.
+        if self._vector_store is not None:
+            try:
+                self._vector_store.upsert(
+                    f"traj_{len(self.entries) - 1}",
+                    embedding,
+                    {
+                        "query": query,
+                        "answer": answer,
+                        "score": float(score),
+                        "verification_method": verification_method,
+                        "task_type": task_type,
+                    },
+                )
+            except Exception:
+                pass  # shadow write failure is non-fatal
 
     def clear(self) -> None:
         self.entries = []

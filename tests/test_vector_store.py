@@ -241,3 +241,67 @@ class TestCacheIntegration:
         from persistent_cache import VerifiedTrajectoryStore
         store = VerifiedTrajectoryStore(cache_path)
         assert store._vector_store is None
+
+    def test_clr_cache_dual_writes_to_vector_store(self, cache_path):
+        """Insert into CLRResultCache should also upsert to the vector store
+        (shadow-mode dual-write)."""
+        from persistent_cache import CLRResultCache
+        vs = LocalVectorStore()
+        cache = CLRResultCache(cache_path, vector_store=vs)
+        cache.insert(
+            problem="what is 2+2",
+            best_answer="4",
+            best_score=0.95,
+            k=8,
+            trajectory_count=8,
+            verified=True,
+            verification_method="python_eval",
+        )
+        # The vector store should have received the upsert
+        assert vs.count() == 1
+        results = vs.search([0.0] * 384, top_k=1)  # dim doesn't matter for count
+        assert len(results) == 1
+
+    def test_trajectory_store_dual_writes_to_vector_store(self, cache_path):
+        """Store into VerifiedTrajectoryStore should also upsert to the vector
+        store (shadow-mode dual-write)."""
+        from persistent_cache import VerifiedTrajectoryStore
+        vs = LocalVectorStore()
+        store = VerifiedTrajectoryStore(cache_path, vector_store=vs)
+        store.store(
+            query="solve fibonacci",
+            answer="0, 1, 1, 2, 3, 5, 8",
+            score=0.92,
+            verification_method="python_eval",
+            task_type="math",
+        )
+        # The vector store should have received the upsert
+        assert vs.count() == 1
+
+    def test_clr_cache_dual_write_failure_is_non_fatal(self, cache_path):
+        """If the vector store raises, the insert should still succeed."""
+        from persistent_cache import CLRResultCache
+
+        class BrokenVectorStore:
+            def upsert(self, *args, **kwargs):
+                raise RuntimeError("AgentDB is down")
+            def search(self, *args, **kwargs):
+                return []
+            def count(self):
+                return 0
+            def delete(self, *args):
+                return False
+
+        cache = CLRResultCache(cache_path, vector_store=BrokenVectorStore())
+        # Should not raise despite the broken vector store
+        cache.insert(
+            problem="what is 2+2",
+            best_answer="4",
+            best_score=0.95,
+            k=8,
+            trajectory_count=8,
+            verified=True,
+            verification_method="python_eval",
+        )
+        # The local cache should still have the entry
+        assert len(cache) == 1

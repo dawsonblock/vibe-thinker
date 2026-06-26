@@ -246,8 +246,9 @@ class AgentDBVectorStore:
         try:
             return asyncio.run(self._post_async(path, payload))
         except RuntimeError:
-            # No running event loop — asyncio.run is fine. If there IS a
-            # running loop (we're inside async code), fall back to a thread.
+            # There IS a running event loop (we're inside async code) —
+            # asyncio.run() refuses to nest. Fall back to a fresh thread
+            # with its own event loop.
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 future = pool.submit(

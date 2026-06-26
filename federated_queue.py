@@ -131,6 +131,17 @@ class LocalJobQueue:
     def __init__(self, *args, **kwargs):
         self._queue = JobQueue(*args, **kwargs)
 
+    def __getattr__(self, name: str):
+        """Delegate any attribute not defined here to the inner JobQueue.
+
+        This transparently forwards ``bitemporal``, ``job_history``,
+        ``state_as_of``, ``persist_path``, and any other JobQueue
+        attribute that the REPL or other callers access directly.
+        """
+        if name == "_queue":
+            raise AttributeError(name)  # not set yet — avoid infinite recursion
+        return getattr(self._queue, name)
+
     async def start(self) -> None:
         await self._queue.start()
 
@@ -250,6 +261,18 @@ class FederatedJobQueue:
             ed25519_private_key_hex=ed25519_private_key_hex,
             ed25519_public_key_hex=ed25519_public_key_hex,
         )
+
+    def __getattr__(self, name: str):
+        """Delegate any attribute not defined here to the local queue.
+
+        This transparently forwards ``bitemporal``, ``job_history``,
+        ``state_as_of``, and any other JobQueue attribute that the
+        REPL or other callers access directly. The local queue itself
+        delegates to its inner JobQueue via its own ``__getattr__``.
+        """
+        if name == "_local":
+            raise AttributeError(name)  # not set yet — avoid infinite recursion
+        return getattr(self._local, name)
 
     def _federation_configured(self) -> bool:
         """True if the federation URL and mTLS certs are all provided."""

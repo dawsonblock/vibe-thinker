@@ -163,6 +163,66 @@ class TestFederatedJobQueue:
         assert isinstance(q.inner, JobQueue)
 
 
+class TestAttributeDelegation:
+    """Tests that the wrappers delegate REPL-accessed attributes to the
+    inner JobQueue. Without this, the CLI crashes when using
+    make_job_queue() because the REPL accesses queue.bitemporal,
+    queue.job_history, and queue.state_as_of directly."""
+
+    @pytest.fixture
+    def audit_log_path(self):
+        path = tempfile.mktemp(suffix=".jsonl")
+        yield path
+        if os.path.exists(path):
+            os.unlink(path)
+
+    def test_local_delegates_bitemporal(self, audit_log_path):
+        q = LocalJobQueue(FakeOrchestrator(), audit_log=audit_log_path)
+        assert hasattr(q, "bitemporal")
+        assert q.bitemporal is not None
+        assert q.bitemporal is q.inner.bitemporal
+
+    def test_local_delegates_job_history(self, audit_log_path):
+        q = LocalJobQueue(FakeOrchestrator(), audit_log=audit_log_path)
+        assert hasattr(q, "job_history")
+        assert callable(q.job_history)
+
+    def test_local_delegates_state_as_of(self, audit_log_path):
+        q = LocalJobQueue(FakeOrchestrator(), audit_log=audit_log_path)
+        assert hasattr(q, "state_as_of")
+        assert callable(q.state_as_of)
+
+    def test_federated_delegates_bitemporal(self, audit_log_path):
+        q = FederatedJobQueue(
+            FakeOrchestrator(), federation_url="", audit_log=audit_log_path
+        )
+        assert hasattr(q, "bitemporal")
+        assert q.bitemporal is not None
+        assert q.bitemporal is q.inner.bitemporal
+
+    def test_federated_delegates_job_history(self, audit_log_path):
+        q = FederatedJobQueue(
+            FakeOrchestrator(), federation_url="", audit_log=audit_log_path
+        )
+        assert hasattr(q, "job_history")
+        assert callable(q.job_history)
+
+    def test_federated_delegates_state_as_of(self, audit_log_path):
+        q = FederatedJobQueue(
+            FakeOrchestrator(), federation_url="", audit_log=audit_log_path
+        )
+        assert hasattr(q, "state_as_of")
+        assert callable(q.state_as_of)
+
+    def test_make_job_queue_delegates_bitemporal(self, audit_log_path):
+        """End-to-end: make_job_queue returns a wrapper that delegates
+        bitemporal — this is what the CLI path uses."""
+        from federated_queue import make_job_queue
+        q = make_job_queue(FakeOrchestrator(), audit_log=audit_log_path)
+        assert q.bitemporal is not None
+        assert q.bitemporal is q.inner.bitemporal
+
+
 class TestMakeJobQueueFactory:
     """Tests for the make_job_queue factory."""
 
