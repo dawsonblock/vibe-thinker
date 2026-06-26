@@ -410,14 +410,34 @@ class TestFastSpecialistPolicy:
         # more often is NOT independent verification.
         assert p.self_claim_cap == 0.65
 
+    def test_fast_specialist_policy_capped_at_k(self):
+        """The fast policy respects the user's k setting, like the default."""
+        from vibe_clr_async import make_fast_specialist_policy
+        p = make_fast_specialist_policy(k=8)
+        assert p.initial_k_with_verifier == 3
+        assert p.initial_k_without_verifier == 5
+        assert p.max_k == 8  # capped at k=8, not 15
+        # Very small k
+        p4 = make_fast_specialist_policy(k=4)
+        assert p4.initial_k_with_verifier == 3
+        assert p4.initial_k_without_verifier == 4  # min(5, 4)
+        assert p4.max_k == 4  # min(15, 4)
+
     def test_fast_specialist_flag_constructs_policy(self):
         clr_fast = VibeThinkerCLRAsync(
             server_url="http://localhost:0", k=8, fast_specialist=True
         )
         assert clr_fast.policy.initial_k_with_verifier == 3
         assert clr_fast.policy.initial_k_without_verifier == 5
-        assert clr_fast.policy.max_k == 15
+        assert clr_fast.policy.max_k == 8  # capped at k=8
         assert clr_fast.fast_specialist is True
+
+    def test_fast_specialist_with_large_k_gets_15(self):
+        """With k>=15, the fast policy gets the full 15."""
+        clr_fast = VibeThinkerCLRAsync(
+            server_url="http://localhost:0", k=20, fast_specialist=True
+        )
+        assert clr_fast.policy.max_k == 15
 
     def test_default_keeps_standard_policy(self):
         """Without fast_specialist, the default 1/2/6 policy is used."""
@@ -438,10 +458,10 @@ class TestFastSpecialistPolicy:
         assert clr.policy is custom
         assert clr.policy.max_k == 10
 
-    def test_fast_specialist_queue_load_adjusts_relative_to_15(self):
-        """Queue-load adjustment caps relative to the fast max_k=15."""
+    def test_fast_specialist_queue_load_adjusts_relative_to_cap(self):
+        """Queue-load adjustment caps relative to the fast max_k (capped at k)."""
         clr_fast = VibeThinkerCLRAsync(
-            server_url="http://localhost:0", k=8, fast_specialist=True
+            server_url="http://localhost:0", k=20, fast_specialist=True
         )
         assert clr_fast._original_max_k == 15
         # High load -> min(2, 15) = 2
@@ -571,6 +591,23 @@ class TestInProcessBackend:
         """Empty model output raises RuntimeError (fail-closed, not silent)."""
         clr._local_llm = MagicMock()
         clr._local_llm.return_value = {"choices": [{"text": ""}]}
+        clr.backend = "in-process"
+        with pytest.raises(RuntimeError, match="empty content"):
+            await clr._call_model(MagicMock(), "prompt", max_tokens=10)
+
+    @pytest.mark.asyncio
+    async def test_call_model_inprocess_raises_on_empty_choices_list(self, clr):
+        """An empty choices list raises RuntimeError, not IndexError."""
+        clr._local_llm = MagicMock()
+        clr._local_llm.return_value = {"choices": []}
+        clr.backend = "in-process"
+        with pytest.raises(RuntimeError, match="empty content"):
+            await clr._call_model(MagicMock(), "prompt", max_tokens=10)
+
+    @pytest.mark.asyncio
+    async def test_call_model_inprocess_raises_on_none_response(self, clr):
+        """A None response raises RuntimeError, not AttributeError."""
+        clr._local_llm = MagicMock(return_value=None)
         clr.backend = "in-process"
         with pytest.raises(RuntimeError, match="empty content"):
             await clr._call_model(MagicMock(), "prompt", max_tokens=10)

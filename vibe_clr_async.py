@@ -68,7 +68,7 @@ class AdaptivePolicy:
     contradiction_penalty: float = 0.75
 
 
-def make_fast_specialist_policy() -> AdaptivePolicy:
+def make_fast_specialist_policy(k: int = 15) -> AdaptivePolicy:
     """Adaptive policy tuned for an ultra-fast, tiny specialist (e.g. 0.5B).
 
     A 0.5B model is essentially "free" to run (~100+ tok/s, ~400MB RAM), so the
@@ -83,14 +83,18 @@ def make_fast_specialist_policy() -> AdaptivePolicy:
     more often is NOT independent verification. Only an external deterministic
     verifier can exceed the cap.
 
+    All values are capped at ``k`` to respect the user's --clr-k setting, mirroring
+    the default policy's ``min(k_max, k)`` behavior. So ``make_fast_specialist_policy(k=8)``
+    yields max_k=8, not 15.
+
     Use this ONLY when the specialist is a small/fast model. On a 3B+ model
     (e.g. VibeThinker-3B on 16GB RAM) running 15 parallel trajectories will
     thrash or OOM; the default AdaptivePolicy (1/2/6) is correct there.
     """
     return AdaptivePolicy(
-        initial_k_with_verifier=3,
-        initial_k_without_verifier=5,
-        max_k=15,
+        initial_k_with_verifier=min(3, k),
+        initial_k_without_verifier=min(5, k),
+        max_k=min(15, k),
         self_claim_cap=0.65,
     )
 
@@ -166,7 +170,7 @@ class VibeThinkerCLRAsync:
         if policy is not None:
             self.policy = policy
         elif fast_specialist:
-            self.policy = make_fast_specialist_policy()
+            self.policy = make_fast_specialist_policy(k=k)
         else:
             self.policy = AdaptivePolicy(
                 initial_k_without_verifier=min(k_min, k) if adaptive else k,
@@ -374,7 +378,14 @@ class VibeThinkerCLRAsync:
                     stop=stop_tokens,
                     grammar=grammar_obj,
                 )
-                text = resp["choices"][0]["text"] if resp else ""
+                # Defensive parsing: llama_cpp returns a dict with "choices",
+                # but guard against None, missing key, or empty list.
+                choices = (resp or {}).get("choices") or []
+                if not choices:
+                    raise RuntimeError(
+                        "In-process specialist returned empty content"
+                    )
+                text = choices[0].get("text", "") if isinstance(choices[0], dict) else ""
                 if not text:
                     raise RuntimeError(
                         "In-process specialist returned empty content"
