@@ -5,7 +5,7 @@ high-precision reasoning specialist (VibeThinker-3B with Claim-Level
 Reliability) and a generalist model, with a priority async job queue,
 bi-temporal audit logging, deterministic verifiers, and an interactive CLI.
 
-## Status: ALPHA SOFTWARE (v0.3.7)
+## Status: ALPHA SOFTWARE (v0.3.9)
 
 **This is alpha software.** It is a local reasoning control plane prototype,
 not a production reasoning engine. The following limitations are real and
@@ -102,7 +102,11 @@ python test_full_stack.py
 | `hybrid_orchestrator.py` | Routes between specialist, generalist, or hybrid path |
 | `persistent_cache.py` | Disk-backed route cache + semantic CLR result cache + verified trajectory store |
 | `rfsn_job_queue.py` | In-process async priority job queue with concurrency limit |
-| `bitemporal_log.py` | Bi-temporal JSONL audit log (valid_time + transaction_time, hash-chain, strict verification) |
+| `bitemporal_log.py` | Bi-temporal JSONL audit log (valid_time + transaction_time, hash-chain, strict verification, optional HMAC/Ed25519 signatures) |
+| `signers.py` | Pluggable signer abstraction: HmacSigner (stdlib) + Ed25519Signer (optional cryptography dep, SLSA L2) |
+| `vector_store.py` | Vector store abstraction: LocalVectorStore (in-memory) + AgentDBVectorStore (HTTP sidecar) + ShadowVectorStore (dual-write migration) |
+| `ruvllm_adapter.py` | RuvLLM inference backend: HTTP sidecar docs + TurboQuant config + PyO3 binding contract |
+| `federated_queue.py` | Federated job queue: BaseJobQueue protocol + LocalJobQueue + FederatedJobQueue (exo-federation over mTLS) |
 | `rfsn_cli.py` | Interactive CLI/REPL over the job queue (env var + CLI flag support) |
 | `scoring.py` | Separated confidence fields (model_confidence, claim_consistency, deterministic_verification) |
 | `verifiers/` | Deterministic verifier adapters (math, code, factual) |
@@ -374,6 +378,151 @@ llama-server -m ~/models/vibethinker-3b-q4_k_m.gguf \
 See AGENTS.md for the full config ladder and the asymmetric K/V compression
 details.
 
+## Security hardening (v0.3.8)
+
+Ten fixes from a full codebase audit. All stdlib-only, no new dependencies.
+
+- **Sandbox nonce anti-spoofing**: the test harness uses a per-execution
+  nonce (`VT_PASS_<nonce>`) instead of a hardcoded `ALL_TESTS_PASSED`
+  string. Candidate code cannot guess the nonce (it's passed via env
+  var, not in the script source). The verifier requires both the nonce
+  marker in stdout AND exit code 0.
+- **Safe AST math evaluator**: `math_solver.py` no longer uses `eval()`.
+  Replaced with a whitelisting AST evaluator (BinOp, UnaryOp, Constant,
+  Name only).
+- **Test-spec vacuity rejection**: `_validate_test_spec` rejects
+  `assert True`, `assert 1 == 1`, etc. via AST check. Every assert must
+  reference a Name or Call node. Retries once with feedback if the
+  generalist produces a vacuous spec.
+- **Bi-temporal log HMAC signatures**: optional `signing_key=` adds
+  HMAC-SHA256 signatures to each entry. `verify_chain(strict=True)`
+  with a key proves the log was written by a key-holder (tamper-proof,
+  not just tamper-evident).
+- **Factual verifier NLI judge + negation detection**: the orchestrator's
+  generalist is wired as an NLI judge (ENTAILMENT/CONTRADICTION/NEUTRAL).
+  The lexical fallback detects negation polarity mismatches.
+- **Session init race fix**: `_get_session()` is async with a
+  double-checked `asyncio.Lock`. The shared `aiohttp.ClientSession` is
+  eagerly created in `start()`.
+- **Warm pool zombie reaping**: before each execution, the warm pool
+  kills all processes except PID 1 and the reaping shell.
+- **Hardened Python block extraction**: handles `py` (abbreviated) and
+  no-tag fences in addition to `python`.
+- **LRU eviction by (access_count, score)**: rarely-retrieved entries
+  are evicted before frequently-retrieved ones, even if their score is
+  higher. Access counts are persisted to disk.
+- **Job queue disk persistence**: `JobQueue(persist_path=)` persists
+  pending/running jobs to JSONL. On restart, non-terminal jobs are
+  recovered and re-queued (crash recovery without Redis).
+
+## RuFlo integration abstractions (v0.3.9)
+
+Four pluggable abstractions from the Vibe-Thinker + RuFlo Integration
+Plan. All are opt-in with backward-compatible defaults — no behavior
+change unless the new parameters/flags are used. External ruvnet repos
+(ruflo/AgentDB, ruvllm, exo-federation) are NOT required; the
+abstractions fail-closed to the existing local behavior when the
+sidecars/bindings are absent.
+
+### Ed25519 audit-log signatures (`signers.py`)
+
+Upgrades the bi-temporal log from HMAC-SHA256 (symmetric, stdlib) to
+Ed25519 (asymmetric, SLSA L2 compliant). The `Signer` protocol
+abstracts the signature scheme so the log can use either without
+coupling to a specific crypto library.
+
+```bash
+# Generate an Ed25519 keypair:
+python3 -c "from signers import Ed25519Signer; s=Ed25519Signer.generate(); print('private:', s.private_key_hex); print('public:', s.public_key_hex)"
+
+# Sign with the private key, verify with the public key:
+python rfsn_cli.py --ed25519-private-key <hex> --audit-log rfsn_jobs.jsonl
+# On a verify-only node:
+python rfsn_cli.py --ed25519-public-key <hex> --audit-log rfsn_jobs.jsonl
+```
+
+| Flag / env | Default | Purpose |
+|---|---|---|
+| `--ed25519-private-key` / `RFSN_ED25519_PRIVATE_KEY` | empty | Ed25519 private key (hex) for asymmetric signing (SLSA L2) |
+| `--ed25519-public-key` / `RFSN_ED25519_PUBLIC_KEY` | empty | Ed25519 public key (hex) for verify-only mode |
+| `--signing-key` / `RFSN_SIGNING_KEY` | empty | HMAC-SHA256 shared secret (symmetric, stdlib) |
+
+Ed25519 takes precedence over HMAC when both are set. Requires the
+optional `cryptography` package. Without it, only HMAC-SHA256 is
+available (the v0.3.8 default).
+
+### Vector store abstraction (`vector_store.py`)
+
+Abstracts the semantic similarity search behind a `VectorStore` protocol
+so the embedding matrix can move out of the orchestrator process into a
+purpose-built vector index (AgentDB):
+
+```bash
+# Shadow mode: dual-write to local JSON + AgentDB, read from local first
+python rfsn_cli.py --agentdb-url http://127.0.0.1:8088
+```
+
+| Flag / env | Default | Purpose |
+|---|---|---|
+| `--agentdb-url` / `AGENTDB_URL` | empty | RuFlo/AgentDB HTTP endpoint for vector search (shadow mode) |
+
+When AgentDB is down, reads fall back to the local in-memory store
+(fail-closed). The `ShadowVectorStore` dual-writes to both, enabling
+zero-downtime migration: once AgentDB recall is verified, cut over to
+AgentDB-only and deprecate the JSON file.
+
+### RuvLLM inference backend (`ruvllm_adapter.py`)
+
+RuvLLM is a Rust inference engine with TurboQuant KV cache compression.
+It exposes the same OpenAI-compatible HTTP API as llama-server, so the
+simplest integration is to point `--vibe` at the RuvLLM port:
+
+```bash
+# Start RuvLLM with TurboQuant (asymmetric KV: q8_0 K, turbo3 V):
+ruvllm-server -m ~/models/vibethinker-3b-q4_k_m.gguf \
+  --host 127.0.0.1 --port 8080 -c 32768 -t 6 --jinja \
+  --cache-type-k q8_0 --cache-type-v turbo3
+
+# Point vibe-thinker at it:
+python rfsn_cli.py --ruvllm-url http://127.0.0.1:8080
+```
+
+| Flag / env | Default | Purpose |
+|---|---|---|
+| `--ruvllm-url` / `RUVLLM_URL` | empty | RuvLLM HTTP endpoint (overrides `--vibe`) |
+| `--fast-code-specialist` / `RFSN_FAST_CODE_SPECIALIST` | false | Bump `CODE_CANDIDATES` to 15 for ultra-fast 0.5B code models |
+
+When the `ruvllm_py` PyO3 binding is installed (not yet published), the
+in-process backend prefers it over `llama-cpp-python` for zero-HTTP-
+overhead inference with native TurboQuant compression.
+
+### Federated job queue (`federated_queue.py`)
+
+Abstracts the job queue behind a `BaseJobQueue` protocol, enabling
+multi-node reasoning swarms via exo-federation:
+
+```bash
+# Run as a worker node in a federation swarm (mTLS authenticated):
+python rfsn_cli.py \
+  --federation-url https://swarm.local:7443 \
+  --mtls-cert /path/to/node-cert.pem \
+  --mtls-key /path/to/node-key.pem \
+  --mtls-ca /path/to/ca.pem
+```
+
+| Flag / env | Default | Purpose |
+|---|---|---|
+| `--federation-url` / `FEDERATION_URL` | empty | exo-federation endpoint for multi-node job distribution |
+| `--mtls-cert` / `FEDERATION_MTLS_CERT` | empty | mTLS client certificate (PEM) |
+| `--mtls-key` / `FEDERATION_MTLS_KEY` | empty | mTLS client private key (PEM) |
+| `--mtls-ca` / `FEDERATION_MTLS_CA` | empty | mTLS CA certificate (PEM) |
+
+When the federation is unreachable (sidecar down, certs missing), the
+queue fail-closed-fallbacks to local-only execution — jobs still run on
+this node, just not distributed. The existing `JobQueue` satisfies the
+`BaseJobQueue` protocol structurally (no changes needed to use it
+directly).
+
 ## Cache promotion rules
 
 Bad answers are never cached. The strict `should_cache()` policy rejects:
@@ -388,7 +537,7 @@ Bad answers are never cached. The strict `should_cache()` policy rejects:
 ## Testing
 
 ```bash
-# Full suite (345 tests, no model servers needed):
+# Full suite (509 tests, no model servers needed):
 python3 -m pytest -q
 
 # Specific subsystems:
@@ -396,6 +545,10 @@ python3 -m pytest tests/test_warm_pool.py -q          # warm Docker pool
 python3 -m pytest tests/test_trajectory_store.py -q    # verified trajectory store
 python3 -m pytest tests/test_clr_scoring.py -q         # CLR scoring + grammar
 python3 -m pytest tests/test_routing.py -q             # routing + code specialist
+python3 -m pytest tests/test_signers.py -q             # Ed25519 + HMAC signers
+python3 -m pytest tests/test_vector_store.py -q        # vector store + AgentDB abstraction
+python3 -m pytest tests/test_ruvllm_adapter.py -q      # RuvLLM adapter + CLI flags
+python3 -m pytest tests/test_federated_queue.py -q     # federated job queue
 
 # Full-stack test (needs live model servers):
 python test_full_stack.py
@@ -420,10 +573,13 @@ python test_full_stack.py
   for 2.5x speedup). Falls back to cold `docker run --rm`, then sbx microVMs.
   If none are available, it **refuses to verify** rather than running untrusted
   code on the host. See `sandbox/README.md` for the full isolation model.
-- The job queue is in-process only. For multi-process/multi-node, swap the
-  dispatcher for RQ/Celery/Dramatiq.
+- The job queue is in-process by default. For multi-node distribution, use
+  `--federation-url` with mTLS certs (v0.3.9 `FederatedJobQueue`, backed by
+  exo-federation). Without a federation, jobs run locally only.
 - The bi-temporal log has hash-chain integrity with strict verification
-  (`verify_chain(strict=True)`), but does not use cryptographic signatures.
-  For audit-grade use, add signing keys.
+  (`verify_chain(strict=True)`). For audit-grade tamper-proofing, use
+  `--signing-key` (HMAC-SHA256, stdlib) or `--ed25519-private-key`
+  (Ed25519 asymmetric, SLSA L2, requires `cryptography`). Without a key,
+  the log is tamper-evident only (an attacker can recompute the hash chain).
 - Cache entries from v0.1/v0.2/v0.3 (schema_version < 3) are silently
   rejected on lookup. Delete `clr_result_cache.json` to start fresh.
