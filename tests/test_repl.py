@@ -167,6 +167,19 @@ class TestEnvVarSupport:
         args = build_argparser().parse_args([])
         assert args.local_specialist_n_ctx == 8192
 
+    def test_local_specialist_pool_size_defaults_to_1(self):
+        args = build_argparser().parse_args([])
+        assert args.local_specialist_pool_size == 1
+
+    def test_local_specialist_pool_size_cli(self):
+        args = build_argparser().parse_args(["--local-specialist-pool-size", "4"])
+        assert args.local_specialist_pool_size == 4
+
+    def test_local_specialist_pool_size_env(self, monkeypatch):
+        monkeypatch.setenv("VIBE_THINKER_LOCAL_POOL_SIZE", "8")
+        args = build_argparser().parse_args([])
+        assert args.local_specialist_pool_size == 8
+
 
 
 

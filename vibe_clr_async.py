@@ -23,6 +23,7 @@ Bug fixes vs. the original walkthrough version:
 import asyncio
 import json
 import os
+import queue
 import re
 import threading
 from dataclasses import dataclass, field
@@ -156,6 +157,7 @@ class VibeThinkerCLRAsync:
         local_model: Optional[str] = None,
         local_n_ctx: int = 4096,
         local_n_threads: int = 8,
+        local_pool_size: int = 1,
     ):
         self.server_url = server_url.rstrip("/")
         self.k = k
@@ -191,9 +193,17 @@ class VibeThinkerCLRAsync:
         # executor (llama_cpp is synchronous). Auto-preferred over HTTP: if the
         # load succeeds, _call_model bypasses aiohttp entirely. If llama_cpp is
         # not installed or the load fails, we warn and fall back to HTTP.
-        self._local_llm = None
+        #
+        # Pool mode: when local_pool_size > 1, N separate Llama instances are
+        # loaded into a queue.Queue. Each inference call checks out one instance,
+        # runs it in a thread executor, and returns it to the pool. This enables
+        # true parallel inference (a single Llama instance is not thread-safe).
+        # For a 0.5B model (~398MB), 4 instances cost ~1.6GB — cheap on 16GB RAM.
+        self._local_llm = None  # single-instance mode (pool_size=1)
+        self._local_llm_pool: Optional[queue.Queue] = None  # pool mode
+        self._local_pool_size = max(1, local_pool_size)
         self._local_grammar = None
-        self._local_lock = threading.Lock()
+        self._local_lock = threading.Lock()  # used only in single-instance mode
         self.backend = "http"
         if local_model:
             self._init_local_backend(local_model, local_n_ctx, local_n_threads)
@@ -202,6 +212,11 @@ class VibeThinkerCLRAsync:
         self, local_model: str, n_ctx: int, n_threads: int
     ) -> None:
         """Try to load the in-process specialist. Fall back to HTTP on failure.
+
+        When self._local_pool_size > 1, loads N separate Llama instances into a
+        queue.Queue for true parallel inference (each call checks out one
+        instance, runs it in a thread executor, returns it to the pool). When
+        pool_size=1, loads a single instance and serializes with a Lock.
 
         local_model may be:
           - a path to a .gguf file on disk -> Llama(model_path=...)
@@ -218,47 +233,82 @@ class VibeThinkerCLRAsync:
             )
             return
 
-        try:
+        def _load_one() -> Any:
+            """Load a single Llama instance from local_model."""
             if os.path.exists(local_model):
-                print(f"[CLR] Loading in-process specialist from {local_model}...")
-                self._local_llm = Llama(
+                return Llama(
                     model_path=local_model,
                     n_ctx=n_ctx,
                     n_threads=n_threads,
                     verbose=False,
                 )
+            if "/" in local_model and local_model.endswith(".gguf"):
+                repo_id, filename = local_model.split("/", 1)
+                return Llama.from_pretrained(
+                    repo_id=repo_id,
+                    filename=filename,
+                    n_ctx=n_ctx,
+                    n_threads=n_threads,
+                    verbose=False,
+                )
+            return Llama.from_pretrained(
+                repo_id=local_model,
+                n_ctx=n_ctx,
+                n_threads=n_threads,
+                verbose=False,
+            )
+
+        try:
+            if self._local_pool_size > 1:
+                # Pool mode: load N instances into a thread-safe queue.
+                # Divide threads across instances so they don't oversubscribe
+                # the CPU when all N run concurrently.
+                per_inst_threads = max(1, n_threads // self._local_pool_size)
+                print(
+                    f"[CLR] Loading {self._local_pool_size} in-process specialist "
+                    f"instances (pool mode, {n_threads} threads -> "
+                    f"{per_inst_threads}/instance) from {local_model}..."
+                )
+                # Temporarily override n_threads for the per-instance loads
+                original_n_threads = n_threads
+                pool: queue.Queue = queue.Queue()
+                loaded = 0
+                for i in range(self._local_pool_size):
+                    try:
+                        inst = _load_one()
+                        # Reconfigure threads if the instance supports it
+                        # (llama_cpp Llama stores n_threads on the instance)
+                        if hasattr(inst, "n_threads"):
+                            inst.n_threads = per_inst_threads
+                        pool.put(inst)
+                        loaded += 1
+                    except Exception as e:
+                        print(f"[CLR] Warning: pool instance {i} failed to load: {e}")
+                if loaded == 0:
+                    raise RuntimeError("all pool instances failed to load")
+                self._local_llm_pool = pool
+                self._local_pool_size = loaded  # actual count
+                self._local_llm = None  # not used in pool mode
+                self.backend = "in-process-pool"
+                print(
+                    f"[CLR] In-process pool ready (backend={self.backend}, "
+                    f"{loaded} instances, n_ctx={n_ctx}). HTTP at "
+                    f"{self.server_url} is bypassed."
+                )
             else:
-                # Treat as repo_id/filename (HF Hub). Split on first '/' if the
-                # user gave "repo/file.gguf"; otherwise pass repo_id and let
-                # from_pretrained pick a default file.
-                if "/" in local_model and local_model.endswith(".gguf"):
-                    repo_id, filename = local_model.split("/", 1)
-                    print(f"[CLR] Loading in-process specialist {repo_id}/{filename}...")
-                    self._local_llm = Llama.from_pretrained(
-                        repo_id=repo_id,
-                        filename=filename,
-                        n_ctx=n_ctx,
-                        n_threads=n_threads,
-                        verbose=False,
-                    )
-                else:
-                    print(f"[CLR] Loading in-process specialist {local_model}...")
-                    self._local_llm = Llama.from_pretrained(
-                        repo_id=local_model,
-                        n_ctx=n_ctx,
-                        n_threads=n_threads,
-                        verbose=False,
-                    )
-            # Pre-compile the JSON claims grammar for the in-process path.
+                # Single-instance mode: one Llama, serialized with a Lock.
+                print(f"[CLR] Loading in-process specialist from {local_model}...")
+                self._local_llm = _load_one()
+                self.backend = "in-process"
+                print(
+                    f"[CLR] In-process specialist ready (backend={self.backend}, "
+                    f"n_ctx={n_ctx}, n_threads={n_threads}). HTTP at "
+                    f"{self.server_url} is bypassed."
+                )
+            # Pre-compile the JSON claims grammar (shared across all instances).
             # llama_cpp enforces grammar natively — the model physically cannot
             # emit invalid JSON, mirroring the HTTP /completion grammar path.
             self._local_grammar = LlamaGrammar.from_string(_CLAIMS_JSON_GRAMMAR)
-            self.backend = "in-process"
-            print(
-                f"[CLR] In-process specialist ready (backend={self.backend}, "
-                f"n_ctx={n_ctx}, n_threads={n_threads}). HTTP at "
-                f"{self.server_url} is bypassed."
-            )
         except Exception as e:
             print(
                 f"[CLR] Warning: failed to load in-process specialist "
@@ -266,6 +316,7 @@ class VibeThinkerCLRAsync:
                 f"{self.server_url}."
             )
             self._local_llm = None
+            self._local_llm_pool = None
             self._local_grammar = None
             self.backend = "http"
 
@@ -326,7 +377,7 @@ class VibeThinkerCLRAsync:
                 (in-process). Used for claim extraction to prevent small models
                 from producing malformed JSON.
         """
-        if self._local_llm is not None:
+        if self._local_llm is not None or self._local_llm_pool is not None:
             return await self._call_model_inprocess(
                 prompt, max_tokens, temperature, stop, grammar
             )
@@ -344,10 +395,13 @@ class VibeThinkerCLRAsync:
     ) -> str:
         """In-process backend: call llama_cpp.Llama in a thread executor.
 
-        llama_cpp is synchronous and a single Llama instance is not safe to
-        call concurrently, so we serialize with self._local_lock inside the
-        executor. The asyncio semaphore (held by _call_model callers via the
-        HTTP path) is not used here; the threading.Lock is the real gate.
+        Two modes:
+          - Pool mode (local_pool_size > 1): check out a Llama from the
+            queue.Queue, run it in a thread executor, return it to the pool.
+            This enables true parallel inference — N trajectories can run
+            simultaneously on N model instances.
+          - Single mode (pool_size=1): one Llama instance, serialized with
+            self._local_lock (a single Llama is not thread-safe).
 
         Grammar: when the requested grammar matches _CLAIMS_JSON_GRAMMAR (the
         only grammar this codebase uses), we pass the pre-compiled
@@ -371,7 +425,9 @@ class VibeThinkerCLRAsync:
                     # and let the regex fallback parser handle malformed JSON.
                     print(f"[CLR] Warning: in-process grammar compile failed: {e}")
 
-        def _run() -> str:
+        use_pool = self._local_llm_pool is not None
+
+        def _run_single() -> str:
             with self._local_lock:
                 resp = self._local_llm(
                     prompt,
@@ -380,28 +436,52 @@ class VibeThinkerCLRAsync:
                     stop=stop_tokens,
                     grammar=grammar_obj,
                 )
-                # Defensive parsing: llama_cpp returns a dict with "choices",
-                # but guard against None, missing key, or empty list.
-                choices = (resp or {}).get("choices") or []
-                if not choices:
-                    raise RuntimeError(
-                        "In-process specialist returned empty content"
-                    )
-                text = choices[0].get("text", "") if isinstance(choices[0], dict) else ""
-                if not text:
-                    raise RuntimeError(
-                        "In-process specialist returned empty content"
-                    )
-                return text
+                return self._parse_inprocess_response(resp)
+
+        def _run_pool() -> str:
+            # Check out an available instance (blocks until one is free).
+            # The queue is thread-safe, so concurrent executor threads can
+            # each grab a different instance and run truly in parallel.
+            llm = self._local_llm_pool.get(block=True)
+            try:
+                resp = llm(
+                    prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    stop=stop_tokens,
+                    grammar=grammar_obj,
+                )
+                return self._parse_inprocess_response(resp)
+            finally:
+                # Return the instance to the pool for the next caller.
+                self._local_llm_pool.put(llm)
 
         try:
-            return await loop.run_in_executor(None, _run)
+            if use_pool:
+                return await loop.run_in_executor(None, _run_pool)
+            return await loop.run_in_executor(None, _run_single)
         except RuntimeError:
             raise
         except Exception as e:
             raise RuntimeError(
                 f"In-process specialist call failed: {e}"
             ) from e
+
+    @staticmethod
+    def _parse_inprocess_response(resp: Any) -> str:
+        """Defensively parse a llama_cpp response dict.
+
+        Guards against None, missing 'choices', empty list, or missing 'text'.
+        Raises RuntimeError (not IndexError/KeyError) on any malformed response
+        so callers get a consistent fail-closed error.
+        """
+        choices = (resp or {}).get("choices") or []
+        if not choices:
+            raise RuntimeError("In-process specialist returned empty content")
+        text = choices[0].get("text", "") if isinstance(choices[0], dict) else ""
+        if not text:
+            raise RuntimeError("In-process specialist returned empty content")
+        return text
 
     async def _call_model_http(
         self,

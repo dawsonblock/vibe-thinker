@@ -260,6 +260,7 @@ class HybridReasoningOrchestrator:
         local_specialist_model: Optional[str] = None,
         local_specialist_n_ctx: int = 4096,
         local_specialist_n_threads: int = 8,
+        local_specialist_pool_size: int = 1,
     ):
         self.vibe_endpoint = vibe_endpoint.rstrip("/")
         self.generalist_endpoint = generalist_endpoint.rstrip("/")
@@ -299,6 +300,7 @@ class HybridReasoningOrchestrator:
             local_model=local_specialist_model,
             local_n_ctx=local_specialist_n_ctx,
             local_n_threads=local_specialist_n_threads,
+            local_pool_size=local_specialist_pool_size,
         )
 
         self.use_embedding_router = use_embedding_router and EMBEDDINGS_AVAILABLE
@@ -841,6 +843,13 @@ class HybridReasoningOrchestrator:
           4. If no candidate passes, return the first candidate with score
              0.0 and an honest "no candidate passed verification" note.
 
+        Test-feedback loop (v0.3.6): if ALL candidates fail with TEST_ERROR
+        (the test harness itself crashed — not an assertion failure), the
+        generalist gets ONE retry to rewrite the tests with the error fed
+        back as context. This distinguishes "bad tests" from "bad code":
+          - ASSERTION_FAILED / IMPORT_ERROR = candidate is wrong → no retry
+          - TEST_ERROR = the test spec is broken → retry once with feedback
+
         If no test spec can be generated, or no verifier/sandbox is
         available, falls back to single-candidate plain generation with
         score 0.0 (unverified — fail-closed, never fake verification).
@@ -864,66 +873,123 @@ class HybridReasoningOrchestrator:
                 raw_traces={"verified": False, "reason": "no test spec generated"},
             )
 
-        # Generate N candidates in parallel with diverse temperatures.
-        # Prepend verified trajectories as few-shot context (self-improving).
-        temps = [0.2] + [0.7] * (self.code_candidates - 1)
-        few_shot = self._get_few_shot_context(query, task_type="code")
-        query_with_ctx = f"{few_shot}\n{query}" if few_shot else query
-        gen_prompt = self._CODE_GEN_PROMPT.format(query=query_with_ctx, tests=tests)
-        if few_shot:
-            print(f"[CodeLoop] Retrieved verified examples as few-shot context")
-        print(f"[CodeLoop] Generating {self.code_candidates} candidates + test spec verification")
-        candidates_raw = await asyncio.gather(
-            *[self._call_code_specialist(gen_prompt, max_tokens=2048) for _ in temps],
-            return_exceptions=True,
-        )
-        candidates = [
-            (raw, self._extract_python_block(raw))
-            for raw in candidates_raw if isinstance(raw, str)
-        ]
-        if not candidates:
-            return OrchestratorResult(
-                final_answer="",
-                route_taken="code_specialist_failed",
-                specialist_used="Code Specialist (ruvltra-claude-code)",
-                clr_score=0.0,
-                routing_confidence=0.0,
-                raw_traces={"verified": False, "reason": "all candidate generations failed"},
-            )
-
-        # Verify each candidate against the test spec in the sandbox.
-        # First passing candidate wins.
-        verification_traces = []
-        for i, (raw, code) in enumerate(candidates):
-            result = await self.code_verifier.verify(
-                query, code, {"unit_tests": tests}
-            )
-            trace = {
-                "candidate_index": i,
-                "verified": result.verified,
-                "score": result.score,
-                "method": result.method,
-                "error": result.error,
-            }
-            verification_traces.append(trace)
-            if result.verified:
-                print(f"[CodeLoop] Candidate {i} PASSED verification — returning")
-                return OrchestratorResult(
-                    final_answer=code,
-                    route_taken="code_specialist_verified",
-                    specialist_used="Code Specialist (ruvltra-claude-code)",
-                    clr_score=1.0,
-                    routing_confidence=1.0,
-                    raw_traces={
-                        "verified": True,
-                        "verification_method": result.method,
-                        "candidates_generated": len(candidates),
-                        "candidate_index": i,
-                        "unit_tests": tests,
-                        "all_verification_traces": verification_traces,
-                    },
+        # --- Test-feedback loop: up to 2 attempts (initial + 1 retry) ---
+        # On the first attempt, use the original tests. If ALL candidates fail
+        # with TEST_ERROR (the test harness crashed, not the candidate), feed
+        # the error back to the generalist and retry test generation once.
+        test_error_feedback: Optional[str] = None
+        for attempt in range(2):
+            if test_error_feedback is not None:
+                print(f"[CodeLoop] Tests crashed on attempt {attempt} — asking "
+                      f"generalist to rewrite tests with error feedback")
+                tests = await self._generate_test_spec(
+                    f"{query}\n\n--- TEST FEEDBACK ---\n"
+                    f"The previous test spec crashed with this error:\n"
+                    f"{test_error_feedback}\n\n"
+                    f"Rewrite the unit tests to be syntactically correct and "
+                    f"robust. Ensure all referenced functions/classes exist "
+                    f"in the solution before asserting on them."
                 )
-            print(f"[CodeLoop] Candidate {i} failed: {result.error or 'not verified'}")
+                if tests is None:
+                    print("[CodeLoop] Retry test generation failed — "
+                          "single-candidate unverified generation")
+                    answer = await self._call_code_specialist(query)
+                    return OrchestratorResult(
+                        final_answer=answer,
+                        route_taken="code_specialist_unverified",
+                        specialist_used="Code Specialist (ruvltra-claude-code)",
+                        clr_score=0.0,
+                        routing_confidence=0.0,
+                        raw_traces={
+                            "verified": False,
+                            "reason": "test spec retry failed after TEST_ERROR",
+                        },
+                    )
+
+            # Generate N candidates in parallel with diverse temperatures.
+            # Prepend verified trajectories as few-shot context (self-improving).
+            temps = [0.2] + [0.7] * (self.code_candidates - 1)
+            few_shot = self._get_few_shot_context(query, task_type="code")
+            query_with_ctx = f"{few_shot}\n{query}" if few_shot else query
+            gen_prompt = self._CODE_GEN_PROMPT.format(query=query_with_ctx, tests=tests)
+            if few_shot:
+                print(f"[CodeLoop] Retrieved verified examples as few-shot context")
+            print(f"[CodeLoop] Generating {self.code_candidates} candidates + "
+                  f"test spec verification (attempt {attempt + 1}/2)")
+            candidates_raw = await asyncio.gather(
+                *[self._call_code_specialist(gen_prompt, max_tokens=2048) for _ in temps],
+                return_exceptions=True,
+            )
+            candidates = [
+                (raw, self._extract_python_block(raw))
+                for raw in candidates_raw if isinstance(raw, str)
+            ]
+            if not candidates:
+                return OrchestratorResult(
+                    final_answer="",
+                    route_taken="code_specialist_failed",
+                    specialist_used="Code Specialist (ruvltra-claude-code)",
+                    clr_score=0.0,
+                    routing_confidence=0.0,
+                    raw_traces={"verified": False, "reason": "all candidate generations failed"},
+                )
+
+            # Verify each candidate against the test spec in the sandbox.
+            # First passing candidate wins.
+            verification_traces = []
+            test_error_count = 0
+            first_test_error: Optional[str] = None
+            for i, (raw, code) in enumerate(candidates):
+                result = await self.code_verifier.verify(
+                    query, code, {"unit_tests": tests}
+                )
+                trace = {
+                    "candidate_index": i,
+                    "verified": result.verified,
+                    "score": result.score,
+                    "method": result.method,
+                    "error": result.error,
+                }
+                verification_traces.append(trace)
+                if result.verified:
+                    print(f"[CodeLoop] Candidate {i} PASSED verification — returning")
+                    return OrchestratorResult(
+                        final_answer=code,
+                        route_taken="code_specialist_verified",
+                        specialist_used="Code Specialist (ruvltra-claude-code)",
+                        clr_score=1.0,
+                        routing_confidence=1.0,
+                        raw_traces={
+                            "verified": True,
+                            "verification_method": result.method,
+                            "candidates_generated": len(candidates),
+                            "candidate_index": i,
+                            "unit_tests": tests,
+                            "all_verification_traces": verification_traces,
+                            "test_spec_retry": attempt,
+                        },
+                    )
+                print(f"[CodeLoop] Candidate {i} failed: {result.error or 'not verified'}")
+                # Detect test-harness crashes (TEST_ERROR = the test itself is
+                # broken, not the candidate). IMPORT_ERROR and ASSERTION_FAILED
+                # are candidate problems — they don't trigger a test retry.
+                if result.error and "TEST_ERROR" in result.error:
+                    test_error_count += 1
+                    if first_test_error is None:
+                        first_test_error = result.error
+
+            # If ALL candidates failed with TEST_ERROR, the test spec is likely
+            # broken (not the code). Retry test generation once with feedback.
+            if (
+                test_error_count == len(candidates)
+                and first_test_error is not None
+                and attempt == 0
+            ):
+                test_error_feedback = first_test_error
+                continue  # retry with rewritten tests
+
+            # Not all TEST_ERROR, or we already retried — return best-effort.
+            break
 
         # No candidate passed — return the first with honest score 0.0.
         print(f"[CodeLoop] No candidate passed verification — returning best-effort (unverified)")
@@ -939,6 +1005,7 @@ class HybridReasoningOrchestrator:
                 "candidates_generated": len(candidates),
                 "unit_tests": tests,
                 "all_verification_traces": verification_traces,
+                "test_spec_retries": attempt,
             },
         )
 

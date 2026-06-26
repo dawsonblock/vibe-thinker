@@ -5,7 +5,7 @@ high-precision reasoning specialist (VibeThinker-3B with Claim-Level
 Reliability) and a generalist model, with a priority async job queue,
 bi-temporal audit logging, deterministic verifiers, and an interactive CLI.
 
-## Status: ALPHA SOFTWARE (v0.3.5)
+## Status: ALPHA SOFTWARE (v0.3.6)
 
 **This is alpha software.** It is a local reasoning control plane prototype,
 not a production reasoning engine. The following limitations are real and
@@ -280,7 +280,7 @@ The existing regex fallback parser is retained as defense-in-depth. When the
 in-process backend (below) is active, the same grammar is enforced natively via
 `LlamaGrammar`.
 
-## In-process specialist backend (v0.3.5)
+## In-process specialist backend (v0.3.5, pool in v0.3.6)
 
 For ultra-tiny specialists (e.g. ruvltra-claude-code-0.5b, ~398MB, ~100+ tok/s),
 HTTP overhead to a separate llama-server dominates inference time. The
@@ -291,13 +291,21 @@ network latency, zero JSON-serialization overhead.
 Auto-preferred over HTTP when configured; falls back to HTTP if
 `llama-cpp-python` is missing or the load fails.
 
+**Pool mode (v0.3.6)**: `--local-specialist-pool-size N` loads N separate
+`Llama` instances into a `queue.Queue` for true parallel inference. Each call
+checks out one instance, runs it in a thread executor, and returns it. For a
+0.5B model, 4 instances cost ~1.6GB and enable 4 concurrent trajectories —
+fixing the serialization bottleneck of single-instance mode. Default is 1
+(single instance + Lock, lowest memory).
+
 ```bash
 # Install (Apple Silicon, Metal acceleration):
 CMAKE_ARGS="-DGGML_METAL=on" pip install llama-cpp-python
 
-# Run with the 0.5B loaded in-process + the fast-specialist policy:
+# Run with 4 in-process instances + fast-specialist policy:
 python rfsn_cli.py \
   --local-specialist-model ~/models/ruvltra-claude-code-0.5b-q4_k_m.gguf \
+  --local-specialist-pool-size 4 \
   --fast-specialist \
   --generalist http://127.0.0.1:8081
 ```
@@ -306,10 +314,21 @@ python rfsn_cli.py \
 |---|---|---|
 | `--local-specialist-model` / `VIBE_THINKER_LOCAL_MODEL` | empty | `.gguf` path or `repo_id/filename.gguf` |
 | `--local-specialist-n-ctx` / `VIBE_THINKER_LOCAL_N_CTX` | 4096 | context window |
-| `--local-specialist-n-threads` / `VIBE_THINKER_LOCAL_N_THREADS` | 8 | CPU threads |
+| `--local-specialist-n-threads` / `VIBE_THINKER_LOCAL_N_THREADS` | 8 | CPU threads (divided across pool) |
+| `--local-specialist-pool-size` / `VIBE_THINKER_LOCAL_POOL_SIZE` | 1 | N parallel Llama instances |
 
-A single `Llama` instance is not thread-safe, so in-process calls are
-serialized with a `threading.Lock` inside the executor.
+## Test-feedback loop (v0.3.6)
+
+When ALL code candidates fail with `TEST_ERROR` (the test harness itself
+crashed — not an assertion failure), the generalist gets one retry to rewrite
+the tests with the error fed back as context. This distinguishes "bad tests"
+from "bad code":
+
+- `ASSERTION_FAILED` / `IMPORT_ERROR` → candidate is wrong, no retry
+- `TEST_ERROR` → test spec is broken, retry once with error feedback
+
+Max 2 attempts. If the retry also fails, returns best-effort unverified
+(score 0.0, fail-closed).
 
 ## Fast-specialist adaptive profile (v0.3.5)
 

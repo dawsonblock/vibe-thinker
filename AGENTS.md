@@ -1,12 +1,13 @@
 # vibe-thinker — project notes for agents
 
 ## Verify / test
-- Full suite: `python3 -m pytest -q` (366 tests, ~60s, no live servers needed)
+- Full suite: `python3 -m pytest -q` (385 tests, ~95s, no live servers needed)
 - Routing + REPL only: `python3 -m pytest tests/test_routing.py tests/test_repl.py -q`
 - Warm pool + code verifier: `python3 -m pytest tests/test_warm_pool.py tests/test_code_verifier.py -q`
 - Trajectory store: `python3 -m pytest tests/test_trajectory_store.py -q`
 - Grammar enforcement: `python3 -m pytest tests/test_clr_scoring.py::TestGrammarEnforcement -q`
-- In-process backend + fast-specialist: `python3 -m pytest tests/test_clr_scoring.py::TestInProcessBackend tests/test_clr_scoring.py::TestFastSpecialistPolicy -q`
+- In-process backend + pool + fast-specialist: `python3 -m pytest tests/test_clr_scoring.py::TestInProcessBackend tests/test_clr_scoring.py::TestInProcessPool tests/test_clr_scoring.py::TestFastSpecialistPolicy -q`
+- Test-feedback loop: `python3 -m pytest tests/test_routing.py::TestCodeSpecialistRouting -q`
 - Full-stack integration (needs live model servers): `python test_full_stack.py`
 - A benign `ResourceTracker.__del__` AttributeError prints after pytest exits on
   macOS Python 3.12 — it is multiprocessing teardown noise, NOT a test failure.
@@ -64,25 +65,44 @@ parser retained as defense-in-depth. When the in-process backend is active
 
 Health check: `curl http://127.0.0.1:<port>/health` → `{"status":"ok"}`
 
-## In-process specialist backend (v0.3.5)
+## In-process specialist backend (v0.3.5, pool in v0.3.6)
 Eliminates HTTP overhead for tiny specialists. When `--local-specialist-model`
 (or `VIBE_THINKER_LOCAL_MODEL`) is set, the GGUF is loaded directly into the
 orchestrator's Python process via `llama-cpp-python` and called through a
 thread executor (`loop.run_in_executor`). Auto-preferred over HTTP: if the
 load succeeds, `_call_model` bypasses aiohttp entirely. If `llama-cpp-python`
 is missing or the load fails, it warns and falls back to HTTP at `--vibe`.
-- A single `Llama` instance is NOT thread-safe, so calls are serialized with
-  `self._local_lock` (a `threading.Lock`) inside the executor. The asyncio
-  semaphore is not the gate for the in-process path.
+- **Pool mode (v0.3.6)**: `--local-specialist-pool-size N` loads N separate
+  `Llama` instances into a `queue.Queue`. Each call checks out one instance,
+  runs it in a thread executor, and returns it to the pool. This enables true
+  parallel inference — N trajectories run simultaneously on N instances. For a
+  0.5B model (~398MB each), 4 instances cost ~1.6GB. Threads are divided:
+  `n_threads // pool_size` per instance. Default is 1 (single instance + Lock).
+- **Single mode** (pool_size=1): one `Llama` instance, serialized with
+  `self._local_lock` (`threading.Lock`). No parallelism but lowest memory.
 - Grammar enforcement is wired in: `_CLAIMS_JSON_GRAMMAR` is pre-compiled once
   at init into a `LlamaGrammar` and reused on every extraction call.
 - Accepts a local `.gguf` path OR `repo_id/filename.gguf` (HF Hub download).
 - Optional dep: `llama-cpp-python`. On Apple Silicon build with Metal:
   `CMAKE_ARGS="-DGGML_METAL=on" pip install llama-cpp-python`
 - CLI: `--local-specialist-model`, `--local-specialist-n-ctx` (default 4096),
-  `--local-specialist-n-threads` (default 8). Env equivalents:
-  `VIBE_THINKER_LOCAL_MODEL`, `VIBE_THINKER_LOCAL_N_CTX`,
-  `VIBE_THINKER_LOCAL_N_THREADS`.
+  `--local-specialist-n-threads` (default 8), `--local-specialist-pool-size`
+  (default 1). Env equivalents: `VIBE_THINKER_LOCAL_MODEL`,
+  `VIBE_THINKER_LOCAL_N_CTX`, `VIBE_THINKER_LOCAL_N_THREADS`,
+  `VIBE_THINKER_LOCAL_POOL_SIZE`.
+
+## Test-feedback loop (v0.3.6)
+In `_run_code_specialist_verified`, if ALL candidates fail with `TEST_ERROR`
+(the test harness itself crashed — e.g. the test references a function the
+solution doesn't define, or the test has a syntax error), the generalist gets
+ONE retry to rewrite the tests with the error fed back as context. This
+distinguishes "bad tests" from "bad code":
+- `ASSERTION_FAILED` = candidate is wrong (tests ran, code gave wrong answer) → no retry
+- `IMPORT_ERROR` = candidate code failed to define/import → no retry
+- `TEST_ERROR` = the test spec itself is broken → retry once with feedback
+The retry prompt includes the error message so the generalist can fix the
+specific problem. Max 2 attempts (initial + 1 retry). If the retry also fails,
+returns best-effort unverified (score 0.0, fail-closed).
 
 ## Fast-specialist adaptive profile (v0.3.5)
 `make_fast_specialist_policy(k=15)` returns an `AdaptivePolicy(3, 5, max_k=15)`

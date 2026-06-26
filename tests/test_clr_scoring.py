@@ -635,3 +635,152 @@ class TestInProcessBackend:
             lock.__exit__.assert_called_once()
 
 
+class TestInProcessPool:
+    """Tests for the in-process Llama instance pool (true parallelism).
+
+    When local_pool_size > 1, N separate Llama instances are loaded into a
+    queue.Queue. Each call checks out one instance, runs it in a thread
+    executor, and returns it to the pool. This enables true parallel inference
+    (a single Llama instance is not thread-safe).
+    """
+
+    def test_pool_size_defaults_to_1(self, clr):
+        """Default is single-instance mode (no pool)."""
+        assert clr._local_pool_size == 1
+        assert clr._local_llm_pool is None
+
+    def test_init_pool_mode_loads_n_instances(self, tmp_path):
+        """pool_size > 1 loads N instances into a queue.Queue."""
+        import queue as queue_mod
+        gguf = tmp_path / "tiny.gguf"
+        gguf.write_bytes(b"fake")
+        with patch.dict("sys.modules", {
+            "llama_cpp": MagicMock(),
+            "llama_cpp.llama_grammar": MagicMock(),
+        }):
+            import sys
+            llama_mod = sys.modules["llama_cpp"]
+            # Each call to Llama() returns a distinct mock instance
+            instances = [MagicMock(name=f"llm_{i}") for i in range(4)]
+            llama_mod.Llama = MagicMock(side_effect=instances)
+            llama_mod.LlamaGrammar = MagicMock()
+
+            clr = VibeThinkerCLRAsync(
+                server_url="http://localhost:0", k=8,
+                local_model=str(gguf),
+                local_pool_size=4,
+                local_n_threads=8,
+            )
+        assert clr.backend == "in-process-pool"
+        assert clr._local_llm is None  # single-instance not used in pool mode
+        assert clr._local_llm_pool is not None
+        assert clr._local_llm_pool.qsize() == 4
+        assert clr._local_pool_size == 4
+        # Llama() was called 4 times (once per instance)
+        assert llama_mod.Llama.call_count == 4
+
+    def test_pool_partial_load_failure_keeps_loaded_instances(self, tmp_path):
+        """If some instances fail to load, the pool keeps the ones that worked."""
+        gguf = tmp_path / "tiny.gguf"
+        gguf.write_bytes(b"fake")
+        with patch.dict("sys.modules", {
+            "llama_cpp": MagicMock(),
+            "llama_cpp.llama_grammar": MagicMock(),
+        }):
+            import sys
+            llama_mod = sys.modules["llama_cpp"]
+            # First 2 succeed, 3rd fails, 4th succeeds
+            good = MagicMock(name="good")
+            llama_mod.Llama = MagicMock(side_effect=[
+                good, good, RuntimeError("oom"), good,
+            ])
+            llama_mod.LlamaGrammar = MagicMock()
+
+            clr = VibeThinkerCLRAsync(
+                server_url="http://localhost:0", k=8,
+                local_model=str(gguf),
+                local_pool_size=4,
+            )
+        assert clr.backend == "in-process-pool"
+        assert clr._local_pool_size == 3  # only 3 loaded successfully
+        assert clr._local_llm_pool.qsize() == 3
+
+    def test_pool_all_load_failures_fall_back_to_http(self, tmp_path):
+        """If ALL pool instances fail to load, fall back to HTTP."""
+        gguf = tmp_path / "tiny.gguf"
+        gguf.write_bytes(b"fake")
+        with patch.dict("sys.modules", {
+            "llama_cpp": MagicMock(),
+            "llama_cpp.llama_grammar": MagicMock(),
+        }):
+            import sys
+            llama_mod = sys.modules["llama_cpp"]
+            llama_mod.Llama = MagicMock(side_effect=RuntimeError("oom"))
+            llama_mod.LlamaGrammar = MagicMock()
+
+            clr = VibeThinkerCLRAsync(
+                server_url="http://localhost:0", k=8,
+                local_model=str(gguf),
+                local_pool_size=3,
+            )
+        assert clr.backend == "http"
+        assert clr._local_llm_pool is None
+        assert clr._local_llm is None
+
+    @pytest.mark.asyncio
+    async def test_pool_call_checks_out_and_returns_instance(self, clr):
+        """Pool mode: _call_model checks out an instance and returns it."""
+        import queue as queue_mod
+        fake_llm = MagicMock(name="pool_llm")
+        fake_llm.return_value = {"choices": [{"text": "pool reply"}]}
+        clr._local_llm_pool = queue_mod.Queue()
+        clr._local_llm_pool.put(fake_llm)
+        clr._local_pool_size = 1
+        clr._local_llm = None
+        clr.backend = "in-process-pool"
+
+        result = await clr._call_model(MagicMock(), "prompt", max_tokens=50)
+        assert result == "pool reply"
+        fake_llm.assert_called_once()
+        # The instance was returned to the pool
+        assert clr._local_llm_pool.qsize() == 1
+
+    @pytest.mark.asyncio
+    async def test_pool_concurrent_calls_use_different_instances(self, clr):
+        """Two concurrent calls check out two different instances from the pool."""
+        import asyncio as aio
+        import queue as queue_mod
+        llm1 = MagicMock(name="llm1")
+        llm1.return_value = {"choices": [{"text": "reply1"}]}
+        llm2 = MagicMock(name="llm2")
+        llm2.return_value = {"choices": [{"text": "reply2"}]}
+        clr._local_llm_pool = queue_mod.Queue()
+        clr._local_llm_pool.put(llm1)
+        clr._local_llm_pool.put(llm2)
+        clr._local_pool_size = 2
+        clr._local_llm = None
+        clr.backend = "in-process-pool"
+
+        # Fire both concurrently — they should each get a different instance
+        results = await aio.gather(
+            clr._call_model(MagicMock(), "p1", max_tokens=10),
+            clr._call_model(MagicMock(), "p2", max_tokens=10),
+        )
+        assert set(results) == {"reply1", "reply2"}
+        llm1.assert_called_once()
+        llm2.assert_called_once()
+        # Both returned to pool
+        assert clr._local_llm_pool.qsize() == 2
+
+    @pytest.mark.asyncio
+    async def test_pool_empty_choices_raises_runtime_error(self, clr):
+        """Pool mode: empty choices list raises RuntimeError, not IndexError."""
+        import queue as queue_mod
+        fake_llm = MagicMock(return_value={"choices": []})
+        clr._local_llm_pool = queue_mod.Queue()
+        clr._local_llm_pool.put(fake_llm)
+        clr.backend = "in-process-pool"
+        with pytest.raises(RuntimeError, match="empty content"):
+            await clr._call_model(MagicMock(), "prompt", max_tokens=10)
+
+

@@ -371,3 +371,174 @@ class TestCodeSpecialistRouting:
     def test_extract_python_block_without_fence(self):
         assert HybridReasoningOrchestrator._extract_python_block("def foo(): pass") == "def foo(): pass"
 
+    @pytest.mark.asyncio
+    async def test_test_error_triggers_test_spec_retry(self):
+        """When ALL candidates fail with TEST_ERROR, the generalist gets one
+        retry to rewrite the tests with error feedback."""
+        o = HybridReasoningOrchestrator(
+            vibe_endpoint="http://localhost:0",
+            generalist_endpoint="http://localhost:0",
+            code_specialist_endpoint="http://127.0.0.1:8082",
+            code_candidates=2,
+            use_clr=True,
+            use_embedding_router=False,
+            use_clr_cache=False,
+            use_trajectory_store=False,
+        )
+        # First test spec is broken, second is fixed
+        o._generate_test_spec = AsyncMock(
+            side_effect=["assert nonexistent_func() == 1", "assert square(2) == 4"]
+        )
+        o._call_code_specialist = AsyncMock(
+            return_value="```python\ndef square(n): return n*n\n```"
+        )
+        o.code_verifier = MagicMock()
+        # First attempt: all fail with TEST_ERROR (test references missing func)
+        # Second attempt: candidate passes
+        o.code_verifier.verify = AsyncMock(side_effect=[
+            VerificationResult(
+                verified=False, score=0.0, method="unit_tests",
+                error="TEST_ERROR: name 'nonexistent_func' is not defined",
+            ),
+            VerificationResult(
+                verified=False, score=0.0, method="unit_tests",
+                error="TEST_ERROR: name 'nonexistent_func' is not defined",
+            ),
+            # Second attempt (with fixed tests) — passes
+            VerificationResult(
+                verified=True, score=1.0, method="unit_tests",
+            ),
+        ])
+
+        result = await o.run("Write a Python function to square a number")
+        assert result.route_taken == "code_specialist_verified"
+        assert result.clr_score == 1.0
+        # Test spec was generated twice (initial + retry)
+        assert o._generate_test_spec.await_count == 2
+        # The retry prompt should contain the error feedback
+        second_call_args = o._generate_test_spec.call_args_list[1][0][0]
+        assert "TEST_ERROR" in second_call_args
+
+    @pytest.mark.asyncio
+    async def test_assertion_failure_does_not_trigger_retry(self):
+        """ASSERTION_FAILED is a candidate problem, not a test problem — no retry."""
+        o = HybridReasoningOrchestrator(
+            vibe_endpoint="http://localhost:0",
+            generalist_endpoint="http://localhost:0",
+            code_specialist_endpoint="http://127.0.0.1:8082",
+            code_candidates=2,
+            use_clr=True,
+            use_embedding_router=False,
+            use_clr_cache=False,
+            use_trajectory_store=False,
+        )
+        o._generate_test_spec = AsyncMock(return_value="assert square(2) == 4")
+        o._call_code_specialist = AsyncMock(
+            return_value="```python\ndef square(n): return n+1\n```"
+        )
+        o.code_verifier = MagicMock()
+        o.code_verifier.verify = AsyncMock(return_value=VerificationResult(
+            verified=False, score=0.0, method="unit_tests",
+            error="ASSERTION_FAILED: assert 3 == 4",
+        ))
+
+        result = await o.run("Write a Python function to square a number")
+        assert result.route_taken == "code_specialist_unverified"
+        assert result.clr_score == 0.0
+        # No retry — ASSERTION_FAILED is a code problem
+        assert o._generate_test_spec.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_import_error_does_not_trigger_retry(self):
+        """IMPORT_ERROR is a candidate problem (code failed to define), no retry."""
+        o = HybridReasoningOrchestrator(
+            vibe_endpoint="http://localhost:0",
+            generalist_endpoint="http://localhost:0",
+            code_specialist_endpoint="http://127.0.0.1:8082",
+            code_candidates=2,
+            use_clr=True,
+            use_embedding_router=False,
+            use_clr_cache=False,
+            use_trajectory_store=False,
+        )
+        o._generate_test_spec = AsyncMock(return_value="assert square(2) == 4")
+        o._call_code_specialist = AsyncMock(
+            return_value="```python\nsyntax error here\n```"
+        )
+        o.code_verifier = MagicMock()
+        o.code_verifier.verify = AsyncMock(return_value=VerificationResult(
+            verified=False, score=0.0, method="unit_tests",
+            error="IMPORT_ERROR: invalid syntax",
+        ))
+
+        result = await o.run("Write a Python function to square a number")
+        assert result.route_taken == "code_specialist_unverified"
+        assert result.clr_score == 0.0
+        assert o._generate_test_spec.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_test_error_retry_only_once(self):
+        """If the retry also produces TEST_ERROR, no second retry (max 2 attempts)."""
+        o = HybridReasoningOrchestrator(
+            vibe_endpoint="http://localhost:0",
+            generalist_endpoint="http://localhost:0",
+            code_specialist_endpoint="http://127.0.0.1:8082",
+            code_candidates=1,
+            use_clr=True,
+            use_embedding_router=False,
+            use_clr_cache=False,
+            use_trajectory_store=False,
+        )
+        o._generate_test_spec = AsyncMock(
+            side_effect=["assert bad1()", "assert bad2()"]
+        )
+        o._call_code_specialist = AsyncMock(
+            return_value="```python\ndef f(): pass\n```"
+        )
+        o.code_verifier = MagicMock()
+        o.code_verifier.verify = AsyncMock(return_value=VerificationResult(
+            verified=False, score=0.0, method="unit_tests",
+            error="TEST_ERROR: name 'bad1' is not defined",
+        ))
+
+        result = await o.run("Write a function")
+        assert result.route_taken == "code_specialist_unverified"
+        assert result.clr_score == 0.0
+        # Exactly 2 attempts (initial + 1 retry), not 3
+        assert o._generate_test_spec.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_partial_test_error_does_not_trigger_retry(self):
+        """If only SOME candidates fail with TEST_ERROR (not all), no retry."""
+        o = HybridReasoningOrchestrator(
+            vibe_endpoint="http://localhost:0",
+            generalist_endpoint="http://localhost:0",
+            code_specialist_endpoint="http://127.0.0.1:8082",
+            code_candidates=2,
+            use_clr=True,
+            use_embedding_router=False,
+            use_clr_cache=False,
+            use_trajectory_store=False,
+        )
+        o._generate_test_spec = AsyncMock(return_value="assert square(2) == 4")
+        o._call_code_specialist = AsyncMock(
+            return_value="```python\ndef square(n): return n*n\n```"
+        )
+        o.code_verifier = MagicMock()
+        # One TEST_ERROR, one ASSERTION_FAILED — not all TEST_ERROR
+        o.code_verifier.verify = AsyncMock(side_effect=[
+            VerificationResult(
+                verified=False, score=0.0, method="unit_tests",
+                error="TEST_ERROR: something",
+            ),
+            VerificationResult(
+                verified=False, score=0.0, method="unit_tests",
+                error="ASSERTION_FAILED: assert 5 == 4",
+            ),
+        ])
+
+        result = await o.run("Write a function to square a number")
+        assert result.route_taken == "code_specialist_unverified"
+        # No retry — not ALL were TEST_ERROR
+        assert o._generate_test_spec.await_count == 1
+

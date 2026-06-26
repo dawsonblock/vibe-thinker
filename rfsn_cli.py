@@ -344,6 +344,13 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--local-specialist-n-threads", type=int,
                    default=int(os.environ.get("VIBE_THINKER_LOCAL_N_THREADS", "8")),
                    help="CPU threads for the in-process specialist (default 8).")
+    p.add_argument("--local-specialist-pool-size", type=int,
+                   default=int(os.environ.get("VIBE_THINKER_LOCAL_POOL_SIZE", "1")),
+                   help="Number of in-process Llama instances to load for true "
+                        "parallel inference (default 1 = single instance + Lock). "
+                        "For a 0.5B model (~398MB each), 4 instances cost ~1.6GB "
+                        "and enable 4 concurrent trajectories. Each instance gets "
+                        "n_threads/pool_size CPU threads.")
     p.add_argument("--audit-log",
                    default=os.environ.get("RFSN_AUDIT_LOG", "rfsn_jobs_bitemporal.jsonl"),
                    help="Bi-temporal audit log path (empty disables logging)")
@@ -373,6 +380,7 @@ async def _amain() -> None:
         local_specialist_model=args.local_specialist_model or None,
         local_specialist_n_ctx=args.local_specialist_n_ctx,
         local_specialist_n_threads=args.local_specialist_n_threads,
+        local_specialist_pool_size=args.local_specialist_pool_size,
     )
     queue = JobQueue(
         orchestrator,
