@@ -5,7 +5,7 @@ high-precision reasoning specialist (VibeThinker-3B with Claim-Level
 Reliability) and a generalist model, with a priority async job queue,
 bi-temporal audit logging, deterministic verifiers, and an interactive CLI.
 
-## Status: ALPHA SOFTWARE (v0.3.2)
+## Status: ALPHA SOFTWARE (v0.3.4)
 
 **This is alpha software.** It is a local reasoning control plane prototype,
 not a production reasoning engine. The following limitations are real and
@@ -100,13 +100,13 @@ python test_full_stack.py
 | `vibe_clr_async.py` | Async parallel CLR wrapper (k trajectories, claim extraction, verification, scoring, fail-closed) |
 | `vibe_clr.py` | Synchronous facade over the async CLR (single reliability engine) |
 | `hybrid_orchestrator.py` | Routes between specialist, generalist, or hybrid path |
-| `persistent_cache.py` | Disk-backed route cache + semantic CLR result cache with strict promotion rules |
+| `persistent_cache.py` | Disk-backed route cache + semantic CLR result cache + verified trajectory store |
 | `rfsn_job_queue.py` | In-process async priority job queue with concurrency limit |
 | `bitemporal_log.py` | Bi-temporal JSONL audit log (valid_time + transaction_time, hash-chain, strict verification) |
 | `rfsn_cli.py` | Interactive CLI/REPL over the job queue (env var + CLI flag support) |
 | `scoring.py` | Separated confidence fields (model_confidence, claim_consistency, deterministic_verification) |
 | `verifiers/` | Deterministic verifier adapters (math, code, factual) |
-| `sandbox/` | Isolated code execution layer (Docker container, sbx microVM, local subprocess) |
+| `sandbox/` | Isolated code execution layer (Docker container, warm pool, sbx microVM, local subprocess) |
 | `math_solver.py` | Deterministic solver for simple math (arithmetic, sums, recurrences) — derives expected_answer for MathVerifier |
 | `test_demo.py` | Comprehensive test suite (no model servers needed) |
 | `test_full_stack.py` | Full-stack integration test (needs live servers) |
@@ -216,11 +216,12 @@ code tasks run through a sandbox-verified multi-candidate loop:
 1. **Generalist writes tests** — the generalist model produces unit-test
    `assert` statements for the query (the "Software Architect" step).
 2. **Code specialist generates N candidates** — ruvltra (or any configured
-   code model) generates `CODE_CANDIDATES` (default 3) solutions in parallel
-   with diverse temperatures.
+   code model) generates `CODE_CANDIDATES` (default 6) solutions in parallel
+   with diverse temperatures. Higher is better for fast 0.5B models.
 3. **Sandbox verification** — `CodeVerifier` runs each candidate against the
-   test spec in a hardened Docker container (`--network=none`, `--memory=128m`,
-   `--read-only`, `--cap-drop=ALL`).
+   test spec in a hardened Docker container (`--network=none`, `--read-only`,
+   `--cap-drop=ALL`, `--security-opt=no-new-privileges`). Uses the warm Docker
+   pool by default (2.5x faster than cold `docker run`).
 4. **First passing candidate wins** — the first candidate that prints
    `ALL_TESTS_PASSED` is returned with `clr_score=1.0`, `verified=True`.
 5. **Fail-closed** — if no candidate passes, the first candidate is returned
@@ -228,6 +229,54 @@ code tasks run through a sandbox-verified multi-candidate loop:
 
 Requires Docker running + `python:3.12-slim` image. Without Docker, the
 verifier fail-closes and the loop returns unverified best-effort (score 0.0).
+
+## Verified trajectory store (v0.3.4)
+
+Self-improving few-shot memory. When a deterministic verifier (MathVerifier,
+CodeVerifier) confirms an answer, the `(query, verified_answer, method, score,
+task_type)` tuple is stored semantically. On future similar queries, verified
+trajectories are retrieved as few-shot context and prepended to the model
+prompt — improving first-attempt success rate without weight updates.
+
+This is RAG over verified solutions, not fake "self-learning" weight updates.
+The system genuinely improves over time: each verified solution becomes a
+retrievable example for similar future problems.
+
+**Trust model (fail-closed):**
+- Only `verified=True` with deterministic verifiers are stored
+- `self_claims_only` and unverified results are **never** stored
+- Entries re-checked for trustworthiness on retrieval
+- `task_type` filtering prevents math examples polluting code queries
+- The store provides **context, not answers** — the verifier still must confirm
+
+Config: `RFSN_USE_TRAJECTORY_STORE` (default true), `TRAJECTORY_STORE_PATH`,
+`--no-trajectory-store` CLI flag.
+
+## Warm Docker pool (v0.3.4)
+
+`WarmDockerPool` keeps N containers running and uses `docker exec` instead of
+`docker run --rm` for each verification. Measured speedup: **2.5x** (0.494s →
+0.197s per verification).
+
+Same security hardening as cold runs: `--network=none`, `--read-only`,
+`--security-opt=no-new-privileges`, `--cap-drop=ALL`, `--pids-limit=64`,
+tmpfs `/tmp`. The `/tmp` directory is cleaned between executions via
+`find -delete` to prevent state leakage. Containers are recycled after 50
+uses to prevent resource accumulation.
+
+`select_executor` prefers the warm pool by default. Disable with
+`prefer_warm_pool=False`. The orchestrator manages the pool lifecycle via
+`start()` / `cleanup()`.
+
+## Grammar enforcement (v0.3.4)
+
+GBNF grammar passed to llama-server's `/completion` endpoint for CLR claim
+extraction. Forces valid JSON output: `{"claims": [...], "final_answer": "..."}`.
+This prevents small models from producing malformed JSON that causes trajectory
+scoring to fail — the main weakness of sub-3B models.
+
+Applied to the VibeThinker-3B extraction path (where JSON parsing happens).
+The existing regex fallback parser is retained as defense-in-depth.
 
 ## Cache promotion rules
 
@@ -243,11 +292,14 @@ Bad answers are never cached. The strict `should_cache()` policy rejects:
 ## Testing
 
 ```bash
-# Unit + integration tests (no model servers needed):
-python test_demo.py
+# Full suite (345 tests, no model servers needed):
+python3 -m pytest -q
 
-# With pytest:
-pytest tests/
+# Specific subsystems:
+python3 -m pytest tests/test_warm_pool.py -q          # warm Docker pool
+python3 -m pytest tests/test_trajectory_store.py -q    # verified trajectory store
+python3 -m pytest tests/test_clr_scoring.py -q         # CLR scoring + grammar
+python3 -m pytest tests/test_routing.py -q             # routing + code specialist
 
 # Full-stack test (needs live model servers):
 python test_full_stack.py
@@ -268,11 +320,10 @@ python test_full_stack.py
   specifications (`unit_tests` or `expected_output`). Running code without
   checking output is not verification.
 - The code verifier runs in a sandbox executor, not raw subprocess. By
-  default it uses Docker containers with `--network=none`, `--read-only`,
-  `--memory=128m`, and `--cap-drop=ALL`. If Docker is not available, it
-  tries sbx microVMs. If neither is available, it **refuses to verify**
-  rather than running untrusted code on the host. See `sandbox/README.md`
-  for the full isolation model and sbx setup instructions.
+  default it uses the warm Docker pool (pre-started containers with `docker exec`
+  for 2.5x speedup). Falls back to cold `docker run --rm`, then sbx microVMs.
+  If none are available, it **refuses to verify** rather than running untrusted
+  code on the host. See `sandbox/README.md` for the full isolation model.
 - The job queue is in-process only. For multi-process/multi-node, swap the
   dispatcher for RQ/Celery/Dramatiq.
 - The bi-temporal log has hash-chain integrity with strict verification
