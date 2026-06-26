@@ -1,0 +1,8 @@
+[package]
+name = "ruvllm_exo_probe"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ruvllm = "2.3.0"
+exo-federation = "0.1.1"

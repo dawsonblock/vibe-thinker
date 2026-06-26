@@ -280,6 +280,9 @@ class HybridReasoningOrchestrator:
         local_specialist_pool_size: int = 1,
         agentdb_url: Optional[str] = None,
         retrieval_backend: Optional["RetrievalBackend"] = _UNSET,
+        network_allowlist: Optional["NetworkAllowList"] = None,
+        dns_resolver: Optional[str] = None,
+        sandbox_image: Optional[str] = None,
     ):
         self.vibe_endpoint = vibe_endpoint.rstrip("/")
         self.generalist_endpoint = generalist_endpoint.rstrip("/")
@@ -317,6 +320,22 @@ class HybridReasoningOrchestrator:
         # _UNSET -> default CodeVerifier (safe, fail-closed sandbox).
         # None -> explicitly disabled (plain generation, no verification).
         self.code_verifier = CodeVerifier() if code_verifier is _UNSET else code_verifier
+        # Apply the network allow-list to the code verifier's executor
+        # (v0.4.0). When set, the Docker sandbox uses iptables egress
+        # filtering instead of --network=none. Only DockerSandboxExecutor
+        # supports allow-lists; WarmDockerPool and others ignore it.
+        if network_allowlist is not None and self.code_verifier is not None:
+            executor = getattr(self.code_verifier, "executor", None)
+            if executor is not None and hasattr(executor, "set_allowlist"):
+                executor.set_allowlist(network_allowlist)
+                if dns_resolver and hasattr(executor, "set_dns_resolver"):
+                    executor.set_dns_resolver(dns_resolver)
+                print(f"[Orchestrator] Network allow-list applied to "
+                      f"{type(executor).__name__}"
+                      + (f" (DNS restricted to {dns_resolver})" if dns_resolver else ""))
+            # Override the sandbox image if specified.
+            if sandbox_image and executor is not None and hasattr(executor, "image"):
+                executor.image = sandbox_image
         # If the verifier's executor is a WarmDockerPool, start it eagerly so
         # the first code task doesn't pay the cold-start cost.
         if self.code_verifier is not None and hasattr(self.code_verifier, "executor"):

@@ -29,3 +29,7 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+# Rust build artifacts (vendored sources + target are too large for git)
+rust/**/target/
+rust/**/vendor/

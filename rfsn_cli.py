@@ -39,6 +39,7 @@ import argparse
 import asyncio
 import os
 import shlex
+import sys
 
 from hybrid_orchestrator import HybridReasoningOrchestrator
 from rfsn_job_queue import JobQueue
@@ -78,6 +79,45 @@ def _build_retrieval_backend(args) -> "object | None":
         print(f"[CLI] Active retrieval enabled: {backend.name} — "
               f"factual tasks will fetch real sources for NLI verification")
     return backend
+
+
+def _build_network_allowlist(args) -> "object | None":
+    """Build a NetworkAllowList from CLI args / env vars.
+
+    Precedence: --network-allowlist-file > --network-allowlist > env.
+    Returns None when no allow-list is configured (the sandbox uses
+    --network=none, unchanged behavior).
+    """
+    from sandbox.network_allowlist import NetworkAllowList
+
+    file_path = args.network_allowlist_file or None
+    spec = args.network_allowlist or None
+
+    if file_path:
+        if not os.path.exists(file_path):
+            print(f"[CLI] Warning: --network-allowlist-file {file_path} "
+                  f"not found — no allow-list (deny all)")
+            return None
+        allowlist = NetworkAllowList.from_file(file_path)
+        source = f"file:{file_path}"
+    elif spec:
+        allowlist = NetworkAllowList.from_string(spec)
+        source = "CLI string"
+    else:
+        return None
+
+    if allowlist.is_empty:
+        print(f"[CLI] Network allow-list is empty — deny all egress "
+              f"(same as --network=none)")
+    else:
+        summary = allowlist.summary()
+        print(f"[CLI] Network allow-list active ({source}): "
+              f"{summary['entry_count']} entries "
+              f"({len(summary['domains'])} domains, "
+              f"{len(summary['ips'])} IPs, "
+              f"{len(summary['cidrs'])} CIDRs, "
+              f"{len(summary['wildcards'])} wildcards)")
+    return allowlist
 
 
 # ----------------------------- command parsing ----------------------------- #
@@ -478,6 +518,36 @@ def build_argparser() -> argparse.ArgumentParser:
                    default=os.environ.get("SEARCHAPI_API_KEY", ""),
                    help="SearchApi.io API key for factual retrieval (alternative "
                         "to --serper-key). Same fail-closed behavior.")
+    # --- Network allow-list (v0.4.0) ---
+    # When set, code sandbox execution uses --network=default + iptables
+    # egress filtering instead of --network=none. Only allow-listed
+    # destinations (domains, IPs, CIDRs) are reachable from the sandbox.
+    # Fail-closed: empty allow-list = deny all (same as --network=none).
+    p.add_argument("--network-allowlist",
+                   default=os.environ.get("RFSN_NETWORK_ALLOWLIST", ""),
+                   help="Comma-separated list of allowed network destinations "
+                        "for sandbox egress (e.g. 'pypi.org:443,10.0.0.0/24'). "
+                        "When set, the Docker sandbox uses iptables filtering "
+                        "instead of --network=none. Empty = deny all (default).")
+    p.add_argument("--network-allowlist-file",
+                   default=os.environ.get("RFSN_NETWORK_ALLOWLIST_FILE", ""),
+                   help="Path to a file with allowed network destinations "
+                        "(one per line, # comments supported). Alternative to "
+                        "--network-allowlist for long lists.")
+    p.add_argument("--dns-resolver",
+                   default=os.environ.get("RFSN_DNS_RESOLVER", ""),
+                   help="IP address of a DNS resolver to restrict sandbox DNS "
+                        "queries to (e.g. '8.8.8.8'). When set with "
+                        "--network-allowlist, only this resolver can receive "
+                        "DNS queries, preventing DNS-based data exfiltration. "
+                        "Empty = allow DNS to any resolver (default).")
+    p.add_argument("--sandbox-image",
+                   default=os.environ.get("RFSN_SANDBOX_IMAGE",
+                                          "vibe-thinker-sandbox:latest"),
+                   help="Docker image for the code sandbox. Defaults to the "
+                        "purpose-built vibe-thinker-sandbox image with iptables "
+                        "baked in. Build it with: docker build -f "
+                        "sandbox/Dockerfile -t vibe-thinker-sandbox:latest .")
     p.add_argument("--embedding-router", dest="use_embedding_router",
                    action="store_true",
                    help="Use embedding-based semantic router (default)")
@@ -527,6 +597,9 @@ async def _amain() -> None:
         local_specialist_pool_size=args.local_specialist_pool_size,
         agentdb_url=args.agentdb_url or None,
         retrieval_backend=_build_retrieval_backend(args),
+        network_allowlist=_build_network_allowlist(args),
+        dns_resolver=args.dns_resolver or None,
+        sandbox_image=args.sandbox_image or None,
     )
 
     # --- Audit-log signing (v0.3.9) ---
@@ -567,10 +640,139 @@ async def _amain() -> None:
 
 
 def main() -> None:
+    # --- finalize-migration subcommand (v0.4.0) ---
+    # Detected as the first argument before the normal REPL argparse. This
+    # avoids needing subparsers (which would complicate the existing REPL
+    # arg structure). When invoked, runs the migration finalization and
+    # exits without starting the REPL.
+    if len(sys.argv) > 1 and sys.argv[1] == "finalize-migration":
+        sys.argv = [sys.argv[0]] + sys.argv[2:]  # shift for argparse
+        sys.exit(_run_finalize_migration())
+
     try:
         asyncio.run(_amain())
     except KeyboardInterrupt:
         pass
+
+
+def _run_finalize_migration() -> int:
+    """Finalize the AgentDB shadow-mode migration.
+
+    Verifies that AgentDB has sufficient recall compared to the local
+    store, then switches the orchestrator config to AgentDB-only by
+    archiving the local JSON files (renamed to .bak). Fail-closed: if
+    recall fails or AgentDB is unreachable, refuses to finalize (no
+    data loss).
+
+    Usage:
+        python rfsn_cli.py finalize-migration \\
+            --agentdb-url http://127.0.0.1:8088 \\
+            --clr-cache-path ./clr_cache.json \\
+            --trajectory-store-path ./trajectories.json
+    """
+    p = argparse.ArgumentParser(
+        prog="rfsn_cli.py finalize-migration",
+        description="Finalize AgentDB migration: verify recall, archive "
+                    "local JSON files. Fail-closed if recall is insufficient."
+    )
+    p.add_argument("--agentdb-url", required=True,
+                   help="AgentDB HTTP endpoint (must be reachable)")
+    p.add_argument("--collection", default="vibe_thinker",
+                   help="AgentDB collection name (default: vibe_thinker)")
+    p.add_argument("--clr-cache-path", default="",
+                   help="Path to the CLR result cache JSON file to archive")
+    p.add_argument("--trajectory-store-path", default="",
+                   help="Path to the trajectory store JSON file to archive")
+    p.add_argument("--recall-threshold", type=float, default=0.95,
+                   help="Minimum recall to finalize (default 0.95)")
+    p.add_argument("--sample-size", type=int, default=20,
+                   help="Sample size for recall check (default 20)")
+    p.add_argument("--archive-suffix", default=".bak",
+                   help="Suffix for archived local files (default .bak)")
+    p.add_argument("--force", action="store_true",
+                   help="Finalize even if recall is below threshold "
+                        "(DANGEROUS — not recommended)")
+    args = p.parse_args()
+
+    from vector_store import AgentDBVectorStore
+
+    clr_path = args.clr_cache_path or None
+    traj_path = args.trajectory_store_path or None
+    if not clr_path and not traj_path:
+        print("Error: at least one of --clr-cache-path or "
+              "--trajectory-store-path must be set")
+        return 1
+
+    agentdb = AgentDBVectorStore(args.agentdb_url, args.collection)
+
+    # Check reachability via test upsert+delete (count() returns 0 both
+    # for "empty" and "unreachable" — fail-closed).
+    import importlib.util
+    _mig_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "scripts", "migrate_to_agentdb.py",
+    )
+    _spec = importlib.util.spec_from_file_location("migrate_to_agentdb", _mig_path)
+    _mig_mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_mig_mod)
+
+    if not _mig_mod._check_agentdb_reachable(agentdb):
+        print(f"Error: AgentDB at {args.agentdb_url} is unreachable "
+              f"— refusing to finalize (fail-closed, no data loss)")
+        return 1
+    count = agentdb.count()
+    print(f"[Finalize] AgentDB connected: {count} entries in collection "
+          f"'{args.collection}'")
+
+    # Import the recall verification from the migration script (already
+    # loaded above for the reachability check).
+    verify_recall = _mig_mod.verify_recall
+    print(f"\n=== Recall verification ===")
+    vres = verify_recall(
+        agentdb, clr_path, traj_path,
+        sample_size=args.sample_size,
+        recall_threshold=args.recall_threshold,
+    )
+    print(f"\n[Finalize] Overall recall: {vres['overall_recall']:.1%} "
+          f"(threshold: {args.recall_threshold:.1%})")
+
+    if not vres["passed"] and not args.force:
+        print("[Finalize] FAILED — recall is below threshold. "
+              "Refusing to finalize (no data loss).")
+        print("[Finalize] Fix AgentDB configuration and re-run the "
+              "backfill (scripts/migrate_to_agentdb.py), then retry.")
+        print("[Finalize] To override (DANGEROUS), use --force.")
+        return 2
+
+    if not vres["passed"] and args.force:
+        print("[Finalize] WARNING: --force used with recall below "
+              "threshold — proceeding anyway (DATA LOSS RISK)")
+
+    # Archive the local JSON files.
+    archived = []
+    for path in [clr_path, traj_path]:
+        if path and os.path.exists(path):
+            archive_path = path + args.archive_suffix
+            # Don't overwrite an existing archive.
+            if os.path.exists(archive_path):
+                print(f"[Finalize] Archive {archive_path} already exists — "
+                      f"skipping (rename it manually if you want to re-archive)")
+                continue
+            os.rename(path, archive_path)
+            archived.append((path, archive_path))
+            print(f"[Finalize] Archived {path} -> {archive_path}")
+
+    if not archived:
+        print("[Finalize] No local files to archive (they may not exist)")
+    else:
+        print(f"\n[Finalize] Migration complete! {len(archived)} file(s) "
+              f"archived. AgentDB is now the primary vector store.")
+        print("[Finalize] Restart the orchestrator WITHOUT --agentdb-url's "
+              "shadow primary to use AgentDB-only mode.")
+        print("[Finalize] To roll back, rename the .bak files back and "
+              "restart with --agentdb-url (shadow mode).")
+
+    return 0
 
 
 if __name__ == "__main__":

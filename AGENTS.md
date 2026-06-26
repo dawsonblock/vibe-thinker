@@ -1,7 +1,7 @@
 # vibe-thinker — project notes for agents
 
 ## Verify / test
-- Full suite: `python3 -m pytest -q` (579 tests, ~90s, no live servers needed)
+- Full suite: `python3 -m pytest -q` (714 tests, ~120s, no live servers needed)
 - Routing + REPL only: `python3 -m pytest tests/test_routing.py tests/test_repl.py -q`
 - Warm pool + code verifier: `python3 -m pytest tests/test_warm_pool.py tests/test_code_verifier.py -q`
 - Trajectory store: `python3 -m pytest tests/test_trajectory_store.py -q`
@@ -11,6 +11,11 @@
 - Iterative code repair: `python3 -m pytest tests/test_routing.py::TestCodeSpecialistRouting -k repair -q`
 - DPO/SFT exporter: `python3 -m pytest tests/test_export_dpo.py -q`
 - Active retrieval: `python3 -m pytest tests/test_retrieval.py -q`
+- Schema + Logic verifiers: `python3 -m pytest tests/test_schema_verifier.py -q`
+- Dynamic compute limits: `python3 -m pytest tests/test_compute_limits.py -q`
+- Trajectory synthesis: `python3 -m pytest tests/test_trajectory_synthesis.py -q`
+- AgentDB migration: `python3 -m pytest tests/test_migration.py -q`
+- Network allow-listing: `python3 -m pytest tests/test_network_allowlist.py -q`
 - Sandbox nonce anti-spoofing: `python3 -m pytest tests/test_code_verifier.py::TestNonceAntiSpoofing -q`
 - Bi-temporal log HMAC signatures: `python3 -m pytest tests/test_bitemporal_log.py::TestHmacSignatures -q`
 - Ed25519 + signer abstraction: `python3 -m pytest tests/test_signers.py -q`
@@ -213,6 +218,220 @@ tasks never trigger retrieval. The orchestrator's `__init__` accepts
 `--serper-key` / `SERPER_API_KEY` env, `--searchapi-key` /
 `SEARCHAPI_API_KEY` env. When set, the CLI prints which backend is active.
 Keys are never logged.
+
+## Schema + Logic verifiers (v0.4.0)
+Two new deterministic verifiers expand the set of tasks that can be
+independently verified beyond math, code, and factual.
+
+### SchemaVerifier (`verifiers/schema_verifier.py`)
+Validates structural conformance of an answer against a JSON-schema subset
+or regex pattern. Deterministic — no model calls.
+- Supported context keys: `schema` (JSON-schema dict with type, properties,
+  required, items, enum, minimum, maximum, minLength, maxLength, pattern,
+  additionalProperties), `pattern` (regex fullmatch), `expected_keys`
+  (shortcut for required keys), `format` (`"json"` default, `"yaml"`,
+  `"text"`).
+- All provided checks must pass (AND semantics). No schema/pattern/keys ->
+  `verified=False` (honest — no criteria). Parse error -> `verified=False`
+  with the error. Match -> `verified=True`, score 1.0.
+- JSON uses stdlib `json`; YAML requires optional PyYAML (fail-closed when
+  absent). `bool` is correctly excluded from `integer`/`number` checks.
+- Wired into `select_verifier(task_type="schema")`.
+
+### LogicVerifier (`verifiers/logic_verifier.py`)
+Validates logical constraints via Z3/SMT. Z3 is a proof tool, not a model —
+satisfaction is mathematical, not approximate.
+- Context keys: `constraints` (list of Z3 assertion strings, e.g.
+  `["x > 0", "x + y == 10"]`), `variables` (name -> sort: `"Int"`,
+  `"Real"`, `"Bool"`), `values` (name -> numeric, the answer's values).
+- Trust model: Z3 not installed -> `verified=False`, method
+  `"smt_unavailable"` (never falls back to a weaker check). No constraints
+  -> `verified=False`. UNSAT -> `verified=False` (problem is infeasible).
+  SAT + values satisfy all constraints -> `verified=True`, score 1.0, with
+  the Z3 model as evidence.
+- Requires optional `z3-solver` package: `pip install z3-solver`.
+- Wired into `select_verifier(task_type="logic")`.
+
+## Dynamic compute limits (v0.4.0)
+The sandbox's memory and timeout were previously hardcoded (128m / 5.0s for
+code, 10s for the verifier). Now `route_structured` outputs a
+`compute_limits` dict that the CodeVerifier uses to size the sandbox
+dynamically — a data-processing script gets 512m / 30s, a one-liner gets
+64m / 5s.
+- `_suggest_compute_limits(query, task_type)` starts from per-task-type
+  defaults, then bumps memory (128m -> 256m -> 512m) and timeout (+10s per
+  keyword, capped at 60s) when heavy-computation keywords are detected
+  (dataframe, pandas, numpy, torch, matrix, recursive, simulation, etc.).
+- The CodeVerifier reads `compute_limits` from the verifier context and
+  passes `timeout`/`memory_limit` to the executor. Absent compute_limits ->
+  uses the verifier's own defaults (backward-compatible).
+- `_build_verifier_context` passes `compute_limits` into the context for
+  code tasks only (math/factual/schema/logic don't need sandbox sizing).
+
+## Trajectory synthesis / memory pruning (v0.4.0)
+The verified trajectory store accumulates overlapping solutions over time.
+`synthesize_trajectories` finds clusters of highly-similar verified
+trajectories (cosine similarity >= 0.85), asks the generalist to distill
+each cluster into a single "master trajectory" (a general rule capturing
+the common pattern), stores the master, and removes the raw entries —
+pruning memory without losing the distilled knowledge.
+- `VerifiedTrajectoryStore.find_clusters()` — greedy agglomerative
+  clustering on the embedding matrix. Returns clusters of >= min_cluster_size
+  (default 3) entries above the similarity threshold.
+- `VerifiedTrajectoryStore.store_synthesized()` — stores the master with
+  `verification_method="synthesized"`, `verified=False`, `synthesized=True`,
+  and `source_queries` for provenance.
+- `VerifiedTrajectoryStore.remove_entries()` — removes the raw entries and
+  rebuilds the embedding matrix.
+- `HybridReasoningOrchestrator.synthesize_trajectories()` — the full loop:
+  find clusters, call generalist with `_SYNTHESIS_PROMPT`, store masters,
+  remove raws. Bounded by `max_clusters` (default 5). Fail-closed: if the
+  generalist fails for a cluster, the raw entries are kept (no data loss).
+- **Trust model (no epistemic contamination):** synthesized masters are
+  `verified=False` with `verification_method="synthesized"`. The existing
+  `is_cache_entry_trustworthy` check in `retrieve()` filters them out —
+  they are NEVER served as few-shot "verified examples." They exist for
+  provenance/audit and potential future re-verification, not as substitute
+  evidence. Only independently-verified entries are eligible for clustering;
+  synthesized entries are never re-synthesized.
+
+## AgentDB migration script + finalize-migration (v0.4.0)
+One-shot backfill and zero-downtime migration from local JSON cache files
+to AgentDB. The `ShadowVectorStore` (dual-write, primary-read-with-fallback)
+was already implemented in v0.3.9; this adds the operational tooling to
+actually perform the migration.
+
+### `scripts/migrate_to_agentdb.py`
+Reads all entries from the local CLR cache and trajectory store JSON files
+and pushes their embeddings + metadata into AgentDB. After backfill, runs
+a recall check comparing local vs AgentDB search results.
+- `--dry-run`: report what would be migrated without writing to AgentDB
+- `--verify-only`: skip backfill, just check recall
+- `--recall-threshold`: minimum recall to pass (default 0.95)
+- Fail-closed: if AgentDB is unreachable, exits with code 1 (no data loss).
+  If recall fails below threshold, exits with code 2 (refuses to finalize).
+  Does NOT modify the local JSON files — read-only.
+
+### `rfsn_cli.py finalize-migration`
+Verifies AgentDB recall, then archives the local JSON files (renamed to
+`.bak`) to complete the cut-over to AgentDB-only.
+- Fail-closed: if recall is below threshold, refuses to finalize (exit 2)
+  and does NOT archive local files (no data loss).
+- `--force`: override the recall check (DANGEROUS — data loss risk).
+- To roll back: rename `.bak` files back and restart with `--agentdb-url`
+  (shadow mode).
+
+## Network allow-listing (v0.4.0, hardened)
+Granular egress filtering for the Docker sandbox. Replaces the binary
+`--network=none` / `--network=default` choice with iptables-based
+allow-listing: only specified domains, IPs, and CIDRs are reachable from
+the sandbox.
+
+**IMPORTANT — current status is "best-effort egress restriction":**
+The iptables-based approach provides defense-in-depth but is NOT a
+complete network security boundary. Known limitations:
+- Domain-to-IP resolution is done at rule-generation time. CDN IPs
+  (pypi.org, etc.) change, so rules may break or over-allow shared
+  CDN infrastructure. For reliable domain allow-listing, use an
+  HTTP(S) proxy that enforces SNI/Host headers instead of IP-based
+  rules.
+- Wildcard domains (`*.pypi.org`) rely on the DNS allow rule and have
+  no IP-level filtering.
+- DNS is allowed (to a configurable resolver) — this is an exfil
+  channel. Data can be encoded in DNS query names. Restricting DNS
+  to a controlled resolver with query logging mitigates but does not
+  eliminate this.
+- The candidate code runs as non-root with no NET_ADMIN, but the
+  entrypoint phase has NET_ADMIN to apply iptables rules. If the
+  entrypoint script has a vulnerability, it could be exploited before
+  privilege dropping.
+- For production-grade network isolation, use host-side enforcement
+  (e.g., Docker network plugins, eBPF, or a separate proxy container)
+  rather than in-container iptables.
+
+### `sandbox/network_allowlist.py`
+`NetworkAllowList` parses a list of allowed destinations and generates
+iptables rules that DROP all egress except the allow-listed destinations.
+- Supported formats: `pypi.org`, `*.pypi.org` (wildcard), `10.0.0.1` (IP),
+  `10.0.0.0/24` (CIDR), `pypi.org:443` (port-specific).
+- `from_string("pypi.org:443,10.0.0.0/24")` or `from_file("allowlist.txt")`.
+- `generate_iptables_rules(dns_resolver=...)`: returns shell commands that
+  (1) allow loopback, (2) allow established/related, (3) allow DNS
+  (port 53) — to a specific resolver if `dns_resolver` is set, otherwise
+  to any resolver, (4) allow each allow-listed destination, (5) DROP
+  everything else (IPv4), (6) deny all IPv6 (ip6tables DROP policy).
+- Fail-closed: empty allow-list = deny all (same as `--network=none`).
+  Unresolvable domains are skipped (fail-closed for that domain, not the
+  whole execution). Wildcard domains rely on the DNS allow rule (no
+  IP-level filtering).
+
+### Purpose-built sandbox image (`sandbox/Dockerfile`)
+The sandbox uses a purpose-built Docker image (`vibe-thinker-sandbox`)
+that includes iptables, ip6tables, and curl baked in at build time —
+no `apt-get` at runtime. This closes the TOCTOU window where the
+container has open network before firewall lockdown.
+- Build: `docker build -f sandbox/Dockerfile -t vibe-thinker-sandbox:latest .`
+- Creates a non-root `sandbox` user (uid 1000) for candidate code.
+- Uses an entrypoint script that applies firewall rules as root, then
+  drops to the sandbox user before exec'ing the candidate command.
+
+### Entrypoint script (`sandbox/entrypoint.sh`)
+The entrypoint runs as root (container starts as root), applies firewall
+rules from the `VT_IPTABLES_RULES` env var (base64-encoded), then drops
+privileges to the `sandbox` user and exec's the candidate command.
+Security properties:
+1. Firewall rules are applied BEFORE candidate code runs (no TOCTOU).
+2. Candidate code runs as uid 1000 (sandbox user), NOT root.
+3. Candidate code has no NET_ADMIN capability (dropped by Docker after
+   the entrypoint's `runuser` call).
+4. IPv6 is denied via ip6tables DROP policy (prevents IPv6 bypass).
+5. DNS can be restricted to a specific resolver via `VT_DNS_RESOLVER`.
+6. If an iptables rule fails, the entrypoint exits (fail-closed) —
+   candidate code never runs without firewall protection.
+
+### DockerSandboxExecutor integration
+When an allow-list is set, the executor uses `--network=default` +
+`--cap-add=NET_ADMIN` (for the entrypoint's iptables phase only) and
+passes firewall rules via the `VT_IPTABLES_RULES` env var. The
+entrypoint applies rules, drops to the sandbox user, then exec's the
+candidate code. The candidate code has no NET_ADMIN and cannot modify
+the firewall. Without an allow-list, the executor uses `--network=none`
+(unchanged behavior). Audit evidence (rules hash, network mode, DNS
+restriction) is attached to the `ExecutionResult.evidence` dict.
+
+### CLI flags
+`--network-allowlist "pypi.org:443,10.0.0.0/24"` (comma-separated) or
+`--network-allowlist-file allowlist.txt` (one per line, `#` comments).
+`--dns-resolver 8.8.8.8` (restrict DNS to a specific resolver).
+`--sandbox-image vibe-thinker-sandbox:latest` (override the Docker image).
+Env: `RFSN_NETWORK_ALLOWLIST`, `RFSN_NETWORK_ALLOWLIST_FILE`,
+`RFSN_DNS_RESOLVER`, `RFSN_SANDBOX_IMAGE`.
+
+## Rust dependency probe (v0.4.0)
+Probed `ruvllm 2.3.0` and `exo-federation 0.1.1` from crates.io.
+Both compile and link cleanly. Full report at `docs/rust_dependency_report.md`.
+
+### ruvllm 2.3.0 — viable for sidecar
+- Real LLM inference via `LlmBackend` trait (`load_model`, `generate`,
+  `generate_stream`, `get_embeddings`) backed by candle-core.
+- `ServingEngine` wraps a backend with scheduling, batching, KV cache,
+  speculative decoding.
+- `unsafe` is only in SIMD quantization kernels (NEON/AVX2) — expected.
+- **3 cargo audit vulnerabilities** in transitive `rustls-webpki 0.101.7`
+  (CRL panic, cert name constraint bypass). Mitigated by loading models
+  from local disk (no TLS needed).
+- **1 unsound crate** `lru 0.12.5` (Stacked Borrows violation in IterMut).
+- Dependency tree pinned and vendored at `rust/probes/ruvllm_exo_probe/vendor/`.
+- Next: build `rfsn-ruvllm-sidecar` HTTP binary wrapping `CandleBackend`.
+
+### exo-federation 0.1.1 — NOT viable
+- `FederatedMesh` networking is **stubbed** — `federated_query` returns
+  placeholder data, `SubstrateInstance` is an empty struct.
+- Post-quantum crypto stack (`pqcrypto-kyber`, `pqcrypto-internals`) is
+  **unmaintained** — PQClean project archived, replaced by `pqcrypto-mlkem`.
+- Zero `unsafe` blocks, but the crate is scaffolding, not a working
+  federation.
+- Next: implement federation in Python with well-maintained crypto.
 
 ## Security hardening (v0.3.8)
 Ten fixes from a full codebase audit. All stdlib-only, no new dependencies.
