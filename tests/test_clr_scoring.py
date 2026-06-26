@@ -393,7 +393,7 @@ class TestGrammarEnforcement:
 
 
 class TestFastSpecialistPolicy:
-    """Tests for the --fast-specialist adaptive profile (3/5/15).
+    """Tests for the --fast-specialist adaptive profile (up to 3/5/15, capped at k).
 
     The fast-specialist profile is for ultra-tiny models (e.g. 0.5B) where
     shotgun-sampling many trajectories is cheap. It must NOT replace the

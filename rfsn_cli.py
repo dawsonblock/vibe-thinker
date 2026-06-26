@@ -325,9 +325,10 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="CLR k")
     p.add_argument("--fast-specialist", dest="fast_specialist",
                    action="store_true",
-                   help="Use the aggressive adaptive policy (3/5/15 trajectories) "
-                        "tuned for an ultra-tiny fast specialist (e.g. 0.5B). "
-                        "Do NOT use with a 3B+ specialist on 16GB RAM — it will "
+                   help="Use the aggressive adaptive policy (up to 3/5/15 "
+                        "trajectories, capped at --clr-k) tuned for an "
+                        "ultra-tiny fast specialist (e.g. 0.5B). Do NOT use "
+                        "with a 3B+ specialist on 16GB RAM — it will "
                         "thrash/OOM. Default off.")
     p.set_defaults(fast_specialist=_env_bool("RFSN_FAST_SPECIALIST", False))
     p.add_argument("--local-specialist-model",

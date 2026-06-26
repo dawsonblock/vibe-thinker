@@ -79,6 +79,8 @@ def make_fast_specialist_policy(k: int = 15) -> AdaptivePolicy:
       - initial_k_without_verifier=5 (jump straight to 5 for consensus)
       - max_k=15                     (shotgun 15 attempts on hard problems)
 
+    All values are capped at ``k`` to respect the user's --clr-k setting.
+
     The self_claim_cap (0.65) is unchanged — a fast model agreeing with itself
     more often is NOT independent verification. Only an external deterministic
     verifier can exceed the cap.

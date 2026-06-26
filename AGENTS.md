@@ -85,8 +85,8 @@ is missing or the load fails, it warns and falls back to HTTP at `--vibe`.
   `VIBE_THINKER_LOCAL_N_THREADS`.
 
 ## Fast-specialist adaptive profile (v0.3.5)
-`make_fast_specialist_policy()` returns an `AdaptivePolicy(3, 5, max_k=15)`
-tuned for ultra-tiny fast specialists (e.g. ruvltra 0.5B, ~100+ tok/s). At
+`make_fast_specialist_policy(k=15)` returns an `AdaptivePolicy(3, 5, max_k=15)`
+(all capped at `k`) tuned for ultra-tiny fast specialists (e.g. ruvltra 0.5B, ~100+ tok/s). At
 that speed, shotgun-sampling 15 trajectories costs roughly what 2 cost on a
 3B model. The `self_claim_cap` stays 0.65 — a fast model agreeing with itself
 more often is NOT independent verification; only a deterministic verifier

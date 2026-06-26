@@ -314,8 +314,8 @@ serialized with a `threading.Lock` inside the executor.
 ## Fast-specialist adaptive profile (v0.3.5)
 
 `make_fast_specialist_policy()` returns an `AdaptivePolicy` with
-`initial_k_with_verifier=3`, `initial_k_without_verifier=5`, `max_k=15` —
-shotgun-sampling tuned for a 0.5B model where 15 parallel trajectories cost
+`initial_k_with_verifier=3`, `initial_k_without_verifier=5`, `max_k=15` (all
+capped at `--clr-k`) — shotgun-sampling tuned for a 0.5B model where 15 parallel trajectories cost
 roughly what 2 cost on a 3B model. The `self_claim_cap` stays 0.65: a fast
 model agreeing with itself more often is NOT independent verification.
 
