@@ -256,6 +256,10 @@ class HybridReasoningOrchestrator:
         trajectory_store_path: str = "verified_trajectories.json",
         trajectory_retrieval_threshold: float = 0.70,
         trajectory_max_few_shot: int = 3,
+        fast_specialist: bool = False,
+        local_specialist_model: Optional[str] = None,
+        local_specialist_n_ctx: int = 4096,
+        local_specialist_n_threads: int = 8,
     ):
         self.vibe_endpoint = vibe_endpoint.rstrip("/")
         self.generalist_endpoint = generalist_endpoint.rstrip("/")
@@ -291,6 +295,10 @@ class HybridReasoningOrchestrator:
             server_url=vibe_endpoint,
             k=clr_k,
             max_concurrent=max_concurrent_clr,
+            fast_specialist=fast_specialist,
+            local_model=local_specialist_model,
+            local_n_ctx=local_specialist_n_ctx,
+            local_n_threads=local_specialist_n_threads,
         )
 
         self.use_embedding_router = use_embedding_router and EMBEDDINGS_AVAILABLE

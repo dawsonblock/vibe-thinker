@@ -1,11 +1,12 @@
 # vibe-thinker — project notes for agents
 
 ## Verify / test
-- Full suite: `python3 -m pytest -q` (345 tests, ~90s, no live servers needed)
+- Full suite: `python3 -m pytest -q` (366 tests, ~60s, no live servers needed)
 - Routing + REPL only: `python3 -m pytest tests/test_routing.py tests/test_repl.py -q`
 - Warm pool + code verifier: `python3 -m pytest tests/test_warm_pool.py tests/test_code_verifier.py -q`
 - Trajectory store: `python3 -m pytest tests/test_trajectory_store.py -q`
 - Grammar enforcement: `python3 -m pytest tests/test_clr_scoring.py::TestGrammarEnforcement -q`
+- In-process backend + fast-specialist: `python3 -m pytest tests/test_clr_scoring.py::TestInProcessBackend tests/test_clr_scoring.py::TestFastSpecialistPolicy -q`
 - Full-stack integration (needs live model servers): `python test_full_stack.py`
 - A benign `ResourceTracker.__del__` AttributeError prints after pytest exits on
   macOS Python 3.12 — it is multiprocessing teardown noise, NOT a test failure.
@@ -58,9 +59,41 @@ GBNF grammar passed to llama-server `/completion` endpoint for CLR claim
 extraction. Forces valid JSON output (`{"claims": [...], "final_answer": "..."}`
 ). Prevents small models from producing malformed JSON that causes trajectory
 scoring to fail. Applied to VibeThinker-3B extraction path. Regex fallback
-parser retained as defense-in-depth.
+parser retained as defense-in-depth. When the in-process backend is active
+(see below), the same grammar is enforced natively via `LlamaGrammar`.
 
 Health check: `curl http://127.0.0.1:<port>/health` → `{"status":"ok"}`
+
+## In-process specialist backend (v0.3.5)
+Eliminates HTTP overhead for tiny specialists. When `--local-specialist-model`
+(or `VIBE_THINKER_LOCAL_MODEL`) is set, the GGUF is loaded directly into the
+orchestrator's Python process via `llama-cpp-python` and called through a
+thread executor (`loop.run_in_executor`). Auto-preferred over HTTP: if the
+load succeeds, `_call_model` bypasses aiohttp entirely. If `llama-cpp-python`
+is missing or the load fails, it warns and falls back to HTTP at `--vibe`.
+- A single `Llama` instance is NOT thread-safe, so calls are serialized with
+  `self._local_lock` (a `threading.Lock`) inside the executor. The asyncio
+  semaphore is not the gate for the in-process path.
+- Grammar enforcement is wired in: `_CLAIMS_JSON_GRAMMAR` is pre-compiled once
+  at init into a `LlamaGrammar` and reused on every extraction call.
+- Accepts a local `.gguf` path OR `repo_id/filename.gguf` (HF Hub download).
+- Optional dep: `llama-cpp-python`. On Apple Silicon build with Metal:
+  `CMAKE_ARGS="-DGGML_METAL=on" pip install llama-cpp-python`
+- CLI: `--local-specialist-model`, `--local-specialist-n-ctx` (default 4096),
+  `--local-specialist-n-threads` (default 8). Env equivalents:
+  `VIBE_THINKER_LOCAL_MODEL`, `VIBE_THINKER_LOCAL_N_CTX`,
+  `VIBE_THINKER_LOCAL_N_THREADS`.
+
+## Fast-specialist adaptive profile (v0.3.5)
+`make_fast_specialist_policy()` returns an `AdaptivePolicy(3, 5, max_k=15)`
+tuned for ultra-tiny fast specialists (e.g. ruvltra 0.5B, ~100+ tok/s). At
+that speed, shotgun-sampling 15 trajectories costs roughly what 2 cost on a
+3B model. The `self_claim_cap` stays 0.65 — a fast model agreeing with itself
+more often is NOT independent verification; only a deterministic verifier
+exceeds the cap. Gated behind `--fast-specialist` / `RFSN_FAST_SPECIALIST`
+(default off). Do NOT enable with a 3B+ specialist on 16GB RAM — 15 parallel
+trajectories will thrash/OOM. The default 1/2/6 policy is unchanged. An
+explicit `policy=` to `VibeThinkerCLRAsync` overrides the flag.
 
 ### Local setup used on this machine (Apple M2 Pro, 16GB RAM)
 GGUF models stored in `~/models`:

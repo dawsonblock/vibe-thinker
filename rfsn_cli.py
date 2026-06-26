@@ -323,6 +323,26 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--clr-k", type=int,
                    default=int(os.environ.get("RFSN_CLR_K", "8")),
                    help="CLR k")
+    p.add_argument("--fast-specialist", dest="fast_specialist",
+                   action="store_true",
+                   help="Use the aggressive adaptive policy (3/5/15 trajectories) "
+                        "tuned for an ultra-tiny fast specialist (e.g. 0.5B). "
+                        "Do NOT use with a 3B+ specialist on 16GB RAM — it will "
+                        "thrash/OOM. Default off.")
+    p.set_defaults(fast_specialist=_env_bool("RFSN_FAST_SPECIALIST", False))
+    p.add_argument("--local-specialist-model",
+                   default=os.environ.get("VIBE_THINKER_LOCAL_MODEL", ""),
+                   help="Path to a local .gguf (or 'repo_id/filename.gguf') to "
+                        "load the specialist in-process via llama-cpp-python, "
+                        "bypassing HTTP entirely. Auto-preferred over --vibe "
+                        "when set; falls back to HTTP if llama-cpp-python is "
+                        "missing or the load fails. Requires llama-cpp-python.")
+    p.add_argument("--local-specialist-n-ctx", type=int,
+                   default=int(os.environ.get("VIBE_THINKER_LOCAL_N_CTX", "4096")),
+                   help="Context window for the in-process specialist (default 4096).")
+    p.add_argument("--local-specialist-n-threads", type=int,
+                   default=int(os.environ.get("VIBE_THINKER_LOCAL_N_THREADS", "8")),
+                   help="CPU threads for the in-process specialist (default 8).")
     p.add_argument("--audit-log",
                    default=os.environ.get("RFSN_AUDIT_LOG", "rfsn_jobs_bitemporal.jsonl"),
                    help="Bi-temporal audit log path (empty disables logging)")
@@ -348,6 +368,10 @@ async def _amain() -> None:
         use_embedding_router=args.use_embedding_router,
         use_trajectory_store=args.use_trajectory_store,
         trajectory_store_path=args.trajectory_store_path,
+        fast_specialist=args.fast_specialist,
+        local_specialist_model=args.local_specialist_model or None,
+        local_specialist_n_ctx=args.local_specialist_n_ctx,
+        local_specialist_n_threads=args.local_specialist_n_threads,
     )
     queue = JobQueue(
         orchestrator,

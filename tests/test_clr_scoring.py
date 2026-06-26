@@ -391,3 +391,210 @@ class TestGrammarEnforcement:
             await clr._call_model(FakeSession(), "test prompt", max_tokens=100)
         assert "grammar" not in captured_payload
 
+
+class TestFastSpecialistPolicy:
+    """Tests for the --fast-specialist adaptive profile (3/5/15).
+
+    The fast-specialist profile is for ultra-tiny models (e.g. 0.5B) where
+    shotgun-sampling many trajectories is cheap. It must NOT replace the
+    default 1/2/6 policy used for 3B+ specialists on constrained hardware.
+    """
+
+    def test_fast_specialist_policy_values(self):
+        from vibe_clr_async import make_fast_specialist_policy
+        p = make_fast_specialist_policy()
+        assert p.initial_k_with_verifier == 3
+        assert p.initial_k_without_verifier == 5
+        assert p.max_k == 15
+        # The self-claim cap is unchanged — a fast model agreeing with itself
+        # more often is NOT independent verification.
+        assert p.self_claim_cap == 0.65
+
+    def test_fast_specialist_flag_constructs_policy(self):
+        clr_fast = VibeThinkerCLRAsync(
+            server_url="http://localhost:0", k=8, fast_specialist=True
+        )
+        assert clr_fast.policy.initial_k_with_verifier == 3
+        assert clr_fast.policy.initial_k_without_verifier == 5
+        assert clr_fast.policy.max_k == 15
+        assert clr_fast.fast_specialist is True
+
+    def test_default_keeps_standard_policy(self):
+        """Without fast_specialist, the default 1/2/6 policy is used."""
+        clr_default = VibeThinkerCLRAsync(server_url="http://localhost:0", k=8)
+        assert clr_default.policy.initial_k_with_verifier == 1
+        assert clr_default.policy.initial_k_without_verifier == 2
+        assert clr_default.policy.max_k == 6
+        assert clr_default.fast_specialist is False
+
+    def test_explicit_policy_overrides_fast_specialist(self):
+        """An explicit policy wins over the fast_specialist flag."""
+        from vibe_clr_async import AdaptivePolicy
+        custom = AdaptivePolicy(initial_k_with_verifier=2, max_k=10)
+        clr = VibeThinkerCLRAsync(
+            server_url="http://localhost:0", k=8,
+            fast_specialist=True, policy=custom,
+        )
+        assert clr.policy is custom
+        assert clr.policy.max_k == 10
+
+    def test_fast_specialist_queue_load_adjusts_relative_to_15(self):
+        """Queue-load adjustment caps relative to the fast max_k=15."""
+        clr_fast = VibeThinkerCLRAsync(
+            server_url="http://localhost:0", k=8, fast_specialist=True
+        )
+        assert clr_fast._original_max_k == 15
+        # High load -> min(2, 15) = 2
+        clr_fast.adjust_max_k_for_queue_load(0.9)
+        assert clr_fast.policy.max_k == 2
+        # Restore at low load
+        clr_fast.adjust_max_k_for_queue_load(0.3)
+        assert clr_fast.policy.max_k == 15
+
+
+class TestInProcessBackend:
+    """Tests for the in-process specialist backend (llama-cpp-python).
+
+    The in-process backend loads a GGUF directly into the Python process and
+    calls it via a thread executor, bypassing HTTP. These tests mock llama_cpp
+    so they run without the dependency or a real model.
+    """
+
+    def test_default_backend_is_http(self, clr):
+        assert clr.backend == "http"
+        assert clr._local_llm is None
+        assert clr._local_grammar is None
+
+    def test_init_falls_back_when_llama_cpp_missing(self):
+        """If llama-cpp-python is not installed, warn and fall back to HTTP."""
+        import builtins
+        real_import = builtins.__import__
+
+        def fake_import(name, *a, **kw):
+            if name == "llama_cpp" or name.startswith("llama_cpp."):
+                raise ImportError("no llama_cpp")
+            return real_import(name, *a, **kw)
+
+        with patch("builtins.__import__", side_effect=fake_import):
+            clr = VibeThinkerCLRAsync(
+                server_url="http://localhost:0", k=1,
+                local_model="/tmp/nonexistent.gguf",
+            )
+        assert clr.backend == "http"
+        assert clr._local_llm is None
+
+    def test_init_falls_back_on_load_failure(self):
+        """If Llama()/from_pretrained raises, fall back to HTTP, not crash."""
+        with patch.dict("sys.modules", {
+            "llama_cpp": MagicMock(),
+            "llama_cpp.llama_grammar": MagicMock(),
+        }):
+            import sys
+            llama_mod = sys.modules["llama_cpp"]
+            llama_mod.Llama = MagicMock(side_effect=RuntimeError("oom"))
+            llama_mod.Llama.from_pretrained = MagicMock(side_effect=RuntimeError("oom"))
+            llama_mod.LlamaGrammar = MagicMock()
+            clr = VibeThinkerCLRAsync(
+                server_url="http://localhost:0", k=1,
+                local_model="/tmp/nonexistent.gguf",
+            )
+        assert clr.backend == "http"
+        assert clr._local_llm is None
+
+    def test_init_loads_inprocess_from_path(self, tmp_path):
+        """A .gguf path that exists on disk loads via Llama(model_path=...)."""
+        gguf = tmp_path / "tiny.gguf"
+        gguf.write_bytes(b"fake")
+        with patch.dict("sys.modules", {
+            "llama_cpp": MagicMock(),
+            "llama_cpp.llama_grammar": MagicMock(),
+        }):
+            import sys
+            llama_mod = sys.modules["llama_cpp"]
+            fake_llm = MagicMock(name="loaded_llm")
+            llama_mod.Llama = MagicMock(return_value=fake_llm)
+            grammar_cls = MagicMock()
+            llama_mod.LlamaGrammar = grammar_cls
+            clr = VibeThinkerCLRAsync(
+                server_url="http://localhost:0", k=1,
+                local_model=str(gguf),
+                local_n_ctx=2048, local_n_threads=4,
+            )
+        assert clr.backend == "in-process"
+        assert clr._local_llm is fake_llm
+        llama_mod.Llama.assert_called_once()
+        _, kwargs = llama_mod.Llama.call_args
+        assert kwargs["model_path"] == str(gguf)
+        assert kwargs["n_ctx"] == 2048
+        assert kwargs["n_threads"] == 4
+        # Grammar pre-compiled once at init
+        grammar_cls.from_string.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_call_model_uses_inprocess_when_local_llm_set(self, clr):
+        """When _local_llm is set, _call_model bypasses HTTP (ignores session)."""
+        clr._local_llm = MagicMock()
+        clr._local_llm.return_value = {"choices": [{"text": "in-process reply"}]}
+        clr.backend = "in-process"
+        # A session that would raise if used — proves the HTTP path is skipped
+        bomb_session = MagicMock()
+        bomb_session.post = MagicMock(side_effect=AssertionError("HTTP used!"))
+
+        result = await clr._call_model(bomb_session, "prompt", max_tokens=50)
+        assert result == "in-process reply"
+        clr._local_llm.assert_called_once()
+        _, kwargs = clr._local_llm.call_args
+        assert kwargs["max_tokens"] == 50
+        assert kwargs["stop"] == ["<|im_end|>"]
+        # No grammar requested -> grammar_obj is None
+        assert kwargs["grammar"] is None
+
+    @pytest.mark.asyncio
+    async def test_call_model_inprocess_reuses_claims_grammar(self, clr):
+        """The pre-compiled claims grammar is reused, not recompiled."""
+        from vibe_clr_async import _CLAIMS_JSON_GRAMMAR
+        clr._local_llm = MagicMock()
+        clr._local_llm.return_value = {"choices": [{"text": '{"claims":[]}'}]}
+        clr._local_grammar = MagicMock(name="precompiled_grammar")
+        clr.backend = "in-process"
+
+        await clr._call_model(
+            MagicMock(), "prompt", max_tokens=10,
+            grammar=_CLAIMS_JSON_GRAMMAR,
+        )
+        _, kwargs = clr._local_llm.call_args
+        # The pre-compiled object is passed directly, not the raw string
+        assert kwargs["grammar"] is clr._local_grammar
+
+    @pytest.mark.asyncio
+    async def test_call_model_inprocess_raises_on_empty(self, clr):
+        """Empty model output raises RuntimeError (fail-closed, not silent)."""
+        clr._local_llm = MagicMock()
+        clr._local_llm.return_value = {"choices": [{"text": ""}]}
+        clr.backend = "in-process"
+        with pytest.raises(RuntimeError, match="empty content"):
+            await clr._call_model(MagicMock(), "prompt", max_tokens=10)
+
+    @pytest.mark.asyncio
+    async def test_call_model_inprocess_wraps_unexpected_errors(self, clr):
+        """Non-RuntimeError exceptions from the LLM are wrapped as RuntimeError."""
+        clr._local_llm = MagicMock(side_effect=ValueError("bad state"))
+        clr.backend = "in-process"
+        with pytest.raises(RuntimeError, match="In-process specialist call failed"):
+            await clr._call_model(MagicMock(), "prompt", max_tokens=10)
+
+    @pytest.mark.asyncio
+    async def test_call_model_inprocess_serializes_with_lock(self, clr):
+        """The threading.Lock is held during inference (single Llama instance
+        is not safe to call concurrently)."""
+        clr._local_llm = MagicMock()
+        clr._local_llm.return_value = {"choices": [{"text": "ok"}]}
+        clr.backend = "in-process"
+        with patch.object(clr, "_local_lock") as lock:
+            lock.__enter__ = MagicMock(return_value=None)
+            lock.__exit__ = MagicMock(return_value=False)
+            await clr._call_model(MagicMock(), "prompt", max_tokens=10)
+            lock.__enter__.assert_called_once()
+            lock.__exit__.assert_called_once()
+
+

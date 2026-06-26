@@ -22,7 +22,9 @@ Bug fixes vs. the original walkthrough version:
 
 import asyncio
 import json
+import os
 import re
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -64,6 +66,33 @@ class AdaptivePolicy:
     consistency_boost: float = 0.05
     # Contradiction penalty (disagreement multiplies by this)
     contradiction_penalty: float = 0.75
+
+
+def make_fast_specialist_policy() -> AdaptivePolicy:
+    """Adaptive policy tuned for an ultra-fast, tiny specialist (e.g. 0.5B).
+
+    A 0.5B model is essentially "free" to run (~100+ tok/s, ~400MB RAM), so the
+    cost of shotgun-sampling many trajectories is dominated by infrastructure,
+    not inference. This policy aggressively scales up parallel sampling:
+
+      - initial_k_with_verifier=3   (try 3 fast verified paths immediately)
+      - initial_k_without_verifier=5 (jump straight to 5 for consensus)
+      - max_k=15                     (shotgun 15 attempts on hard problems)
+
+    The self_claim_cap (0.65) is unchanged — a fast model agreeing with itself
+    more often is NOT independent verification. Only an external deterministic
+    verifier can exceed the cap.
+
+    Use this ONLY when the specialist is a small/fast model. On a 3B+ model
+    (e.g. VibeThinker-3B on 16GB RAM) running 15 parallel trajectories will
+    thrash or OOM; the default AdaptivePolicy (1/2/6) is correct there.
+    """
+    return AdaptivePolicy(
+        initial_k_with_verifier=3,
+        initial_k_without_verifier=5,
+        max_k=15,
+        self_claim_cap=0.65,
+    )
 
 
 # High-risk task types that should NOT early-exit from self-consensus alone.
@@ -117,6 +146,10 @@ class VibeThinkerCLRAsync:
         k_min: int = 2,
         k_max: int = 6,
         policy: Optional[AdaptivePolicy] = None,
+        fast_specialist: bool = False,
+        local_model: Optional[str] = None,
+        local_n_ctx: int = 4096,
+        local_n_threads: int = 8,
     ):
         self.server_url = server_url.rstrip("/")
         self.k = k
@@ -124,21 +157,111 @@ class VibeThinkerCLRAsync:
         self.semaphore = asyncio.Semaphore(max_concurrent)
 
         # Adaptive compute policy. If not provided, construct from k_min/k_max
-        # for backwards compatibility.
+        # for backwards compatibility, OR use the fast-specialist profile when
+        # requested. fast_specialist is for ultra-tiny models (e.g. 0.5B) where
+        # shotgun-sampling 15 trajectories costs ~nothing; it must NOT be used
+        # with a 3B+ specialist on constrained hardware (OOM/thrash risk).
         self.adaptive = adaptive
-        if policy is None:
+        self.fast_specialist = fast_specialist
+        if policy is not None:
+            self.policy = policy
+        elif fast_specialist:
+            self.policy = make_fast_specialist_policy()
+        else:
             self.policy = AdaptivePolicy(
                 initial_k_without_verifier=min(k_min, k) if adaptive else k,
                 initial_k_with_verifier=1 if adaptive else k,
                 max_k=min(k_max, k) if adaptive else k,
             )
-        else:
-            self.policy = policy
         # Keep k_min/k_max for backwards compat
         self.k_min = self.policy.initial_k_without_verifier
         self.k_max = self.policy.max_k
         # Store the original max_k so adjust_max_k_for_queue_load can restore it
         self._original_max_k = self.policy.max_k
+
+        # In-process specialist backend (eliminates HTTP overhead for tiny
+        # models). When local_model is set, we load the GGUF directly into this
+        # Python process via llama-cpp-python and call it through a thread
+        # executor (llama_cpp is synchronous). Auto-preferred over HTTP: if the
+        # load succeeds, _call_model bypasses aiohttp entirely. If llama_cpp is
+        # not installed or the load fails, we warn and fall back to HTTP.
+        self._local_llm = None
+        self._local_grammar = None
+        self._local_lock = threading.Lock()
+        self.backend = "http"
+        if local_model:
+            self._init_local_backend(local_model, local_n_ctx, local_n_threads)
+
+    def _init_local_backend(
+        self, local_model: str, n_ctx: int, n_threads: int
+    ) -> None:
+        """Try to load the in-process specialist. Fall back to HTTP on failure.
+
+        local_model may be:
+          - a path to a .gguf file on disk -> Llama(model_path=...)
+          - "repo_id/filename"            -> Llama.from_pretrained(...)
+          - "repo_id" with filename in env -> Llama.from_pretrained(...)
+        """
+        try:
+            from llama_cpp import Llama, LlamaGrammar
+        except ImportError:
+            print(
+                f"[CLR] Warning: local specialist '{local_model}' requested but "
+                f"llama-cpp-python is not installed. Falling back to HTTP at "
+                f"{self.server_url}. Install with: pip install llama-cpp-python"
+            )
+            return
+
+        try:
+            if os.path.exists(local_model):
+                print(f"[CLR] Loading in-process specialist from {local_model}...")
+                self._local_llm = Llama(
+                    model_path=local_model,
+                    n_ctx=n_ctx,
+                    n_threads=n_threads,
+                    verbose=False,
+                )
+            else:
+                # Treat as repo_id/filename (HF Hub). Split on first '/' if the
+                # user gave "repo/file.gguf"; otherwise pass repo_id and let
+                # from_pretrained pick a default file.
+                if "/" in local_model and local_model.endswith(".gguf"):
+                    repo_id, filename = local_model.split("/", 1)
+                    print(f"[CLR] Loading in-process specialist {repo_id}/{filename}...")
+                    self._local_llm = Llama.from_pretrained(
+                        repo_id=repo_id,
+                        filename=filename,
+                        n_ctx=n_ctx,
+                        n_threads=n_threads,
+                        verbose=False,
+                    )
+                else:
+                    print(f"[CLR] Loading in-process specialist {local_model}...")
+                    self._local_llm = Llama.from_pretrained(
+                        repo_id=local_model,
+                        n_ctx=n_ctx,
+                        n_threads=n_threads,
+                        verbose=False,
+                    )
+            # Pre-compile the JSON claims grammar for the in-process path.
+            # llama_cpp enforces grammar natively — the model physically cannot
+            # emit invalid JSON, mirroring the HTTP /completion grammar path.
+            self._local_grammar = LlamaGrammar.from_string(_CLAIMS_JSON_GRAMMAR)
+            self.backend = "in-process"
+            print(
+                f"[CLR] In-process specialist ready (backend={self.backend}, "
+                f"n_ctx={n_ctx}, n_threads={n_threads}). HTTP at "
+                f"{self.server_url} is bypassed."
+            )
+        except Exception as e:
+            print(
+                f"[CLR] Warning: failed to load in-process specialist "
+                f"'{local_model}': {e}. Falling back to HTTP at "
+                f"{self.server_url}."
+            )
+            self._local_llm = None
+            self._local_grammar = None
+            self.backend = "http"
 
     def adjust_max_k_for_queue_load(self, queue_load: float) -> None:
         """Adjust max_k based on queue pressure.
@@ -182,17 +305,101 @@ class VibeThinkerCLRAsync:
         stop: Optional[List[str]] = None,
         grammar: Optional[str] = None,
     ) -> str:
-        """Async call to llama-server /completion endpoint.
+        """Call the specialist model. Routes to the in-process backend when
+        available, otherwise falls back to the HTTP /completion endpoint.
 
-Raises RuntimeError on any failure — callers must handle the exception
-rather than silently proceeding with an empty string.
+        Raises RuntimeError on any failure — callers must handle the exception
+        rather than silently proceeding with an empty string.
 
-Args:
-    grammar: optional GBNF grammar string to constrain output format.
-        When set, llama-server enforces the grammar — the model physically
-        cannot output invalid JSON. Used for claim extraction to prevent
-        small models from producing malformed JSON.
-"""
+        Args:
+            session: aiohttp session (ignored when the in-process backend is
+                active — kept for signature compatibility with all callers).
+            grammar: optional GBNF grammar string to constrain output format.
+                When set, the model physically cannot output invalid JSON.
+                Enforced natively by llama-server (HTTP) or LlamaGrammar
+                (in-process). Used for claim extraction to prevent small models
+                from producing malformed JSON.
+        """
+        if self._local_llm is not None:
+            return await self._call_model_inprocess(
+                prompt, max_tokens, temperature, stop, grammar
+            )
+        return await self._call_model_http(
+            session, prompt, max_tokens, temperature, stop, grammar
+        )
+
+    async def _call_model_inprocess(
+        self,
+        prompt: str,
+        max_tokens: int,
+        temperature: float,
+        stop: Optional[List[str]],
+        grammar: Optional[str],
+    ) -> str:
+        """In-process backend: call llama_cpp.Llama in a thread executor.
+
+        llama_cpp is synchronous and a single Llama instance is not safe to
+        call concurrently, so we serialize with self._local_lock inside the
+        executor. The asyncio semaphore (held by _call_model callers via the
+        HTTP path) is not used here; the threading.Lock is the real gate.
+
+        Grammar: when the requested grammar matches _CLAIMS_JSON_GRAMMAR (the
+        only grammar this codebase uses), we pass the pre-compiled
+        LlamaGrammar. A different grammar string would be compiled on demand.
+        """
+        loop = asyncio.get_running_loop()
+        stop_tokens = stop if stop is not None else ["<|im_end|>"]
+
+        # Resolve the grammar object: reuse the pre-compiled claims grammar when
+        # the caller asked for it; compile any other grammar on demand.
+        grammar_obj = None
+        if grammar is not None:
+            if grammar == _CLAIMS_JSON_GRAMMAR and self._local_grammar is not None:
+                grammar_obj = self._local_grammar
+            else:
+                try:
+                    from llama_cpp import LlamaGrammar
+                    grammar_obj = LlamaGrammar.from_string(grammar)
+                except Exception as e:
+                    # Grammar compile failure is non-fatal — proceed without it
+                    # and let the regex fallback parser handle malformed JSON.
+                    print(f"[CLR] Warning: in-process grammar compile failed: {e}")
+
+        def _run() -> str:
+            with self._local_lock:
+                resp = self._local_llm(
+                    prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    stop=stop_tokens,
+                    grammar=grammar_obj,
+                )
+                text = resp["choices"][0]["text"] if resp else ""
+                if not text:
+                    raise RuntimeError(
+                        "In-process specialist returned empty content"
+                    )
+                return text
+
+        try:
+            return await loop.run_in_executor(None, _run)
+        except RuntimeError:
+            raise
+        except Exception as e:
+            raise RuntimeError(
+                f"In-process specialist call failed: {e}"
+            ) from e
+
+    async def _call_model_http(
+        self,
+        session: aiohttp.ClientSession,
+        prompt: str,
+        max_tokens: int,
+        temperature: float,
+        stop: Optional[List[str]],
+        grammar: Optional[str],
+    ) -> str:
+        """HTTP backend: POST to llama-server /completion endpoint."""
         payload = {
             "prompt": prompt,
             "n_predict": max_tokens,

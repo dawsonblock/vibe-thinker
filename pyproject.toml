@@ -4,7 +4,7 @@ build-backend = "setuptools.backends._legacy:_Backend"
 
 [project]
 name = "vibe-thinker"
-version = "0.3.2"
+version = "0.3.5"
 description = "Fail-closed hybrid reasoning control plane for local LLMs with CLR, deterministic verifiers, job queue, and bi-temporal audit logging"
 readme = "README.md"
 license = {file = "LICENSE"}

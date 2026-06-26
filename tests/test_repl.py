@@ -134,6 +134,39 @@ class TestEnvVarSupport:
         args = build_argparser().parse_args([])
         assert args.use_embedding_router is True
 
+    def test_fast_specialist_defaults_off(self):
+        args = build_argparser().parse_args([])
+        assert args.fast_specialist is False
+
+    def test_fast_specialist_cli_flag(self):
+        args = build_argparser().parse_args(["--fast-specialist"])
+        assert args.fast_specialist is True
+
+    def test_fast_specialist_env_true(self, monkeypatch):
+        monkeypatch.setenv("RFSN_FAST_SPECIALIST", "true")
+        args = build_argparser().parse_args([])
+        assert args.fast_specialist is True
+
+    def test_local_specialist_model_defaults_empty(self):
+        args = build_argparser().parse_args([])
+        assert args.local_specialist_model == ""
+
+    def test_local_specialist_model_cli(self):
+        args = build_argparser().parse_args(
+            ["--local-specialist-model", "/tmp/tiny.gguf"]
+        )
+        assert args.local_specialist_model == "/tmp/tiny.gguf"
+
+    def test_local_specialist_model_env(self, monkeypatch):
+        monkeypatch.setenv("VIBE_THINKER_LOCAL_MODEL", "ruv/ruvltra-claude-code-0.5b-q4_k_m.gguf")
+        args = build_argparser().parse_args([])
+        assert args.local_specialist_model == "ruv/ruvltra-claude-code-0.5b-q4_k_m.gguf"
+
+    def test_local_specialist_n_ctx_env(self, monkeypatch):
+        monkeypatch.setenv("VIBE_THINKER_LOCAL_N_CTX", "8192")
+        args = build_argparser().parse_args([])
+        assert args.local_specialist_n_ctx == 8192
+
 
 
 
