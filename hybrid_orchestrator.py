@@ -37,7 +37,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import aiohttp
 
 from vibe_clr_async import CLRResult, VibeThinkerCLRAsync
-from persistent_cache import CLRResultCache, PersistentRouteCache, should_cache
+from persistent_cache import (
+    CLRResultCache,
+    PersistentRouteCache,
+    VerifiedTrajectoryStore,
+    should_cache,
+)
 from verifiers import MathVerifier, CodeVerifier, FactualVerifier
 from math_solver import solve as solve_math
 
@@ -246,6 +251,10 @@ class HybridReasoningOrchestrator:
         clr_cache_path: str = "clr_result_cache.json",
         clr_cache_similarity: float = 0.92,
         clr_cache_min_score: float = 0.7,
+        use_trajectory_store: bool = True,
+        trajectory_store_path: str = "verified_trajectories.json",
+        trajectory_retrieval_threshold: float = 0.70,
+        trajectory_max_few_shot: int = 3,
     ):
         self.vibe_endpoint = vibe_endpoint.rstrip("/")
         self.generalist_endpoint = generalist_endpoint.rstrip("/")
@@ -300,6 +309,27 @@ class HybridReasoningOrchestrator:
                 self.clr_cache = None
         else:
             self.clr_cache = None
+
+        # Verified trajectory store (self-improving few-shot memory).
+        # Stores independently-verified solutions and retrieves them as
+        # few-shot context for similar future queries. Only available with
+        # embedding deps. Only stores verified=True results — never learns
+        # from unverified output.
+        self.use_trajectory_store = use_trajectory_store and EMBEDDINGS_AVAILABLE
+        if self.use_trajectory_store:
+            try:
+                self.trajectory_store = VerifiedTrajectoryStore(
+                    path=trajectory_store_path,
+                    model_name=embedding_model,
+                    retrieval_threshold=trajectory_retrieval_threshold,
+                    max_few_shot=trajectory_max_few_shot,
+                )
+            except Exception as e:
+                print(f"[Warning] Could not load trajectory store: {e}")
+                self.use_trajectory_store = False
+                self.trajectory_store = None
+        else:
+            self.trajectory_store = None
 
         # Keyword fallback
         self.verifiable_keywords = {
@@ -812,8 +842,13 @@ class HybridReasoningOrchestrator:
             )
 
         # Generate N candidates in parallel with diverse temperatures.
+        # Prepend verified trajectories as few-shot context (self-improving).
         temps = [0.2] + [0.7] * (self.code_candidates - 1)
-        gen_prompt = self._CODE_GEN_PROMPT.format(query=query, tests=tests)
+        few_shot = self._get_few_shot_context(query, task_type="code")
+        query_with_ctx = f"{few_shot}\n{query}" if few_shot else query
+        gen_prompt = self._CODE_GEN_PROMPT.format(query=query_with_ctx, tests=tests)
+        if few_shot:
+            print(f"[CodeLoop] Retrieved verified examples as few-shot context")
         print(f"[CodeLoop] Generating {self.code_candidates} candidates + test spec verification")
         candidates_raw = await asyncio.gather(
             *[self._call_code_specialist(gen_prompt, max_tokens=2048) for _ in temps],
@@ -1024,8 +1059,18 @@ class HybridReasoningOrchestrator:
         else:
             print(f"[CLR] No verifier for task_type={task_type} — self-claims-only cap applies")
 
+        # Retrieve verified trajectories as few-shot context (self-improving
+        # memory). The model sees prior verified solutions to similar problems
+        # before attempting this one. This is how the system "learns" — not by
+        # updating weights, but by accumulating verified examples.
+        few_shot = self._get_few_shot_context(query, task_type=task_type)
+        query_with_context = f"{few_shot}\n{query}" if few_shot else query
+        if few_shot:
+            print(f"[TrajectoryStore] Retrieved {min(self.trajectory_store.max_few_shot, len(self.trajectory_store.retrieve(query, task_type)))} "
+                  f"verified examples as few-shot context")
+
         clr_result = await self.reasoner.run(
-            query, verifier=verifier, task_type=task_type,
+            query_with_context, verifier=verifier, task_type=task_type,
             verifier_context=verifier_context,
         )
 
@@ -1064,6 +1109,65 @@ class HybridReasoningOrchestrator:
         return clr_result, False
 
     # ------------------------------------------------------------------ #
+    # Trajectory store helpers (self-improving memory)
+    # ------------------------------------------------------------------ #
+    def _store_if_verified(
+        self, query: str, result: OrchestratorResult,
+        clr_result: Optional[CLRResult] = None,
+    ) -> None:
+        """Store a verified result in the trajectory store.
+
+        Only stores results that were independently verified (verified=True
+        with a deterministic verifier, not self_claims_only). This is the
+        "learning" step: verified solutions become few-shot context for
+        future similar queries. Unverified results are never stored.
+        """
+        if not self.use_trajectory_store or self.trajectory_store is None:
+            return
+
+        # Determine verification status and method
+        verified = False
+        method = "self_claims_only"
+        score = result.clr_score or 0.0
+        task_type = "unknown"
+
+        if clr_result is not None:
+            verified = clr_result.verified
+            method = clr_result.verification_method
+        elif result.raw_traces.get("verified"):
+            verified = True
+            method = result.raw_traces.get("verification_method", "self_claims_only")
+
+        if not verified or method == "self_claims_only":
+            return  # Never learn from unverified or self-claimed results
+
+        # Determine task type
+        tt, _, _ = self._detect_task_type(query)
+        task_type = tt
+
+        self.trajectory_store.store(
+            query=query,
+            answer=result.final_answer,
+            score=score,
+            verification_method=method,
+            task_type=task_type,
+            route_taken=result.route_taken,
+        )
+        print(f"[TrajectoryStore] Stored verified result (method={method}, "
+              f"score={score:.3f}, task_type={task_type}) — "
+              f"store now has {len(self.trajectory_store)} entries")
+
+    def _get_few_shot_context(self, query: str, task_type: Optional[str] = None) -> str:
+        """Retrieve verified trajectories as few-shot context for the query.
+
+        Returns a string to prepend to the model prompt, or "" if no similar
+        verified trajectories exist or the store is disabled.
+        """
+        if not self.use_trajectory_store or self.trajectory_store is None:
+            return ""
+        return self.trajectory_store.build_few_shot_prefix(query, task_type=task_type)
+
+    # ------------------------------------------------------------------ #
     # Main entry point
     # ------------------------------------------------------------------ #
     async def run(self, query: str, force_route: Optional[str] = None) -> OrchestratorResult:
@@ -1084,7 +1188,9 @@ class HybridReasoningOrchestrator:
                 if task_type == "code":
                     if self.code_verifier is not None:
                         print("[Orchestrator] Code task -> code specialist + sandbox verification")
-                        return await self._run_code_specialist_verified(query)
+                        result = await self._run_code_specialist_verified(query)
+                        self._store_if_verified(query, result)
+                        return result
                     print("[Orchestrator] Code task -> code specialist (no verifier)")
                     answer = await self._call_code_specialist(query)
                     return OrchestratorResult(
@@ -1096,7 +1202,7 @@ class HybridReasoningOrchestrator:
                     )
             if self.use_clr:
                 clr_result, cache_hit = await self._run_clr_with_cache(query)
-                return OrchestratorResult(
+                result = OrchestratorResult(
                     final_answer=clr_result.best_answer,
                     route_taken="specialist_clr_cached" if cache_hit else "specialist_clr",
                     specialist_used="VibeThinker-3B + CLR",
@@ -1104,6 +1210,8 @@ class HybridReasoningOrchestrator:
                     routing_confidence=confidence,
                     raw_traces={"clr_result": self._trim_clr(clr_result), "cache_hit": cache_hit},
                 )
+                self._store_if_verified(query, result, clr_result=clr_result)
+                return result
             # Plain specialist (fixed: real session via helper)
             answer = await self._call_specialist_plain(query)
             return OrchestratorResult(

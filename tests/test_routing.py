@@ -17,6 +17,7 @@ def orch():
         use_clr=False,
         use_embedding_router=False,
         use_clr_cache=False,
+        use_trajectory_store=False,
     )
 
 
@@ -212,6 +213,7 @@ class TestCodeSpecialistRouting:
             use_clr=False,
             use_embedding_router=False,
             use_clr_cache=False,
+            use_trajectory_store=False,
         )
         assert o.code_specialist_endpoint == "http://127.0.0.1:8082"
 
@@ -234,6 +236,7 @@ class TestCodeSpecialistRouting:
             use_clr=True,
             use_embedding_router=False,
             use_clr_cache=False,
+            use_trajectory_store=False,
         )
         o._generate_test_spec = AsyncMock(return_value="assert square(2) == 4")
         o._call_code_specialist = AsyncMock(return_value="```python\ndef square(n): return n*n\n```")
@@ -261,6 +264,7 @@ class TestCodeSpecialistRouting:
             use_clr=True,
             use_embedding_router=False,
             use_clr_cache=False,
+            use_trajectory_store=False,
         )
         o._generate_test_spec = AsyncMock(return_value="assert square(2) == 4")
         o._call_code_specialist = AsyncMock(return_value="```python\ndef square(n): return n+1\n```")
@@ -284,6 +288,7 @@ class TestCodeSpecialistRouting:
             use_clr=True,
             use_embedding_router=False,
             use_clr_cache=False,
+            use_trajectory_store=False,
         )
         o._generate_test_spec = AsyncMock(return_value=None)
         o._call_code_specialist = AsyncMock(return_value="def square(n): return n*n")
@@ -304,6 +309,7 @@ class TestCodeSpecialistRouting:
             use_clr=True,
             use_embedding_router=False,
             use_clr_cache=False,
+            use_trajectory_store=False,
         )
         o._call_code_specialist = AsyncMock(return_value="def sort(l): return sorted(l)")
         o._run_clr_with_cache = AsyncMock(side_effect=AssertionError("CLR should not run for code"))
@@ -325,6 +331,7 @@ class TestCodeSpecialistRouting:
             use_clr=True,
             use_embedding_router=False,
             use_clr_cache=False,
+            use_trajectory_store=False,
         )
         o._call_code_specialist = AsyncMock(side_effect=AssertionError("ruvltra should not run for math"))
         o._generate_test_spec = AsyncMock(side_effect=AssertionError("test spec should not run for math"))
@@ -347,6 +354,7 @@ class TestCodeSpecialistRouting:
             use_clr=True,
             use_embedding_router=False,
             use_clr_cache=False,
+            use_trajectory_store=False,
         )
         fake_clr = CLRResult(best_answer="code here", best_score=0.8, best_raw_trace="")
         o._run_clr_with_cache = AsyncMock(return_value=(fake_clr, False))

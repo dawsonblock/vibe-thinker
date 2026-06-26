@@ -302,6 +302,15 @@ def build_argparser() -> argparse.ArgumentParser:
                    default=int(os.environ.get("CODE_CANDIDATES", "3")),
                    help="Number of parallel code candidates to generate and "
                         "verify in the sandbox (default 3).")
+    p.add_argument("--no-trajectory-store", dest="use_trajectory_store",
+                   action="store_false",
+                   help="Disable the verified-trajectory store (self-improving "
+                        "few-shot memory). Enabled by default when embedding "
+                        "deps are available.")
+    p.set_defaults(use_trajectory_store=_env_bool("RFSN_USE_TRAJECTORY_STORE", True))
+    p.add_argument("--trajectory-store-path",
+                   default=os.environ.get("TRAJECTORY_STORE_PATH", "verified_trajectories.json"),
+                   help="Path to the verified-trajectory store file.")
     p.add_argument("--max-concurrent", type=int,
                    default=int(os.environ.get("RFSN_MAX_CONCURRENT", "2")),
                    help="Max concurrent jobs")
@@ -336,6 +345,8 @@ async def _amain() -> None:
         use_clr=args.use_clr,
         clr_k=args.clr_k,
         use_embedding_router=args.use_embedding_router,
+        use_trajectory_store=args.use_trajectory_store,
+        trajectory_store_path=args.trajectory_store_path,
     )
     queue = JobQueue(
         orchestrator,

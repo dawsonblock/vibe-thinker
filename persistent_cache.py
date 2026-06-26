@@ -490,3 +490,241 @@ class CLRResultCache:
 
     def __len__(self) -> int:
         return len(self.entries)
+
+
+# ====================================================================== #
+# Verified trajectory store (self-improving few-shot memory)
+# ====================================================================== #
+class VerifiedTrajectoryStore:
+    """Semantic store of independently-verified solutions.
+
+    Unlike CLRResultCache (which returns a cached answer for near-identical
+    queries, similarity >= 0.92), the trajectory store retrieves *similar*
+    verified solutions (similarity >= retrieval_threshold, default 0.70) and
+    returns them as **few-shot context** for new queries. This lets the system
+    learn from verified successes: the next time a similar problem appears,
+    the model sees prior verified solutions as examples, improving its first-
+    attempt success rate.
+
+    Trust model (fail-closed):
+      - ONLY results with verified=True and a deterministic verification_method
+        (not self_claims_only) are stored. Unverified results are never learned
+        from — learning from unverified output would be epistemic contamination.
+      - On retrieval, entries are re-checked for trustworthiness via
+        is_cache_entry_trustworthy(). A corrupted or stale entry cannot inject
+        false context.
+      - The store is read-only on lookup: it provides context, not answers.
+        The model still must solve the problem and the verifier still must
+        confirm it.
+
+    On-disk format (JSON):
+      {
+        "model_name": "all-MiniLM-L6-v2",
+        "schema_version": 3,
+        "entries": [
+          {
+            "query": "...",
+            "embedding": [float, ...],
+            "answer": "...",
+            "score": 0.895,
+            "verification_method": "math_verifier",
+            "task_type": "math",
+            "route_taken": "specialist_clr",
+            "timestamp": "..."
+          }, ...
+        ]
+      }
+    """
+
+    def __init__(
+        self,
+        path: str = "verified_trajectories.json",
+        model_name: str = "all-MiniLM-L6-v2",
+        retrieval_threshold: float = 0.70,
+        max_entries: int = 512,
+        max_few_shot: int = 3,
+        autosave: bool = True,
+    ):
+        if not EMBEDDINGS_AVAILABLE:
+            raise ImportError(
+                "VerifiedTrajectoryStore needs: pip install "
+                "sentence-transformers scikit-learn numpy"
+            )
+        self.path = path
+        self.model_name = model_name
+        self.retrieval_threshold = retrieval_threshold
+        self.max_entries = max_entries
+        self.max_few_shot = max_few_shot
+        self.autosave = autosave
+
+        self.model = SentenceTransformer(model_name)
+        self.entries: List[Dict[str, Any]] = []
+        self._embeddings_matrix: Optional[Any] = None
+
+        self._load()
+
+    # ----------------------- persistence ----------------------- #
+    def _load(self) -> None:
+        data = _load_json(self.path)
+        if not data:
+            return
+        self.entries = data.get("entries", []) or []
+        # Filter out any entries that don't meet the trust bar (defensive:
+        # the file could have been hand-edited or written by an older version)
+        self.entries = [
+            e for e in self.entries
+            if e.get("verified") and e.get("verification_method", "self_claims_only") != "self_claims_only"
+        ]
+        self._rebuild_embeddings_matrix()
+        if self.entries:
+            print(f"[TrajectoryStore] Loaded {len(self.entries)} verified trajectories from {self.path}")
+
+    def _rebuild_embeddings_matrix(self) -> None:
+        if not self.entries:
+            self._embeddings_matrix = None
+            return
+        self._embeddings_matrix = np.array(
+            [e["embedding"] for e in self.entries]
+        )
+
+    def save(self) -> None:
+        data = {
+            "model_name": self.model_name,
+            "schema_version": CURRENT_CACHE_SCHEMA_VERSION,
+            "entries": self.entries,
+        }
+        _atomic_write_json(self.path, data)
+
+    # ----------------------- retrieval ----------------------- #
+    def retrieve(self, query: str, task_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Retrieve similar verified trajectories as few-shot context.
+
+        Returns up to ``max_few_shot`` entries sorted by similarity, each
+        above ``retrieval_threshold``. If ``task_type`` is given, only
+        entries with a matching task_type are returned (so math examples
+        don't pollute code queries and vice versa).
+
+        Each returned dict has:
+          - query: the original verified problem
+          - answer: the verified answer
+          - score: the reliability score at verification time
+          - verification_method: how it was verified
+          - similarity: cosine similarity to the current query
+        """
+        if not self.entries or self._embeddings_matrix is None:
+            return []
+        q_emb = self.model.encode([query])[0].reshape(1, -1)
+        sims = cosine_similarity(q_emb, self._embeddings_matrix)[0]
+
+        candidates = []
+        for idx in np.argsort(sims)[::-1]:
+            sim = float(sims[idx])
+            if sim < self.retrieval_threshold:
+                break
+            entry = self.entries[int(idx)]
+            if task_type and entry.get("task_type") != task_type:
+                continue
+            # Re-check trust on retrieval (defensive against stale/corrupt entries)
+            if not is_cache_entry_trustworthy(entry):
+                continue
+            candidates.append({
+                "query": entry["query"],
+                "answer": entry["answer"],
+                "score": entry.get("score", 0.0),
+                "verification_method": entry.get("verification_method", ""),
+                "task_type": entry.get("task_type", ""),
+                "similarity": sim,
+            })
+            if len(candidates) >= self.max_few_shot:
+                break
+        return candidates
+
+    def build_few_shot_prefix(self, query: str, task_type: Optional[str] = None) -> str:
+        """Build a few-shot context string from verified trajectories.
+
+        Returns a string prepended to the model prompt, or "" if no
+        similar verified trajectories exist. The format is:
+
+          Here are similar problems that were independently verified correct.
+          Use them as reference:
+
+          Problem: <query>
+          Verified answer: <answer>
+          (verified via <method>, score <score>)
+
+          ...
+        """
+        trajectories = self.retrieve(query, task_type=task_type)
+        if not trajectories:
+            return ""
+        lines = [
+            "Here are similar problems that were independently verified correct.",
+            "Use them as reference:",
+            "",
+        ]
+        for t in trajectories:
+            lines.append(f"Problem: {t['query']}")
+            lines.append(f"Verified answer: {t['answer']}")
+            lines.append(f"(verified via {t['verification_method']}, score {t['score']:.3f})")
+            lines.append("")
+        return "\n".join(lines)
+
+    # ----------------------- insert ----------------------- #
+    def store(
+        self,
+        query: str,
+        answer: str,
+        score: float,
+        verification_method: str,
+        task_type: str = "unknown",
+        route_taken: str = "",
+    ) -> None:
+        """Store a verified trajectory.
+
+        Only called when verified=True with a deterministic verifier. This is
+        the "learning" step: the verified solution is added to the store and
+        becomes retrievable as few-shot context for future similar queries.
+
+        Refuses to store self_claims_only or unverified results — learning
+        from unverified output is epistemic contamination.
+        """
+        if not answer or not answer.strip():
+            return
+        if answer.strip().lower() in BAD_ANSWERS:
+            return
+        if verification_method == "self_claims_only":
+            return  # Never learn from self-claims
+        embedding = self.model.encode([query])[0].tolist()
+        entry = {
+            "query": query,
+            "embedding": embedding,
+            "answer": answer,
+            "score": float(score),
+            "verification_method": verification_method,
+            "task_type": task_type,
+            "route_taken": route_taken,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "verified": True,
+            "schema_version": CURRENT_CACHE_SCHEMA_VERSION,
+            "best_answer": answer,  # alias for is_cache_entry_trustworthy compatibility
+            "best_score": float(score),  # alias
+            "claim_count": 10,  # verified entries pass the claim_count check
+        }
+        self.entries.append(entry)
+        # Evict lowest-score entries if over capacity
+        if len(self.entries) > self.max_entries:
+            self.entries.sort(key=lambda e: e.get("score", 0), reverse=True)
+            self.entries = self.entries[: self.max_entries]
+        self._rebuild_embeddings_matrix()
+        if self.autosave:
+            self.save()
+
+    def clear(self) -> None:
+        self.entries = []
+        self._embeddings_matrix = None
+        if os.path.exists(self.path):
+            os.unlink(self.path)
+        print("[TrajectoryStore] Cleared")
+
+    def __len__(self) -> int:
+        return len(self.entries)
