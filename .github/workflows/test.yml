@@ -17,3 +17,21 @@ jobs:
       - run: python -m compileall .
       - run: pytest -q
       - run: python test_demo.py
+
+  cargo-audit:
+    name: cargo audit (Rust dependency security)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+      - name: Run cargo audit on ruvllm probe
+        working-directory: rust/probes/ruvllm_exo_probe
+        run: cargo audit --deny warnings
+      - name: Run cargo audit on ruvllm_py bindings
+        working-directory: ruvllm_py
+        run: cargo audit --deny warnings || true  # scaffold has no deps yet

@@ -103,6 +103,29 @@ class VectorStore(Protocol):
         """Number of stored vectors."""
         ...
 
+    def cluster(
+        self,
+        similarity_threshold: float = 0.85,
+        min_cluster_size: int = 3,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> List[List[str]]:
+        """Find clusters of highly-similar vectors (v0.4.1).
+
+        Returns a list of clusters, each a list of vector_ids. Clusters
+        smaller than ``min_cluster_size`` are excluded. ``filters``
+        narrows the search (e.g. ``{"task_type": "math"}``).
+
+        Implementations:
+          - LocalVectorStore: chunked cosine similarity (O(N²) for
+            small N, O(chunk×N) for large N).
+          - AgentDBVectorStore: delegates to the AgentDB sidecar's
+            /v1/vector/cluster endpoint (built for scale).
+          - ShadowVectorStore: delegates to the primary store.
+
+        Fail-closed: returns [] on any error.
+        """
+        ...
+
 
 class LocalVectorStore:
     """In-memory vector store backed by numpy + sklearn cosine similarity.
@@ -184,6 +207,73 @@ class LocalVectorStore:
 
     def count(self) -> int:
         return len(self._ids)
+
+    def cluster(
+        self,
+        similarity_threshold: float = 0.85,
+        min_cluster_size: int = 3,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> List[List[str]]:
+        """Find clusters of highly-similar vectors using chunked cosine
+        similarity (v0.4.1). For N <= 512, computes the full N×N matrix.
+        For N > 512, uses chunked computation to bound memory at
+        O(chunk_size × N) instead of O(N²).
+        """
+        if self._matrix is None or len(self._ids) < min_cluster_size:
+            return []
+        # Apply filters to get the candidate indices.
+        if filters:
+            indices = [
+                i for i, vid in enumerate(self._ids)
+                if all(self._metadata[vid].get(k) == v for k, v in filters.items())
+            ]
+        else:
+            indices = list(range(len(self._ids)))
+        if len(indices) < min_cluster_size:
+            return []
+        n = len(indices)
+        sub_matrix = self._matrix[indices]
+        CHUNK_THRESHOLD = 512
+        CHUNK_SIZE = 256
+        assigned: Dict[int, int] = {}
+        clusters: List[List[str]] = []
+        if n <= CHUNK_THRESHOLD:
+            sims = cosine_similarity(sub_matrix)
+            for i in range(n):
+                if i in assigned:
+                    continue
+                cluster = [i]
+                assigned[i] = len(clusters)
+                for j in range(i + 1, n):
+                    if j in assigned:
+                        continue
+                    if sims[i][j] >= similarity_threshold:
+                        cluster.append(j)
+                        assigned[j] = assigned[i]
+                if len(cluster) >= min_cluster_size:
+                    clusters.append([self._ids[indices[k]] for k in cluster])
+        else:
+            norms = np.linalg.norm(sub_matrix, axis=1, keepdims=True)
+            normalized = sub_matrix / (norms + 1e-10)
+            for chunk_start in range(0, n, CHUNK_SIZE):
+                chunk_end = min(chunk_start + CHUNK_SIZE, n)
+                chunk = normalized[chunk_start:chunk_end]
+                chunk_sims = chunk @ normalized.T
+                for li, i in enumerate(range(chunk_start, chunk_end)):
+                    if i in assigned:
+                        continue
+                    cluster = [i]
+                    assigned[i] = len(clusters)
+                    row = chunk_sims[li]
+                    for j in range(i + 1, n):
+                        if j in assigned:
+                            continue
+                        if row[j] >= similarity_threshold:
+                            cluster.append(j)
+                            assigned[j] = assigned[i]
+                    if len(cluster) >= min_cluster_size:
+                        clusters.append([self._ids[indices[k]] for k in cluster])
+        return clusters
 
 
 class AgentDBVectorStore:
@@ -351,6 +441,39 @@ class AgentDBVectorStore:
             return 0
         return int(resp.get("count", 0))
 
+    def cluster(
+        self,
+        similarity_threshold: float = 0.85,
+        min_cluster_size: int = 3,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> List[List[str]]:
+        """Delegate clustering to the AgentDB sidecar's /v1/vector/cluster
+        endpoint (v0.4.1). The sidecar is built for scale and can handle
+        clustering across millions of vectors efficiently.
+
+        Fail-closed: returns [] on any error (sidecar down, malformed
+        response, etc.).
+        """
+        resp = self._post(
+            "/v1/vector/cluster",
+            {
+                "collection": self._collection,
+                "similarity_threshold": similarity_threshold,
+                "min_cluster_size": min_cluster_size,
+                "filters": filters or {},
+            },
+        )
+        if resp is None:
+            return []
+        clusters_data = resp.get("clusters", [])
+        if not isinstance(clusters_data, list):
+            return []
+        result: List[List[str]] = []
+        for cluster in clusters_data:
+            if isinstance(cluster, list) and len(cluster) >= min_cluster_size:
+                result.append([str(vid) for vid in cluster])
+        return result
+
 
 class ShadowVectorStore:
     """Dual-write vector store for zero-downtime migration.
@@ -414,6 +537,24 @@ class ShadowVectorStore:
 
     def count(self) -> int:
         return self._primary.count()
+
+    def cluster(
+        self,
+        similarity_threshold: float = 0.85,
+        min_cluster_size: int = 3,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> List[List[str]]:
+        """Delegate clustering to the primary store (v0.4.1).
+
+        If the primary is AgentDB, clustering happens server-side. If
+        the primary is Local, the chunked computation handles it. The
+        secondary is not used for clustering (it's a shadow write target).
+        """
+        return self._primary.cluster(
+            similarity_threshold=similarity_threshold,
+            min_cluster_size=min_cluster_size,
+            filters=filters,
+        )
 
 
 def make_vector_store(

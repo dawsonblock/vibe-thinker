@@ -306,3 +306,98 @@ class TestLogicVerifierUnavailable:
         assert result.verified is False
         assert result.method == "smt_unavailable"
         assert "z3-solver not installed" in result.error
+
+
+# ---------------------------------------------------------------------- #
+# Logic constraint translation (v0.4.1)
+# ---------------------------------------------------------------------- #
+class TestLogicConstraintTranslation:
+    """Test the _translate_logic_constraints method that translates
+    natural-language logic problems into Z3-compatible constraints via
+    the generalist model."""
+
+    @pytest.mark.asyncio
+    async def test_valid_constraint_translation(self):
+        """When the generalist returns valid JSON, it's parsed correctly."""
+        from hybrid_orchestrator import HybridReasoningOrchestrator
+        from unittest.mock import AsyncMock, patch
+
+        generalist_response = json.dumps({
+            "constraints": ["x > 0", "x + y == 10", "y < x"],
+            "variables": {"x": "Int", "y": "Int"},
+            "values": {"x": 7, "y": 3},
+        })
+
+        with patch.object(
+            HybridReasoningOrchestrator, "_call_generalist",
+            new_callable=AsyncMock, return_value=generalist_response,
+        ):
+            # Create a minimal orchestrator instance (we only need the
+            # _translate_logic_constraints method, not a full init).
+            orch = HybridReasoningOrchestrator.__new__(HybridReasoningOrchestrator)
+            result = await orch._translate_logic_constraints(
+                "If x is positive and x + y = 10 and y < x, what are x and y?"
+            )
+        assert result is not None
+        assert result["constraints"] == ["x > 0", "x + y == 10", "y < x"]
+        assert result["variables"] == {"x": "Int", "y": "Int"}
+        assert result["values"] == {"x": 7, "y": 3}
+
+    @pytest.mark.asyncio
+    async def test_malformed_json_returns_none(self):
+        """When the generalist returns malformed JSON, return None (fail-closed)."""
+        from hybrid_orchestrator import HybridReasoningOrchestrator
+        from unittest.mock import AsyncMock, patch
+
+        with patch.object(
+            HybridReasoningOrchestrator, "_call_generalist",
+            new_callable=AsyncMock, return_value="This is not JSON at all.",
+        ):
+            orch = HybridReasoningOrchestrator.__new__(HybridReasoningOrchestrator)
+            result = await orch._translate_logic_constraints("some query")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_markdown_wrapped_json_parsed(self):
+        """JSON wrapped in markdown code fences is still parsed."""
+        from hybrid_orchestrator import HybridReasoningOrchestrator
+        from unittest.mock import AsyncMock, patch
+
+        response = '```json\n{"constraints": ["a > 0"], "variables": {"a": "Int"}, "values": {"a": 5}}\n```'
+        with patch.object(
+            HybridReasoningOrchestrator, "_call_generalist",
+            new_callable=AsyncMock, return_value=response,
+        ):
+            orch = HybridReasoningOrchestrator.__new__(HybridReasoningOrchestrator)
+            result = await orch._translate_logic_constraints("query")
+        assert result is not None
+        assert result["constraints"] == ["a > 0"]
+
+    @pytest.mark.asyncio
+    async def test_empty_constraints_returns_none(self):
+        """When the generalist returns empty constraints, return None."""
+        from hybrid_orchestrator import HybridReasoningOrchestrator
+        from unittest.mock import AsyncMock, patch
+
+        response = json.dumps({"constraints": [], "variables": {}, "values": {}})
+        with patch.object(
+            HybridReasoningOrchestrator, "_call_generalist",
+            new_callable=AsyncMock, return_value=response,
+        ):
+            orch = HybridReasoningOrchestrator.__new__(HybridReasoningOrchestrator)
+            result = await orch._translate_logic_constraints("query")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_generalist_error_returns_none(self):
+        """When the generalist call raises, return None (fail-closed)."""
+        from hybrid_orchestrator import HybridReasoningOrchestrator
+        from unittest.mock import AsyncMock, patch
+
+        with patch.object(
+            HybridReasoningOrchestrator, "_call_generalist",
+            new_callable=AsyncMock, side_effect=RuntimeError("connection refused"),
+        ):
+            orch = HybridReasoningOrchestrator.__new__(HybridReasoningOrchestrator)
+            result = await orch._translate_logic_constraints("query")
+        assert result is None

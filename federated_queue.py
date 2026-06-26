@@ -56,6 +56,18 @@ from typing import Any, Callable, Dict, List, Optional, Protocol, runtime_checka
 from rfsn_job_queue import Job, JobStatus, JobQueue
 
 
+def _serialize_result(result) -> Dict[str, Any]:
+    """Serialize an OrchestratorResult to a JSON-safe dict for federation."""
+    if result is None:
+        return {}
+    if hasattr(result, "__dict__"):
+        return {k: v for k, v in result.__dict__.items()
+                if isinstance(v, (str, int, float, bool, list, dict, type(None)))}
+    if isinstance(result, dict):
+        return result
+    return {"result": str(result)}
+
+
 @runtime_checkable
 class BaseJobQueue(Protocol):
     """Protocol for job queue implementations.
@@ -400,7 +412,8 @@ class FederatedJobQueue:
 
         This is the "pull" side of the federation — the local node
         periodically polls the coordinator for pending jobs. If it gets
-        one, it submits it to the local queue for execution.
+        one, it submits it to the local queue for execution, then POSTs
+        the result back to the coordinator when the job completes.
         """
         import aiohttp
         import ssl
@@ -424,17 +437,72 @@ class FederatedJobQueue:
                         if not data.get("job_id"):
                             continue  # no pending jobs
                         # We claimed a job — submit it locally for execution.
+                        remote_job_id = data["job_id"]
                         job = self._local.submit(
                             data["query"],
                             priority=data.get("priority", 0),
                             force_route=data.get("force_route"),
                         )
-                        print(f"[FederatedQueue] Claimed job {data['job_id']} "
+                        print(f"[FederatedQueue] Claimed job {remote_job_id} "
                               f"from federation, running locally as {job.job_id}")
+                        # Launch a background task to wait for completion
+                        # and POST the result back to the coordinator.
+                        asyncio.create_task(
+                            self._claim_and_report(
+                                session, ctx, remote_job_id, job.job_id
+                            )
+                        )
             except asyncio.CancelledError:
                 break
             except Exception:
                 pass  # silent fail — the claim loop is best-effort
+
+    async def _claim_and_report(
+        self, session, ssl_ctx, remote_job_id: str, local_job_id: str
+    ):
+        """Wait for a claimed job to complete locally, then POST the
+        result back to the federation coordinator.
+        """
+        try:
+            result = await self._local.wait_for(local_job_id, timeout=600.0)
+            # POST the result back to the coordinator.
+            payload = {
+                "job_id": remote_job_id,
+                "result": _serialize_result(result),
+            }
+            async with session.post(
+                f"{self._federation_url}/complete",
+                json=payload, ssl=ssl_ctx,
+            ) as resp:
+                if resp.status < 400:
+                    print(f"[FederatedQueue] Reported result for "
+                          f"federation job {remote_job_id}")
+                else:
+                    print(f"[FederatedQueue] Failed to report result for "
+                          f"federation job {remote_job_id}: HTTP {resp.status}")
+        except asyncio.TimeoutError:
+            # Job timed out — report the error.
+            try:
+                async with session.post(
+                    f"{self._federation_url}/complete",
+                    json={"job_id": remote_job_id,
+                          "error": "execution timed out (600s)"},
+                    ssl=ssl_ctx,
+                ) as resp:
+                    pass
+            except Exception:
+                pass
+        except Exception as e:
+            # Job failed — report the error.
+            try:
+                async with session.post(
+                    f"{self._federation_url}/complete",
+                    json={"job_id": remote_job_id, "error": str(e)},
+                    ssl=ssl_ctx,
+                ) as resp:
+                    pass
+            except Exception:
+                pass
 
     # ----------------------- BaseJobQueue protocol ----------------------- #
     async def start(self) -> None:

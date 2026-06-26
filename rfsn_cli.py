@@ -446,6 +446,15 @@ def build_argparser() -> argparse.ArgumentParser:
                         "model pointing at the ruvltra .gguf. Do NOT use with a "
                         "3B+ code model — 15 parallel candidates will thrash.")
     p.set_defaults(fast_code_specialist=_env_bool("RFSN_FAST_CODE_SPECIALIST", False))
+    p.add_argument("--structured-output", dest="use_structured_output",
+                   action="store_true",
+                   help="Force the specialist to output structured JSON "
+                        "(reasoning_steps, boxed_answer, code_solution) via "
+                        "GBNF grammar. Eliminates brittle \\boxed{} regex "
+                        "scraping — the answer is read directly from the "
+                        "boxed_answer key. Falls back to regex for backends "
+                        "without grammar support. Default: off (backward compat).")
+    p.set_defaults(use_structured_output=_env_bool("RFSN_STRUCTURED_OUTPUT", False))
     p.add_argument("--audit-log",
                    default=os.environ.get("RFSN_AUDIT_LOG", "rfsn_jobs_bitemporal.jsonl"),
                    help="Bi-temporal audit log path (empty disables logging)")
@@ -613,6 +622,7 @@ async def _amain() -> None:
         dns_resolver=args.dns_resolver or None,
         sandbox_image=args.sandbox_image or None,
         proxy_egress=args.proxy_egress or None,
+        use_structured_output=args.use_structured_output,
     )
 
     # --- Audit-log signing (v0.3.9) ---

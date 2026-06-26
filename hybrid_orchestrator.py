@@ -284,6 +284,7 @@ class HybridReasoningOrchestrator:
         dns_resolver: Optional[str] = None,
         sandbox_image: Optional[str] = None,
         proxy_egress: Optional[str] = None,
+        use_structured_output: bool = False,
     ):
         self.vibe_endpoint = vibe_endpoint.rstrip("/")
         self.generalist_endpoint = generalist_endpoint.rstrip("/")
@@ -377,6 +378,7 @@ class HybridReasoningOrchestrator:
             local_n_ctx=local_specialist_n_ctx,
             local_n_threads=local_specialist_n_threads,
             local_pool_size=local_specialist_pool_size,
+            use_structured_output=use_structured_output,
         )
 
         self.use_embedding_router = use_embedding_router and EMBEDDINGS_AVAILABLE
@@ -1609,8 +1611,8 @@ class HybridReasoningOrchestrator:
         "Example:\n"
         'Problem: "If x is a positive integer and x + y = 10 and y < x, what are x and y?"\n'
         "Output:\n"
-        '{"constraints": ["x > 0", "x + y == 10", "y < x"], '
-        '"variables": {"x": "Int", "y": "Int"}, "values": {"x": 7, "y": 3}}\n'
+        '{{"constraints": ["x > 0", "x + y == 10", "y < x"], '
+        '"variables": {{"x": "Int", "y": "Int"}}, "values": {{"x": 7, "y": 3}}}}\n'
         "\n"
         "Problem: {query}\n"
         "Output:"

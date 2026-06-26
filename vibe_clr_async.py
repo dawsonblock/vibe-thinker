@@ -171,6 +171,7 @@ class VibeThinkerCLRAsync:
         local_n_ctx: int = 4096,
         local_n_threads: int = 8,
         local_pool_size: int = 1,
+        use_structured_output: bool = False,
     ):
         self.server_url = server_url.rstrip("/")
         self.k = k
@@ -217,6 +218,14 @@ class VibeThinkerCLRAsync:
         self._local_pool_size = max(1, local_pool_size)
         self._local_grammar = None
         self._local_lock = threading.Lock()  # used only in single-instance mode
+        # Structured output mode (v0.4.1): when enabled, trajectory
+        # generation uses _STRUCTURED_OUTPUT_GRAMMAR to force JSON output
+        # with reasoning_steps, boxed_answer, and code_solution keys.
+        # This eliminates brittle \boxed{} regex scraping. Disabled by
+        # default for backward compatibility — older model templates
+        # may not produce good JSON reasoning. Enable with the CLI flag
+        # --structured-output or the constructor parameter.
+        self.use_structured_output = use_structured_output
         self.backend = "http"
         if local_model:
             self._init_local_backend(local_model, local_n_ctx, local_n_threads)
@@ -962,19 +971,53 @@ class VibeThinkerCLRAsync:
 
         This does the full CLR pipeline: reasoning → claim extraction →
         claim verification → scoring. It is the expensive path (7 LLM calls).
-        """
-        reasoning_prompt = (
-            "<|im_start|>user\n"
-            f"{problem}\n\n"
-            "Solve this step by step. Think carefully and put your final "
-            "answer in \\boxed{}.\n"
-            "<|im_end|>\n<|im_start|>assistant\n"
-        )
-        raw_trace = await self._call_model(
-            session, reasoning_prompt, max_tokens=max_tokens
-        )
 
-        parsed = await self._extract_claims_and_answer(session, raw_trace)
+        When use_structured_output is enabled (v0.4.1), the reasoning step
+        uses _STRUCTURED_OUTPUT_GRAMMAR to force JSON output with
+        reasoning_steps, boxed_answer, and code_solution keys. The answer
+        is extracted directly from the JSON — no \boxed{} regex scraping.
+        """
+        if self.use_structured_output:
+            # Structured mode: force JSON output with distinct keys.
+            reasoning_prompt = (
+                "<|im_start|>user\n"
+                f"{problem}\n\n"
+                "Solve this step by step. Output your reasoning as a JSON "
+                "object with:\n"
+                '  "reasoning_steps": ["step 1", "step 2", ...]\n'
+                '  "boxed_answer": "the final answer" or null\n'
+                '  "code_solution": "the code" or null\n'
+                "<|im_end|>\n<|im_start|>assistant\n"
+            )
+            raw_trace = await self._call_model(
+                session, reasoning_prompt, max_tokens=max_tokens,
+                grammar=_STRUCTURED_OUTPUT_GRAMMAR,
+            )
+            # Parse the structured output directly — no regex needed.
+            structured = self.parse_structured_output(raw_trace)
+            if structured is not None:
+                final_answer = structured.get("boxed_answer")
+                # Still extract claims for the full CLR pipeline.
+                parsed = await self._extract_claims_and_answer(session, raw_trace)
+                # Override the answer with the structured one (more reliable).
+                parsed["final_answer"] = final_answer
+            else:
+                # Fallback: grammar wasn't enforced (e.g., HTTP backend
+                # without grammar support). Fall back to regex extraction.
+                parsed = await self._extract_claims_and_answer(session, raw_trace)
+        else:
+            reasoning_prompt = (
+                "<|im_start|>user\n"
+                f"{problem}\n\n"
+                "Solve this step by step. Think carefully and put your final "
+                "answer in \\boxed{}.\n"
+                "<|im_end|>\n<|im_start|>assistant\n"
+            )
+            raw_trace = await self._call_model(
+                session, reasoning_prompt, max_tokens=max_tokens
+            )
+            parsed = await self._extract_claims_and_answer(session, raw_trace)
+
         verdicts = await self._verify_claims(session, parsed["claims"])
         # Initial score without consistency check (applied later in run())
         score = self._calculate_reliability(
@@ -1002,23 +1045,49 @@ class VibeThinkerCLRAsync:
         final answer directly — no need for expensive self-verification
         if an external verifier will confirm or refute.
 
+        When use_structured_output is enabled (v0.4.1), the answer is
+        extracted directly from the JSON boxed_answer key — no regex.
+        Falls back to _extract_boxed_answer() for unstructured outputs.
+
         The claims/verdicts fields are empty. If the verifier doesn't
         confirm, the caller should re-run with full trajectory generation
         to get self-claim scores.
         """
-        reasoning_prompt = (
-            "<|im_start|>user\n"
-            f"{problem}\n\n"
-            "Solve this step by step. Think carefully and put your final "
-            "answer in \\boxed{}.\n"
-            "<|im_end|>\n<|im_start|>assistant\n"
-        )
-        raw_trace = await self._call_model(
-            session, reasoning_prompt, max_tokens=max_tokens
-        )
-
-        # Extract just the final answer (no LLM call — regex only)
-        final_answer = self._extract_boxed_answer(raw_trace)
+        if self.use_structured_output:
+            reasoning_prompt = (
+                "<|im_start|>user\n"
+                f"{problem}\n\n"
+                "Solve this step by step. Output your reasoning as a JSON "
+                "object with:\n"
+                '  "reasoning_steps": ["step 1", "step 2", ...]\n'
+                '  "boxed_answer": "the final answer" or null\n'
+                '  "code_solution": "the code" or null\n'
+                "<|im_end|>\n<|im_start|>assistant\n"
+            )
+            raw_trace = await self._call_model(
+                session, reasoning_prompt, max_tokens=max_tokens,
+                grammar=_STRUCTURED_OUTPUT_GRAMMAR,
+            )
+            # Parse structured output — no regex needed.
+            structured = self.parse_structured_output(raw_trace)
+            if structured is not None:
+                final_answer = structured.get("boxed_answer")
+            else:
+                # Fallback: regex extraction for unstructured output.
+                final_answer = self._extract_boxed_answer(raw_trace)
+        else:
+            reasoning_prompt = (
+                "<|im_start|>user\n"
+                f"{problem}\n\n"
+                "Solve this step by step. Think carefully and put your final "
+                "answer in \\boxed{}.\n"
+                "<|im_end|>\n<|im_start|>assistant\n"
+            )
+            raw_trace = await self._call_model(
+                session, reasoning_prompt, max_tokens=max_tokens
+            )
+            # Extract just the final answer (no LLM call — regex only)
+            final_answer = self._extract_boxed_answer(raw_trace)
 
         return {
             "score": 0.0,  # Not scored yet — caller scores after verification

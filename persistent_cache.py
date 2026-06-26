@@ -861,6 +861,42 @@ class VerifiedTrajectoryStore:
         if len(self.entries) < min_cluster_size:
             return []
 
+        # v0.4.1: When a vector store (AgentDB) is configured, delegate
+        # clustering to it — the sidecar is built for scale and can handle
+        # clustering across millions of vectors efficiently. The vector
+        # store returns clusters of vector_ids, which we map back to entry
+        # indices. Fail-closed: if the vector store returns [], fall
+        # through to the local chunked computation.
+        if self._vector_store is not None:
+            try:
+                filters = {"task_type": task_type} if task_type else None
+                vid_clusters = self._vector_store.cluster(
+                    similarity_threshold=similarity_threshold,
+                    min_cluster_size=min_cluster_size,
+                    filters=filters,
+                )
+                if vid_clusters:
+                    # Map vector_ids back to entry indices.
+                    id_to_idx = {
+                        e.get("id", f"entry_{i}"): i
+                        for i, e in enumerate(self.entries)
+                    }
+                    result = []
+                    for vid_cluster in vid_clusters:
+                        idx_cluster = [
+                            id_to_idx[vid] for vid in vid_cluster
+                            if vid in id_to_idx
+                        ]
+                        if len(idx_cluster) >= min_cluster_size:
+                            result.append(idx_cluster)
+                    if result:
+                        return result
+                    # Vector store returned clusters but we couldn't map
+                    # them — fall through to local computation.
+            except Exception as e:
+                print(f"[TrajectoryStore] Vector store clustering failed: {e} "
+                      f"— falling back to local computation")
+
         # Filter by task_type if requested.
         if task_type is not None:
             indices = [

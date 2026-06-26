@@ -224,6 +224,76 @@ def create_app(
             return JSONResponse({"error": "not found"}, status_code=404)
         return job
 
+    # ------------------------------------------------------------------ #
+    # Federation coordinator endpoints (v0.4.1)
+    # ------------------------------------------------------------------ #
+    # These endpoints allow this UI server to act as a federation
+    # coordinator. Worker nodes can claim pending jobs and report
+    # results back. This integrates the federation directly into the
+    # existing web UI — no separate federation_server.py needed when
+    # the UI is already running.
+    #
+    # Worker flow:
+    #   1. POST /api/jobs/claim {"worker_id": "laptop-2"} -> gets a job
+    #   2. Worker runs the job locally
+    #   3. POST /api/jobs/complete {"job_id": "...", "result": {...}}
+
+    @app.post("/api/jobs/claim")
+    async def api_jobs_claim(request: dict):
+        """A worker claims a pending job for federated execution.
+
+        Returns the highest-priority pending job, or {"job_id": null}
+        if no jobs are pending. The job's status is set to "running"
+        with claimed_by set to the worker_id.
+        """
+        worker_id = request.get("worker_id", "unknown")
+        # Find the highest-priority pending job.
+        pending = [
+            (jid, j) for jid, j in state.jobs.items()
+            if j["status"] == "pending"
+        ]
+        if not pending:
+            return {"job_id": None, "status": "no_jobs"}
+        # Sort by created_at (FIFO) — priority could be added here.
+        pending.sort(key=lambda x: x[1]["created_at"])
+        job_id, job = pending[0]
+        state.update_job(
+            job_id, status="running", started_at=time.time(),
+            claimed_by=worker_id,
+        )
+        await state.broadcast({"type": "job_update", "job": state.jobs[job_id]})
+        return {
+            "job_id": job_id,
+            "query": job["query"],
+            "force_route": job.get("force_route"),
+            "status": "claimed",
+        }
+
+    @app.post("/api/jobs/complete")
+    async def api_jobs_complete(request: dict):
+        """A worker reports a completed job.
+
+        Sets the job's result and status. Triggers WebSocket broadcast
+        so the UI updates in real time.
+        """
+        job_id = request.get("job_id", "")
+        if job_id not in state.jobs:
+            return JSONResponse({"error": "job not found"}, status_code=404)
+        result = request.get("result")
+        error = request.get("error")
+        if error:
+            state.update_job(
+                job_id, status="error", finished_at=time.time(),
+                error=error, result=result,
+            )
+        else:
+            state.update_job(
+                job_id, status="done", finished_at=time.time(),
+                result=result,
+            )
+        await state.broadcast({"type": "job_update", "job": state.jobs[job_id]})
+        return {"status": "ok"}
+
     @app.get("/api/memory")
     async def api_memory(limit: int = 50):
         """View orchestrator memory vault (orchestrator_memory.jsonl)."""
