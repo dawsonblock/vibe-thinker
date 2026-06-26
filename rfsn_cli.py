@@ -63,6 +63,23 @@ def _env_bool(name: str, default: bool) -> bool:
     return val.strip().lower() in ("true", "1", "yes", "on")
 
 
+def _build_retrieval_backend(args) -> "object | None":
+    """Build a retrieval backend from CLI args / env vars.
+
+    Precedence: --serper-key > --searchapi-key > SERPER_API_KEY env >
+    SEARCHAPI_API_KEY env. Returns None when no key is configured (the
+    orchestrator then skips retrieval — fail-closed, unchanged behavior).
+    """
+    from retrieval import make_retrieval_backend
+    serper = args.serper_key or None
+    searchapi = args.searchapi_key or None
+    backend = make_retrieval_backend(serper_key=serper, searchapi_key=searchapi)
+    if backend is not None:
+        print(f"[CLI] Active retrieval enabled: {backend.name} — "
+              f"factual tasks will fetch real sources for NLI verification")
+    return backend
+
+
 # ----------------------------- command parsing ----------------------------- #
 def _split_flags(tokens):
     """Pull leading -p/-r style flags out of a token list.
@@ -304,6 +321,14 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Number of parallel code candidates to generate and "
                         "verify in the sandbox (default 6 — higher for fast "
                         "0.5B models, lower for slower models).")
+    p.add_argument("--max-repair-attempts", type=int,
+                   default=int(os.environ.get("MAX_REPAIR_ATTEMPTS", "2")),
+                   help="When a code candidate fails with a real bug "
+                        "(ASSERTION_FAILED/IMPORT_ERROR), feed the failing "
+                        "code + error back to the code specialist for a "
+                        "targeted repair. Max repair rounds (default 2, 0 "
+                        "disables). Fail-closed: unverified if no repair "
+                        "passes.")
     p.add_argument("--no-trajectory-store", dest="use_trajectory_store",
                    action="store_false",
                    help="Disable the verified-trajectory store (self-improving "
@@ -437,6 +462,22 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--mtls-ca",
                    default=os.environ.get("FEDERATION_MTLS_CA", ""),
                    help="Path to the mTLS CA certificate (PEM) that signed all node certs.")
+    # --- Active retrieval (v0.4.0) ---
+    # When configured, factual tasks fetch real source text from a search API
+    # and feed it to the FactualVerifier's NLI judge. Fail-closed: no key =
+    # no retrieval = unsupported_factual (unchanged honest behavior).
+    # Keys are NEVER logged or committed. Precedence: --serper-key >
+    # --searchapi-key > SERPER_API_KEY env > SEARCHAPI_API_KEY env.
+    p.add_argument("--serper-key",
+                   default=os.environ.get("SERPER_API_KEY", ""),
+                   help="Serper.dev API key for factual retrieval. When set, "
+                        "factual queries fetch real Google search results and "
+                        "feed the snippets to the FactualVerifier NLI judge. "
+                        "Empty = no retrieval (default, fail-closed).")
+    p.add_argument("--searchapi-key",
+                   default=os.environ.get("SEARCHAPI_API_KEY", ""),
+                   help="SearchApi.io API key for factual retrieval (alternative "
+                        "to --serper-key). Same fail-closed behavior.")
     p.add_argument("--embedding-router", dest="use_embedding_router",
                    action="store_true",
                    help="Use embedding-based semantic router (default)")
@@ -473,6 +514,7 @@ async def _amain() -> None:
         generalist_endpoint=args.generalist,
         code_specialist_endpoint=args.code_specialist or None,
         code_candidates=code_candidates,
+        max_repair_attempts=args.max_repair_attempts,
         use_clr=args.use_clr,
         clr_k=args.clr_k,
         use_embedding_router=args.use_embedding_router,
@@ -484,6 +526,7 @@ async def _amain() -> None:
         local_specialist_n_threads=args.local_specialist_n_threads,
         local_specialist_pool_size=args.local_specialist_pool_size,
         agentdb_url=args.agentdb_url or None,
+        retrieval_backend=_build_retrieval_backend(args),
     )
 
     # --- Audit-log signing (v0.3.9) ---

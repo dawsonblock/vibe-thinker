@@ -124,6 +124,13 @@ class CodeVerifier:
         unit_tests = context.get("unit_tests")
         expected_output = context.get("expected_output")
 
+        # Dynamic resource limits (v0.4.0): when the orchestrator provides
+        # compute_limits in the context, use them instead of the hardcoded
+        # defaults. Absent -> use self.timeout / "128m" (backward-compatible).
+        compute_limits = context.get("compute_limits") or {}
+        timeout = compute_limits.get("timeout", self.timeout)
+        memory_limit = compute_limits.get("memory", "128m")
+
         # Check that we have a sandbox executor
         if self.executor is None:
             return VerificationResult(
@@ -138,11 +145,16 @@ class CodeVerifier:
 
         # If unit tests are provided, run them against the candidate code.
         if unit_tests:
-            return await self._run_unit_tests(answer, unit_tests)
+            return await self._run_unit_tests(
+                answer, unit_tests, timeout=timeout, memory_limit=memory_limit,
+            )
 
         # If expected_output is provided, run the code and compare stdout.
         if expected_output is not None:
-            return await self._run_and_compare_stdout(answer, str(expected_output))
+            return await self._run_and_compare_stdout(
+                answer, str(expected_output),
+                timeout=timeout, memory_limit=memory_limit,
+            )
 
         # No verification criteria provided — be honest.
         return VerificationResult(
@@ -154,26 +166,35 @@ class CodeVerifier:
         )
 
     async def _run_unit_tests(
-        self, code: str, unit_tests: str
+        self, code: str, unit_tests: str,
+        timeout: Optional[float] = None,
+        memory_limit: str = "128m",
     ) -> VerificationResult:
         """Run unit tests against the candidate code in the sandbox."""
         result = await self.executor.execute_tests(
             code, unit_tests,
-            timeout=self.timeout,
+            timeout=timeout if timeout is not None else self.timeout,
             network=False,
+            memory_limit=memory_limit,
         )
         return self._interpret_test_result(result, {
             "code_length": len(code),
             "tests_length": len(unit_tests),
             "executor": result.executor,
+            "memory_limit": memory_limit,
         })
 
     async def _run_and_compare_stdout(
-        self, code: str, expected_output: str
+        self, code: str, expected_output: str,
+        timeout: Optional[float] = None,
+        memory_limit: str = "128m",
     ) -> VerificationResult:
         """Run code in sandbox and compare stdout to expected output."""
         result = await self.executor.execute(
-            code, timeout=self.timeout, network=False,
+            code,
+            timeout=timeout if timeout is not None else self.timeout,
+            network=False,
+            memory_limit=memory_limit,
         )
         if result.timed_out:
             return VerificationResult(

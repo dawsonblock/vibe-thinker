@@ -1,13 +1,16 @@
 # vibe-thinker — project notes for agents
 
 ## Verify / test
-- Full suite: `python3 -m pytest -q` (502 tests, ~90s, no live servers needed)
+- Full suite: `python3 -m pytest -q` (579 tests, ~90s, no live servers needed)
 - Routing + REPL only: `python3 -m pytest tests/test_routing.py tests/test_repl.py -q`
 - Warm pool + code verifier: `python3 -m pytest tests/test_warm_pool.py tests/test_code_verifier.py -q`
 - Trajectory store: `python3 -m pytest tests/test_trajectory_store.py -q`
 - Grammar enforcement: `python3 -m pytest tests/test_clr_scoring.py::TestGrammarEnforcement -q`
 - In-process backend + pool + fast-specialist: `python3 -m pytest tests/test_clr_scoring.py::TestInProcessBackend tests/test_clr_scoring.py::TestInProcessPool tests/test_clr_scoring.py::TestFastSpecialistPolicy -q`
 - Test-feedback loop: `python3 -m pytest tests/test_routing.py::TestCodeSpecialistRouting -q`
+- Iterative code repair: `python3 -m pytest tests/test_routing.py::TestCodeSpecialistRouting -k repair -q`
+- DPO/SFT exporter: `python3 -m pytest tests/test_export_dpo.py -q`
+- Active retrieval: `python3 -m pytest tests/test_retrieval.py -q`
 - Sandbox nonce anti-spoofing: `python3 -m pytest tests/test_code_verifier.py::TestNonceAntiSpoofing -q`
 - Bi-temporal log HMAC signatures: `python3 -m pytest tests/test_bitemporal_log.py::TestHmacSignatures -q`
 - Ed25519 + signer abstraction: `python3 -m pytest tests/test_signers.py -q`
@@ -108,6 +111,108 @@ Phase 4.1. Enables multi-node reasoning swarms via exo-federation:
 The existing `JobQueue` satisfies `BaseJobQueue` structurally
 (runtime_checkable Protocol) — no changes needed to use it as a
 `BaseJobQueue`.
+
+## Iterative code repair (v0.4.0)
+Extends the multi-candidate code loop (`_run_code_specialist_verified`) with
+targeted repair. Previously, candidates that failed an assertion were simply
+discarded. Now, when the best candidate fails with a code bug
+(`ASSERTION_FAILED` or `IMPORT_ERROR` — a real defect in the candidate, NOT
+a broken test), the failing code + the verifier's error message are fed back
+to the code specialist via `_CODE_REPAIR_PROMPT` for a corrected attempt.
+- Bounded by `max_repair_attempts` (default 2, 0 disables). CLI:
+  `--max-repair-attempts` / `MAX_REPAIR_ATTEMPTS` env.
+- Distinct from the v0.3.6 test-feedback loop: that fires only when ALL
+  candidates fail with `TEST_ERROR` (the test spec itself is broken) and
+  retries test generation. Repair fires on candidate code bugs and retries
+  code generation. The two are mutually exclusive — `TEST_ERROR` never
+  triggers repair, and `ASSERTION_FAILED`/`IMPORT_ERROR` never trigger a
+  test-spec retry.
+- Fail-closed: if no repair passes, the best-effort unverified result is
+  returned with `score 0.0` (never fake verification). The verified result's
+  `raw_traces` carries `repair_attempts`; the unverified result carries
+  `repair_attempts` = rounds actually attempted.
+- Repair candidates are generated in parallel (same `code_candidates` count
+  and diverse temperatures as the initial round) and verified concurrently.
+  Each repair round's traces are appended to `all_verification_traces` with a
+  `repair_attempt` index. The next repair round feeds back the latest
+  failing candidate.
+
+## DPO / SFT exporter (v0.4.0)
+`scripts/export_dpo.py` turns the system into an automated data-flywheel for
+fine-tuning. Verified solutions become the "chosen" column; failed/unverified
+completions become the "rejected" column, in standard HuggingFace formats.
+- Chosen: drawn ONLY from `verified_trajectories.json` entries that are
+  `verified=True` with a deterministic `verification_method` (not
+  `self_claims_only`). The trajectory store already enforces this on load;
+  the exporter re-checks defensively. Never learns from self-claims.
+- Rejected: drawn ONLY from clearly-worse completions in
+  `orchestrator_memory.jsonl`:
+  - CLR trajectories whose score < `--reject-threshold` (default 0.5) AND
+    whose answer differs from the verified chosen (near-ties are NOT labeled
+    rejected — that would teach a wrong preference).
+  - CLR runs whose `best_score` < `--min-score` (default 0.75, matching the
+    cache trust threshold) — the low-confidence best answer is rejected.
+  - Code tasks where `raw_traces.verified` is False — the sandbox explicitly
+    rejected the candidate.
+- Formats: `--format dpo` (`{"prompt","chosen","rejected"}` JSONL),
+  `--format sft` (`{"messages":[user,assistant]}` JSONL), or `--format both`
+  (writes `<out>.dpo.jsonl` + `<out>.sft.jsonl`).
+- `--max-pairs-per-query` (default 3) caps pairs per query so one popular
+  query can't dominate. Chosen entries with no matching rejected completion
+  are still emitted as SFT (verified data is always safe to learn from).
+- Note: the plan referenced a `clr_trace.json` file that does not exist; the
+  real trace data lives in `orchestrator_memory.jsonl` (via `log_to_memory`).
+
+## Active retrieval (v0.4.0)
+`retrieval.py` provides pluggable search-API backends that fetch real source
+text for factual verification. This closes the "honesty gap" where
+FactualVerifier always returned `unsupported_factual` because no sources
+existed. Now, when a retrieval backend is configured, factual queries fetch
+real Google search snippets and feed them to the NLI judge for
+ENTAILMENT / CONTRADICTION / NEUTRAL classification.
+
+### Trust model (fail-closed, no epistemic contamination)
+- Every backend returns `[]` on ANY failure: missing API key, network error,
+  timeout, non-2xx response, malformed JSON, empty results. The orchestrator
+  treats `[]` as "no sources" — the FactualVerifier returns
+  `unsupported_factual`, which is the honest, unchanged behavior. No backend
+  ever fabricates sources or returns hardcoded text.
+- Sources are real text snippets from search-engine organic results (title +
+  snippet + link). These are genuine web text, not model-generated — the NLI
+  judge classifies the model's answer against them, same as a human checking
+  a citation.
+- Results without a snippet are skipped — a title alone is too thin for the
+  NLI judge to classify entailment against.
+- API keys are read from constructor args or env vars. They are NEVER
+  hardcoded, logged, or committed to the repo.
+
+### Backends
+- `SerperBackend` — google.serper.dev (POST, `X-API-KEY` header). Key from
+  `api_key` arg or `SERPER_API_KEY` env. Extracts `organic[].snippet` +
+  `knowledgeGraph.description`.
+- `SearchApiBackend` — www.searchapi.io (GET, `api_key` query param). Key
+  from `api_key` arg or `SEARCHAPI_API_KEY` env. Extracts
+  `organic_results[].snippet` + `knowledge_graph.description`.
+- `None` (default) — no retrieval. Unchanged fail-closed behavior.
+
+### Factory
+`make_retrieval_backend(serper_key, searchapi_key, timeout)` — precedence:
+explicit serper_key > explicit searchapi_key > `SERPER_API_KEY` env >
+`SEARCHAPI_API_KEY` env > None.
+
+### Orchestrator integration
+`_build_verifier_context` is now async (it was sync; the only caller,
+`_run_clr_with_cache`, is already async). For `task_type == "factual"`, it
+calls `await self._retrieval_backend.search(query)` and puts the results in
+`context["sources"]`. If the backend is None, returns [], or raises, no
+sources are set — the verifier returns `unsupported_factual`. Math and code
+tasks never trigger retrieval. The orchestrator's `__init__` accepts
+`retrieval_backend=` (default `_UNSET` → auto-detect from env vars).
+
+### CLI flags
+`--serper-key` / `SERPER_API_KEY` env, `--searchapi-key` /
+`SEARCHAPI_API_KEY` env. When set, the CLI prints which backend is active.
+Keys are never logged.
 
 ## Security hardening (v0.3.8)
 Ten fixes from a full codebase audit. All stdlib-only, no new dependencies.

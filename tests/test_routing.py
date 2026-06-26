@@ -521,6 +521,7 @@ class TestCodeSpecialistRouting:
             generalist_endpoint="http://localhost:0",
             code_specialist_endpoint="http://127.0.0.1:8082",
             code_candidates=2,
+            max_repair_attempts=0,  # isolate test-spec-retry behavior
             use_clr=True,
             use_embedding_router=False,
             use_clr_cache=False,
@@ -547,6 +548,194 @@ class TestCodeSpecialistRouting:
         assert result.route_taken == "code_specialist_unverified"
         # No retry — not ALL were TEST_ERROR
         assert o._generate_test_spec.await_count == 1
+
+    # ------------------------------------------------------------------ #
+    # Iterative code repair (v0.4.0)
+    # ------------------------------------------------------------------ #
+    @pytest.mark.asyncio
+    async def test_assertion_failure_triggers_repair_success(self):
+        """When a candidate fails with ASSERTION_FAILED, the failing code +
+        error are fed back to the code specialist. If a repair passes, the
+        result is verified (score 1.0) with repair_attempts traced."""
+        o = HybridReasoningOrchestrator(
+            vibe_endpoint="http://localhost:0",
+            generalist_endpoint="http://localhost:0",
+            code_specialist_endpoint="http://127.0.0.1:8082",
+            code_candidates=1,
+            max_repair_attempts=2,
+            use_clr=True,
+            use_embedding_router=False,
+            use_clr_cache=False,
+            use_trajectory_store=False,
+        )
+        o._generate_test_spec = AsyncMock(return_value="assert square(2) == 4")
+        # Initial candidate is buggy; the repair produces a correct solution.
+        o._call_code_specialist = AsyncMock(side_effect=[
+            "```python\ndef square(n): return n + 1\n```",   # initial (buggy)
+            "```python\ndef square(n): return n * n\n```",   # repair (correct)
+        ])
+        o.code_verifier = MagicMock()
+        o.code_verifier.verify = AsyncMock(side_effect=[
+            VerificationResult(
+                verified=False, score=0.0, method="unit_tests",
+                error="ASSERTION_FAILED: assert 3 == 4",
+            ),
+            VerificationResult(
+                verified=True, score=1.0, method="unit_tests",
+            ),
+        ])
+
+        result = await o.run("Write a Python function to square a number")
+        assert result.route_taken == "code_specialist_verified"
+        assert result.clr_score == 1.0
+        assert result.raw_traces["verified"] is True
+        assert result.raw_traces["repair_attempts"] == 1
+        # The repair prompt must contain the failing-code error feedback.
+        repair_call_args = o._call_code_specialist.call_args_list[1][0][0]
+        assert "ASSERTION_FAILED" in repair_call_args
+        # No test-spec retry happened (ASSERTION_FAILED is a code problem).
+        assert o._generate_test_spec.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_import_error_triggers_repair(self):
+        """IMPORT_ERROR is also a candidate defect — repair fires for it too."""
+        o = HybridReasoningOrchestrator(
+            vibe_endpoint="http://localhost:0",
+            generalist_endpoint="http://localhost:0",
+            code_specialist_endpoint="http://127.0.0.1:8082",
+            code_candidates=1,
+            max_repair_attempts=2,
+            use_clr=True,
+            use_embedding_router=False,
+            use_clr_cache=False,
+            use_trajectory_store=False,
+        )
+        o._generate_test_spec = AsyncMock(return_value="assert square(2) == 4")
+        o._call_code_specialist = AsyncMock(side_effect=[
+            "```python\nsyntax error here\n```",            # initial (broken)
+            "```python\ndef square(n): return n * n\n```",  # repair (correct)
+        ])
+        o.code_verifier = MagicMock()
+        o.code_verifier.verify = AsyncMock(side_effect=[
+            VerificationResult(
+                verified=False, score=0.0, method="unit_tests",
+                error="IMPORT_ERROR: invalid syntax",
+            ),
+            VerificationResult(
+                verified=True, score=1.0, method="unit_tests",
+            ),
+        ])
+
+        result = await o.run("Write a Python function to square a number")
+        assert result.route_taken == "code_specialist_verified"
+        assert result.clr_score == 1.0
+        assert result.raw_traces["repair_attempts"] == 1
+
+    @pytest.mark.asyncio
+    async def test_repair_exhausted_fails_closed(self):
+        """If every repair attempt also fails, the result is unverified with
+        score 0.0 (fail-closed — never fake verification)."""
+        o = HybridReasoningOrchestrator(
+            vibe_endpoint="http://localhost:0",
+            generalist_endpoint="http://localhost:0",
+            code_specialist_endpoint="http://127.0.0.1:8082",
+            code_candidates=1,
+            max_repair_attempts=2,
+            use_clr=True,
+            use_embedding_router=False,
+            use_clr_cache=False,
+            use_trajectory_store=False,
+        )
+        o._generate_test_spec = AsyncMock(return_value="assert square(2) == 4")
+        # The specialist always returns the same buggy code, even on repair.
+        o._call_code_specialist = AsyncMock(
+            return_value="```python\ndef square(n): return n + 1\n```"
+        )
+        o.code_verifier = MagicMock()
+        o.code_verifier.verify = AsyncMock(return_value=VerificationResult(
+            verified=False, score=0.0, method="unit_tests",
+            error="ASSERTION_FAILED: assert 3 == 4",
+        ))
+
+        result = await o.run("Write a Python function to square a number")
+        assert result.route_taken == "code_specialist_unverified"
+        assert result.clr_score == 0.0
+        assert result.raw_traces["verified"] is False
+        assert result.raw_traces["repair_attempts"] == 2
+        # 1 initial verify + 2 repair verifies = 3 total verify calls.
+        assert o.code_verifier.verify.await_count == 3
+        # No test-spec retry.
+        assert o._generate_test_spec.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_max_repair_attempts_zero_disables_repair(self):
+        """With max_repair_attempts=0, ASSERTION_FAILED does NOT trigger any
+        repair — the loop is fully disabled (backward-compatible behavior)."""
+        o = HybridReasoningOrchestrator(
+            vibe_endpoint="http://localhost:0",
+            generalist_endpoint="http://localhost:0",
+            code_specialist_endpoint="http://127.0.0.1:8082",
+            code_candidates=1,
+            max_repair_attempts=0,
+            use_clr=True,
+            use_embedding_router=False,
+            use_clr_cache=False,
+            use_trajectory_store=False,
+        )
+        o._generate_test_spec = AsyncMock(return_value="assert square(2) == 4")
+        o._call_code_specialist = AsyncMock(
+            return_value="```python\ndef square(n): return n + 1\n```"
+        )
+        o.code_verifier = MagicMock()
+        o.code_verifier.verify = AsyncMock(return_value=VerificationResult(
+            verified=False, score=0.0, method="unit_tests",
+            error="ASSERTION_FAILED: assert 3 == 4",
+        ))
+
+        result = await o.run("Write a Python function to square a number")
+        assert result.route_taken == "code_specialist_unverified"
+        assert result.clr_score == 0.0
+        assert result.raw_traces["repair_attempts"] == 0
+        # Only the single initial verification — no repair calls.
+        assert o.code_verifier.verify.await_count == 1
+        # The code specialist is called exactly once (no repair generation).
+        assert o._call_code_specialist.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_test_error_does_not_trigger_repair(self):
+        """TEST_ERROR is a broken-test problem, not a code bug — it must
+        trigger the test-spec retry path, NOT the code-repair path."""
+        o = HybridReasoningOrchestrator(
+            vibe_endpoint="http://localhost:0",
+            generalist_endpoint="http://localhost:0",
+            code_specialist_endpoint="http://127.0.0.1:8082",
+            code_candidates=1,
+            max_repair_attempts=2,
+            use_clr=True,
+            use_embedding_router=False,
+            use_clr_cache=False,
+            use_trajectory_store=False,
+        )
+        o._generate_test_spec = AsyncMock(
+            side_effect=["assert bad1()", "assert bad2()"]
+        )
+        o._call_code_specialist = AsyncMock(
+            return_value="```python\ndef f(): pass\n```"
+        )
+        o.code_verifier = MagicMock()
+        o.code_verifier.verify = AsyncMock(return_value=VerificationResult(
+            verified=False, score=0.0, method="unit_tests",
+            error="TEST_ERROR: name 'bad1' is not defined",
+        ))
+
+        result = await o.run("Write a function")
+        assert result.route_taken == "code_specialist_unverified"
+        assert result.clr_score == 0.0
+        # TEST_ERROR triggers test-spec retry (2 generations), not repair.
+        assert o._generate_test_spec.await_count == 2
+        # 2 verifications (one per test-spec attempt); no repair verifications.
+        assert o.code_verifier.verify.await_count == 2
+        assert result.raw_traces["repair_attempts"] == 0
 
     @pytest.mark.asyncio
     async def test_parallel_verification_runs_concurrently(self):

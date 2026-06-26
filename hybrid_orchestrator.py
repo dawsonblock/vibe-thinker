@@ -36,6 +36,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from retrieval import RetrievalBackend
+
 from vibe_clr_async import CLRResult, VibeThinkerCLRAsync
 from persistent_cache import (
     CLRResultCache,
@@ -43,7 +48,7 @@ from persistent_cache import (
     VerifiedTrajectoryStore,
     should_cache,
 )
-from verifiers import MathVerifier, CodeVerifier, FactualVerifier
+from verifiers import MathVerifier, CodeVerifier, FactualVerifier, SchemaVerifier, LogicVerifier
 from sandbox import WarmDockerPool
 from math_solver import solve as solve_math
 
@@ -60,7 +65,8 @@ def select_verifier(task_type: str, llm_judge=None):
     no deterministic way to verify "explain X" or "summarize Y".
 
     Args:
-        task_type: the routed task type ("math", "code", "factual", etc.).
+        task_type: the routed task type ("math", "code", "factual",
+            "schema", "logic", etc.).
         llm_judge: optional async callable (prompt -> response str) used
             by FactualVerifier as an NLI judge. Typically the
             orchestrator's ``_call_generalist``.
@@ -71,6 +77,10 @@ def select_verifier(task_type: str, llm_judge=None):
         return CodeVerifier()
     if task_type == "factual":
         return FactualVerifier(llm_judge=llm_judge)
+    if task_type == "schema":
+        return SchemaVerifier()
+    if task_type == "logic":
+        return LogicVerifier()
     return None
 
 # Optional dependency — gracefully degrade if not installed
@@ -247,6 +257,7 @@ class HybridReasoningOrchestrator:
         generalist_endpoint: str = "http://127.0.0.1:8081",
         code_specialist_endpoint: Optional[str] = None,
         code_candidates: int = 6,
+        max_repair_attempts: int = 2,
         code_verifier: Optional["CodeVerifier"] = _UNSET,
         use_clr: bool = True,
         clr_k: int = 8,
@@ -268,6 +279,7 @@ class HybridReasoningOrchestrator:
         local_specialist_n_threads: int = 8,
         local_specialist_pool_size: int = 1,
         agentdb_url: Optional[str] = None,
+        retrieval_backend: Optional["RetrievalBackend"] = _UNSET,
     ):
         self.vibe_endpoint = vibe_endpoint.rstrip("/")
         self.generalist_endpoint = generalist_endpoint.rstrip("/")
@@ -284,6 +296,24 @@ class HybridReasoningOrchestrator:
         # code_verifier (CodeVerifier with a sandbox executor). If no verifier
         # is configured, falls back to single-candidate plain generation.
         self.code_candidates = max(1, code_candidates)
+        # Iterative code repair (v0.4.0): when the best candidate fails with
+        # a code bug (ASSERTION_FAILED / IMPORT_ERROR — not a broken test),
+        # feed the failing code + error back to the code specialist for a
+        # targeted repair. Bounded by max_repair_attempts. Fail-closed: if no
+        # repair passes, the best-effort unverified result is returned. Set to
+        # 0 to disable. CLI: --max-repair-attempts / MAX_REPAIR_ATTEMPTS env.
+        self.max_repair_attempts = max(0, max_repair_attempts)
+        # Active retrieval backend (v0.4.0). When configured, factual tasks
+        # fetch real source text from a search API (Serper / SearchApi) and
+        # feed it to the FactualVerifier's NLI judge. When None (default),
+        # no retrieval — the verifier returns unsupported_factual, which is
+        # the honest, unchanged fail-closed behavior. _UNSET -> auto-detect
+        # from SERPER_API_KEY / SEARCHAPI_API_KEY env vars.
+        if retrieval_backend is _UNSET:
+            from retrieval import make_retrieval_backend
+            self._retrieval_backend = make_retrieval_backend()
+        else:
+            self._retrieval_backend = retrieval_backend
         # _UNSET -> default CodeVerifier (safe, fail-closed sandbox).
         # None -> explicitly disabled (plain generation, no verification).
         self.code_verifier = CodeVerifier() if code_verifier is _UNSET else code_verifier
@@ -600,6 +630,10 @@ class HybridReasoningOrchestrator:
           - requires_tools: list of tool names needed for verification
           - requires_model: whether a model call is needed
           - requires_human_review: whether human review is recommended
+          - compute_limits: suggested sandbox resource limits
+            {memory, timeout} for code execution (v0.4.0). The CodeVerifier
+            uses these instead of the hardcoded 128m / 5.0s defaults — a
+            data-processing script gets more headroom than a one-liner.
           - reason: human-readable explanation
         """
         route, confidence = self._classify_route(query)
@@ -607,6 +641,11 @@ class HybridReasoningOrchestrator:
 
         # Human review recommended for low-confidence routing or unknown task types
         requires_human_review = confidence < 0.65 or task_type == "unknown"
+
+        # Suggest sandbox resource limits based on task complexity (v0.4.0).
+        # The CodeVerifier reads these from the verifier context to size the
+        # sandbox dynamically instead of using the hardcoded 128m / 5.0s.
+        compute_limits = self._suggest_compute_limits(query, task_type)
 
         reasons = []
         if self.use_embedding_router:
@@ -624,7 +663,79 @@ class HybridReasoningOrchestrator:
             "requires_tools": requires_tools,
             "requires_model": requires_model,
             "requires_human_review": requires_human_review,
+            "compute_limits": compute_limits,
             "reason": ", ".join(reasons),
+        }
+
+    # Keywords that signal heavy computation — bump the sandbox limits.
+    _HEAVY_COMPUTE_KEYWORDS = frozenset({
+        "dataframe", "pandas", "numpy", "tensor", "torch", "tensorflow",
+        "ml", "machine learning", "model", "train", "inference",
+        "matrix", "large", "dataset", "csv", "json file", "parse",
+        "sort", "merge", "graph", "tree", "recursive", "backtracking",
+        "dynamic programming", "dp", "simulation", "monte carlo",
+        "scrape", "crawl", "download", "process", "transform",
+        "encrypt", "decrypt", "hash", "compress", "image", "audio",
+    })
+
+    # Default sandbox limits per task type. These are conservative starting
+    # points; _suggest_compute_limits bumps them when heavy-compute keywords
+    # are detected. The CodeVerifier's own defaults (128m / 5.0s) remain the
+    # ultimate fallback when no compute_limits are provided.
+    _DEFAULT_COMPUTE_LIMITS = {
+        "math": {"memory": "64m", "timeout": 5.0},
+        "code": {"memory": "128m", "timeout": 10.0},
+        "schema": {"memory": "64m", "timeout": 5.0},
+        "logic": {"memory": "128m", "timeout": 10.0},
+        "factual": {"memory": "64m", "timeout": 5.0},
+        "planning": {"memory": "64m", "timeout": 5.0},
+        "retrieval": {"memory": "64m", "timeout": 5.0},
+        "summarization": {"memory": "64m", "timeout": 5.0},
+        "conversation": {"memory": "64m", "timeout": 5.0},
+        "unknown": {"memory": "64m", "timeout": 5.0},
+    }
+
+    def _suggest_compute_limits(
+        self, query: str, task_type: str
+    ) -> Dict[str, Any]:
+        """Suggest sandbox resource limits based on task complexity.
+
+        Returns a dict with ``memory`` (Docker memory spec string) and
+        ``timeout`` (seconds). The CodeVerifier reads these from the
+        verifier context to size the sandbox dynamically.
+
+        Heuristic: start from the task-type default, then bump memory and
+        timeout when heavy-computation keywords are detected in the query
+        (e.g. "dataframe", "pandas", "matrix", "recursive"). A simple
+        math one-liner gets 64m / 5s; a data-processing script gets 512m
+        / 30s. The limits are advisory — the CodeVerifier's own defaults
+        apply when compute_limits is absent (backward-compatible).
+        """
+        base = self._DEFAULT_COMPUTE_LIMITS.get(
+            task_type, self._DEFAULT_COMPUTE_LIMITS["unknown"]
+        )
+        memory = base["memory"]
+        timeout = base["timeout"]
+
+        query_lower = query.lower()
+        heavy_hits = sum(
+            1 for kw in self._HEAVY_COMPUTE_KEYWORDS if kw in query_lower
+        )
+        if heavy_hits > 0:
+            # Bump memory: 128m -> 256m -> 512m based on keyword density.
+            if heavy_hits >= 3:
+                memory = "512m"
+            elif heavy_hits >= 2:
+                memory = "256m"
+            else:
+                memory = "256m" if task_type == "code" else "128m"
+            # Bump timeout: +10s per heavy keyword, capped at 60s.
+            timeout = min(base["timeout"] + heavy_hits * 10.0, 60.0)
+
+        return {
+            "memory": memory,
+            "timeout": timeout,
+            "heavy_compute_keywords": heavy_hits,
         }
 
     def _classify_route(self, query: str) -> Tuple[str, float]:
@@ -835,6 +946,17 @@ class HybridReasoningOrchestrator:
         "Output the ```python code block now:"
     )
 
+    _CODE_REPAIR_PROMPT = (
+        "A previous solution to the request below FAILED its unit tests. "
+        "Fix the bug. Output ONLY a single ```python code block with the "
+        "complete, runnable corrected code — no explanation.\n\n"
+        "Request:\n{query}\n\n"
+        "Tests it must pass:\n{tests}\n\n"
+        "Failing code:\n```python\n{failing_code}\n```\n\n"
+        "Error:\n{error}\n\n"
+        "Output the corrected ```python code block now:"
+    )
+
     @staticmethod
     def _extract_python_block(text: str) -> str:
         """Extract the best Python code block from text.
@@ -1022,6 +1144,15 @@ class HybridReasoningOrchestrator:
           - ASSERTION_FAILED / IMPORT_ERROR = candidate is wrong → no retry
           - TEST_ERROR = the test spec is broken → retry once with feedback
 
+        Iterative code repair (v0.4.0): if the best candidate fails with a
+        code bug (ASSERTION_FAILED / IMPORT_ERROR — a real defect in the
+        candidate, NOT a broken test), the failing code + error are fed
+        back to the code specialist for a targeted repair. Up to
+        max_repair_attempts rounds. This is distinct from the test-feedback
+        loop above (which only fires when ALL candidates fail with
+        TEST_ERROR). Fail-closed: if no repair passes, the best-effort
+        unverified result is returned with score 0.0.
+
         If no test spec can be generated, or no verifier/sandbox is
         available, falls back to single-candidate plain generation with
         score 0.0 (unverified — fail-closed, never fake verification).
@@ -1176,6 +1307,100 @@ class HybridReasoningOrchestrator:
             # Not all TEST_ERROR, or we already retried — return best-effort.
             break
 
+        # --- Iterative code repair (v0.4.0) ---
+        # If the best candidate failed with a code bug (ASSERTION_FAILED or
+        # IMPORT_ERROR — a real defect in the candidate, NOT a broken test),
+        # feed the failing code + error back to the code specialist for a
+        # targeted repair. This is distinct from the test-feedback loop above
+        # (which fires only when ALL candidates fail with TEST_ERROR = the
+        # tests themselves are broken). Bounded by max_repair_attempts;
+        # fail-closed: if no repair passes, the best-effort unverified result
+        # below is returned with score 0.0.
+        repair_attempts_made = 0
+        for repair_attempt in range(self.max_repair_attempts):
+            # Pick the candidate to repair: first one whose error indicates a
+            # code bug. If none are code bugs (e.g. all timeouts or all
+            # TEST_ERROR — the latter already handled above), stop: repair
+            # cannot fix a timeout or a broken test spec.
+            repair_idx: Optional[int] = None
+            repair_error: Optional[str] = None
+            for i, result in verify_results:
+                if result.error and any(
+                    m in result.error for m in ("ASSERTION_FAILED", "IMPORT_ERROR")
+                ):
+                    repair_idx = i
+                    repair_error = result.error
+                    break
+            if repair_idx is None:
+                break  # nothing repairable
+
+            failing_code = candidates[repair_idx][1]
+            print(f"[CodeLoop] Repair attempt {repair_attempt + 1}/"
+                  f"{self.max_repair_attempts}: feeding error back to code "
+                  f"specialist (candidate {repair_idx} failed: {repair_error})")
+            repair_prompt = self._CODE_REPAIR_PROMPT.format(
+                query=query_with_ctx, tests=tests,
+                failing_code=failing_code, error=repair_error,
+            )
+            repair_raw = await asyncio.gather(
+                *[self._call_code_specialist(repair_prompt, max_tokens=2048)
+                  for _ in temps],
+                return_exceptions=True,
+            )
+            repair_candidates = [
+                (raw, self._extract_python_block(raw))
+                for raw in repair_raw if isinstance(raw, str)
+            ]
+            if not repair_candidates:
+                continue
+
+            async def _repair_verify(idx: int, code: str):
+                r = await self.code_verifier.verify(
+                    query, code, {"unit_tests": tests}
+                )
+                return idx, r
+
+            repair_results = await asyncio.gather(
+                *[_repair_verify(i, code)
+                  for i, (raw, code) in enumerate(repair_candidates)]
+            )
+            for i, result in repair_results:
+                verification_traces.append({
+                    "candidate_index": i,
+                    "verified": result.verified,
+                    "score": result.score,
+                    "method": result.method,
+                    "error": result.error,
+                    "repair_attempt": repair_attempt + 1,
+                })
+                if result.verified:
+                    print(f"[CodeLoop] Repaired candidate {i} PASSED — returning")
+                    return OrchestratorResult(
+                        final_answer=repair_candidates[i][1],
+                        route_taken="code_specialist_verified",
+                        specialist_used="Code Specialist (ruvltra-claude-code)",
+                        clr_score=1.0,
+                        routing_confidence=1.0,
+                        raw_traces={
+                            "verified": True,
+                            "verification_method": result.method,
+                            "candidates_generated": len(candidates)
+                            + len(repair_candidates),
+                            "candidate_index": i,
+                            "unit_tests": tests,
+                            "all_verification_traces": verification_traces,
+                            "test_spec_retry": attempt,
+                            "repair_attempts": repair_attempt + 1,
+                        },
+                    )
+                print(f"[CodeLoop] Repaired candidate {i} failed: "
+                      f"{result.error or 'not verified'}")
+            # Use the repaired candidates as the basis for the next repair
+            # iteration (feed the new failing code + error back).
+            verify_results = repair_results
+            candidates = repair_candidates
+            repair_attempts_made = repair_attempt + 1
+
         # No candidate passed — return the first with honest score 0.0.
         print(f"[CodeLoop] No candidate passed verification — returning best-effort (unverified)")
         return OrchestratorResult(
@@ -1191,6 +1416,7 @@ class HybridReasoningOrchestrator:
                 "unit_tests": tests,
                 "all_verification_traces": verification_traces,
                 "test_spec_retries": attempt,
+                "repair_attempts": repair_attempts_made,
             },
         )
 
@@ -1255,7 +1481,10 @@ class HybridReasoningOrchestrator:
             return False
         return True
 
-    def _build_verifier_context(self, query: str, task_type: str) -> Dict[str, Any]:
+    async def _build_verifier_context(
+        self, query: str, task_type: str,
+        compute_limits: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """Derive verifier context from the query.
 
         This is what makes verifiers actually useful instead of ceremonial.
@@ -1264,10 +1493,15 @@ class HybridReasoningOrchestrator:
 
         For math: use the deterministic math_solver to derive expected_answer.
         For code: extract code blocks and test assertions from the query.
-        For factual: no sources available unless caller provides them.
+        For factual: if a retrieval backend is configured, fetch real source
+          text from a search API (Serper / SearchApi) and feed it to the
+          FactualVerifier's NLI judge. If no backend is configured, or the
+          backend returns no results, no sources are set — the verifier
+          returns unsupported_factual, which is the honest result.
 
-        Do NOT fake context. If we can't derive it deterministically, leave
-        it absent — the verifier will return verified=False, which is honest.
+        Do NOT fake context. If we can't derive it deterministically (or
+        retrieve it from a real source), leave it absent — the verifier
+        will return verified=False, which is honest.
         """
         context: Dict[str, Any] = {}
 
@@ -1282,9 +1516,32 @@ class HybridReasoningOrchestrator:
             code_blocks = re.findall(r"```(?:python)?\n(.*?)```", query, re.DOTALL)
             if code_blocks:
                 context["expected_output"] = code_blocks[0].strip()
+            # Pass dynamic sandbox resource limits (v0.4.0) to the CodeVerifier.
+            # When present, the verifier sizes the sandbox accordingly instead
+            # of using its hardcoded 128m / 5.0s defaults. Backward-compatible:
+            # absent compute_limits -> the verifier uses its own defaults.
+            if compute_limits is not None:
+                context["compute_limits"] = compute_limits
 
-        # Factual: no sources to derive. The verifier will return
-        # unsupported_factual, which is the honest result.
+        elif task_type == "factual":
+            # Active retrieval (v0.4.0): fetch real source text from a search
+            # API so the FactualVerifier's NLI judge can classify entailment
+            # / contradiction. Fail-closed: if no backend is configured, or
+            # the backend returns no results, sources stays absent and the
+            # verifier returns unsupported_factual (unchanged honest behavior).
+            if self._retrieval_backend is not None:
+                try:
+                    sources = await self._retrieval_backend.search(query)
+                except Exception as e:
+                    print(f"[CLR] Retrieval failed: {e} — no sources (fail-closed)")
+                    sources = []
+                if sources:
+                    context["sources"] = sources
+                    print(f"[CLR] Retrieved {len(sources)} source(s) via "
+                          f"{self._retrieval_backend.name} for factual verification")
+                else:
+                    print(f"[CLR] Retrieval returned no sources — "
+                          f"verifier will return unsupported_factual")
 
         return context
 
@@ -1326,7 +1583,10 @@ class HybridReasoningOrchestrator:
         decision = self.route_structured(query)
         task_type = decision["task_type"]
         verifier = select_verifier(task_type, llm_judge=self._call_generalist)
-        verifier_context = self._build_verifier_context(query, task_type)
+        verifier_context = await self._build_verifier_context(
+            query, task_type,
+            compute_limits=decision.get("compute_limits"),
+        )
         if verifier is not None:
             ctx_desc = ", ".join(f"{k}={v!r}" for k, v in verifier_context.items() if v)
             print(f"[CLR] Selected verifier: {verifier.name} (task_type={task_type})"
