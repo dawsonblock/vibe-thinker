@@ -88,6 +88,15 @@ class TestEnvVarSupport:
         args = build_argparser().parse_args([])
         assert args.generalist == "http://env-generalist:8888"
 
+    def test_env_code_specialist_url_loaded(self, monkeypatch):
+        monkeypatch.setenv("CODE_SPECIALIST_URL", "http://env-code-specialist:8082")
+        args = build_argparser().parse_args([])
+        assert args.code_specialist == "http://env-code-specialist:8082"
+
+    def test_code_specialist_defaults_empty(self):
+        args = build_argparser().parse_args([])
+        assert args.code_specialist == ""
+
     def test_cli_overrides_env(self, monkeypatch):
         """CLI flags take precedence over environment variables."""
         monkeypatch.setenv("VIBE_THINKER_URL", "http://env-specialist:9999")

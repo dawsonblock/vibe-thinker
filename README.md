@@ -68,6 +68,10 @@ Query -> EmbeddingRouter -> specialist | generalist | hybrid
 - Python 3.10+
 - A running llama-server for the specialist (default: `http://127.0.0.1:8080`)
 - A running llama-server for the generalist (default: `http://127.0.0.1:8081`)
+- *Optional:* a dedicated code-specialist server (default: `http://127.0.0.1:8082`).
+  When configured via `CODE_SPECIALIST_URL` / `--code-specialist`, code tasks
+  route here for fast plain generation (verified downstream by CodeVerifier)
+  instead of the VibeThinker CLR path. Math/reasoning still uses the specialist.
 - `pip install -r requirements.txt` (aiohttp is required; sentence-transformers
   is optional but enables semantic routing + CLR result caching)
 
@@ -79,8 +83,10 @@ pip install -r requirements.txt
 # Start your model servers (e.g.):
 # llama-server --model vibethinker-3b.gguf --port 8080
 # llama-server --model llama-3.2-3b.gguf --port 8081
+# Optional code specialist (e.g. ruvltra-claude-code-0.5b):
+# llama-server --model ruvltra-claude-code-0.5b-q4_k_m.gguf --port 8082
 
-# Run the interactive REPL:
+# Run the interactive REPL (auto-loads .env, incl. CODE_SPECIALIST_URL):
 python rfsn_cli.py
 
 # Or run the full-stack integration test (needs live servers):
@@ -200,6 +206,28 @@ max_k is automatically reduced to improve throughput:
   "agreement": true
 }
 ```
+
+## Multi-candidate code generation (v0.3.3)
+
+When a dedicated code-specialist endpoint is configured (`CODE_SPECIALIST_URL`)
+and a code verifier is available (default: `CodeVerifier` with Docker sandbox),
+code tasks run through a sandbox-verified multi-candidate loop:
+
+1. **Generalist writes tests** — the generalist model produces unit-test
+   `assert` statements for the query (the "Software Architect" step).
+2. **Code specialist generates N candidates** — ruvltra (or any configured
+   code model) generates `CODE_CANDIDATES` (default 3) solutions in parallel
+   with diverse temperatures.
+3. **Sandbox verification** — `CodeVerifier` runs each candidate against the
+   test spec in a hardened Docker container (`--network=none`, `--memory=128m`,
+   `--read-only`, `--cap-drop=ALL`).
+4. **First passing candidate wins** — the first candidate that prints
+   `ALL_TESTS_PASSED` is returned with `clr_score=1.0`, `verified=True`.
+5. **Fail-closed** — if no candidate passes, the first candidate is returned
+   with `clr_score=0.0`, `verified=False`. The system never fakes verification.
+
+Requires Docker running + `python:3.12-slim` image. Without Docker, the
+verifier fail-closes and the loop returns unverified best-effort (score 0.0).
 
 ## Cache promotion rules
 

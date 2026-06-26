@@ -294,6 +294,14 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--generalist",
                    default=os.environ.get("GENERALIST_URL", "http://127.0.0.1:8081"),
                    help="Generalist model endpoint")
+    p.add_argument("--code-specialist",
+                   default=os.environ.get("CODE_SPECIALIST_URL", ""),
+                   help="Dedicated code-specialist endpoint (e.g. ruvltra on "
+                        "8082). Empty disables code-specialist routing.")
+    p.add_argument("--code-candidates", type=int,
+                   default=int(os.environ.get("CODE_CANDIDATES", "3")),
+                   help="Number of parallel code candidates to generate and "
+                        "verify in the sandbox (default 3).")
     p.add_argument("--max-concurrent", type=int,
                    default=int(os.environ.get("RFSN_MAX_CONCURRENT", "2")),
                    help="Max concurrent jobs")
@@ -323,6 +331,8 @@ async def _amain() -> None:
     orchestrator = HybridReasoningOrchestrator(
         vibe_endpoint=args.vibe,
         generalist_endpoint=args.generalist,
+        code_specialist_endpoint=args.code_specialist or None,
+        code_candidates=args.code_candidates,
         use_clr=args.use_clr,
         clr_k=args.clr_k,
         use_embedding_router=args.use_embedding_router,

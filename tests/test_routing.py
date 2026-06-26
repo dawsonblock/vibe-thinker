@@ -1,8 +1,11 @@
 """Pytest tests for structured routing output."""
 
 import pytest
+from unittest.mock import AsyncMock, MagicMock
 
 from hybrid_orchestrator import HybridReasoningOrchestrator
+from vibe_clr_async import CLRResult
+from verifiers.base import VerificationResult
 
 
 @pytest.fixture
@@ -187,4 +190,175 @@ class TestRouteClassification:
         """'find a_5' pattern should trigger math intent."""
         decision = orch.route_structured("Find a_5 where a_1=1")
         assert decision["task_type"] == "math"
+
+
+class TestCodeSpecialistRouting:
+    """Tests for the optional dedicated code-specialist endpoint (ruvltra).
+
+    When code_specialist_endpoint is configured, code tasks route to it.
+    With a code_verifier (default), the multi-candidate sandbox-verified loop
+    runs: generalist writes tests, ruvltra generates N candidates, CodeVerifier
+    picks the winner. Math/reasoning still uses the VibeThinker CLR path.
+    """
+
+    def test_endpoint_defaults_to_none(self, orch):
+        assert orch.code_specialist_endpoint is None
+
+    def test_endpoint_stored_and_stripped(self):
+        o = HybridReasoningOrchestrator(
+            vibe_endpoint="http://localhost:0",
+            generalist_endpoint="http://localhost:0",
+            code_specialist_endpoint="http://127.0.0.1:8082/",
+            use_clr=False,
+            use_embedding_router=False,
+            use_clr_cache=False,
+        )
+        assert o.code_specialist_endpoint == "http://127.0.0.1:8082"
+
+    def test_code_candidates_default(self):
+        o = HybridReasoningOrchestrator(
+            vibe_endpoint="http://localhost:0",
+            generalist_endpoint="http://localhost:0",
+            use_clr=False, use_embedding_router=False, use_clr_cache=False,
+        )
+        assert o.code_candidates == 3
+
+    @pytest.mark.asyncio
+    async def test_code_task_verified_loop_first_candidate_passes(self):
+        """Code task -> multi-candidate loop -> first candidate passes verification."""
+        o = HybridReasoningOrchestrator(
+            vibe_endpoint="http://localhost:0",
+            generalist_endpoint="http://localhost:0",
+            code_specialist_endpoint="http://127.0.0.1:8082",
+            code_candidates=3,
+            use_clr=True,
+            use_embedding_router=False,
+            use_clr_cache=False,
+        )
+        o._generate_test_spec = AsyncMock(return_value="assert square(2) == 4")
+        o._call_code_specialist = AsyncMock(return_value="```python\ndef square(n): return n*n\n```")
+        o.code_verifier = MagicMock()
+        o.code_verifier.verify = AsyncMock(return_value=VerificationResult(
+            verified=True, score=1.0, method="unit_tests",
+        ))
+        o._run_clr_with_cache = AsyncMock(side_effect=AssertionError("CLR should not run for code"))
+
+        result = await o.run("Write a Python function to square a number")
+        assert result.route_taken == "code_specialist_verified"
+        assert result.clr_score == 1.0
+        assert "ruvltra" in result.specialist_used
+        assert "def square" in result.final_answer
+        o._run_clr_with_cache.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_code_task_verified_loop_no_candidate_passes(self):
+        """All candidates fail verification -> unverified, score 0.0 (fail-closed)."""
+        o = HybridReasoningOrchestrator(
+            vibe_endpoint="http://localhost:0",
+            generalist_endpoint="http://localhost:0",
+            code_specialist_endpoint="http://127.0.0.1:8082",
+            code_candidates=2,
+            use_clr=True,
+            use_embedding_router=False,
+            use_clr_cache=False,
+        )
+        o._generate_test_spec = AsyncMock(return_value="assert square(2) == 4")
+        o._call_code_specialist = AsyncMock(return_value="```python\ndef square(n): return n+1\n```")
+        o.code_verifier = MagicMock()
+        o.code_verifier.verify = AsyncMock(return_value=VerificationResult(
+            verified=False, score=0.0, method="unit_tests", error="assertion failed",
+        ))
+
+        result = await o.run("Write a Python function to square a number")
+        assert result.route_taken == "code_specialist_unverified"
+        assert result.clr_score == 0.0
+        assert result.raw_traces["verified"] is False
+
+    @pytest.mark.asyncio
+    async def test_code_task_no_test_spec_falls_back_unverified(self):
+        """Generalist can't produce tests -> single-candidate unverified, score 0.0."""
+        o = HybridReasoningOrchestrator(
+            vibe_endpoint="http://localhost:0",
+            generalist_endpoint="http://localhost:0",
+            code_specialist_endpoint="http://127.0.0.1:8082",
+            use_clr=True,
+            use_embedding_router=False,
+            use_clr_cache=False,
+        )
+        o._generate_test_spec = AsyncMock(return_value=None)
+        o._call_code_specialist = AsyncMock(return_value="def square(n): return n*n")
+
+        result = await o.run("Write a Python function to square a number")
+        assert result.route_taken == "code_specialist_unverified"
+        assert result.clr_score == 0.0
+        o._call_code_specialist.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_code_task_no_verifier_plain_generation(self):
+        """With code_verifier=None, code tasks use plain single-candidate generation."""
+        o = HybridReasoningOrchestrator(
+            vibe_endpoint="http://localhost:0",
+            generalist_endpoint="http://localhost:0",
+            code_specialist_endpoint="http://127.0.0.1:8082",
+            code_verifier=None,
+            use_clr=True,
+            use_embedding_router=False,
+            use_clr_cache=False,
+        )
+        o._call_code_specialist = AsyncMock(return_value="def sort(l): return sorted(l)")
+        o._run_clr_with_cache = AsyncMock(side_effect=AssertionError("CLR should not run for code"))
+
+        result = await o.run("Write a Python function to sort a list efficiently")
+        assert result.route_taken == "code_specialist"
+        assert "ruvltra" in result.specialist_used
+        assert result.final_answer == "def sort(l): return sorted(l)"
+        o._call_code_specialist.assert_awaited_once()
+        o._run_clr_with_cache.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_math_task_does_not_use_code_specialist(self):
+        """Math tasks must stay on the VibeThinker CLR path, not ruvltra."""
+        o = HybridReasoningOrchestrator(
+            vibe_endpoint="http://localhost:0",
+            generalist_endpoint="http://localhost:0",
+            code_specialist_endpoint="http://127.0.0.1:8082",
+            use_clr=True,
+            use_embedding_router=False,
+            use_clr_cache=False,
+        )
+        o._call_code_specialist = AsyncMock(side_effect=AssertionError("ruvltra should not run for math"))
+        o._generate_test_spec = AsyncMock(side_effect=AssertionError("test spec should not run for math"))
+        fake_clr = CLRResult(best_answer="42", best_score=0.9, best_raw_trace="")
+        o._run_clr_with_cache = AsyncMock(return_value=(fake_clr, False))
+
+        result = await o.run("Solve the equation 2x + 3 = 7")
+        assert result.route_taken != "code_specialist"
+        assert result.final_answer == "42"
+        o._call_code_specialist.assert_not_awaited()
+        o._run_clr_with_cache.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_code_without_specialist_falls_back_to_clr(self):
+        """With no code_specialist_endpoint, code tasks use the normal CLR path."""
+        o = HybridReasoningOrchestrator(
+            vibe_endpoint="http://localhost:0",
+            generalist_endpoint="http://localhost:0",
+            code_specialist_endpoint=None,
+            use_clr=True,
+            use_embedding_router=False,
+            use_clr_cache=False,
+        )
+        fake_clr = CLRResult(best_answer="code here", best_score=0.8, best_raw_trace="")
+        o._run_clr_with_cache = AsyncMock(return_value=(fake_clr, False))
+
+        result = await o.run("Write a Python function to sort a list efficiently")
+        assert result.route_taken != "code_specialist"
+        o._run_clr_with_cache.assert_awaited_once()
+
+    def test_extract_python_block_with_fence(self):
+        text = "Here:\n```python\ndef foo(): pass\n```\nDone."
+        assert HybridReasoningOrchestrator._extract_python_block(text) == "def foo(): pass"
+
+    def test_extract_python_block_without_fence(self):
+        assert HybridReasoningOrchestrator._extract_python_block("def foo(): pass") == "def foo(): pass"
 

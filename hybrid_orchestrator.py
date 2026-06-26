@@ -41,6 +41,10 @@ from persistent_cache import CLRResultCache, PersistentRouteCache, should_cache
 from verifiers import MathVerifier, CodeVerifier, FactualVerifier
 from math_solver import solve as solve_math
 
+# Sentinel for "argument not provided" — distinct from an explicit None
+# (which means "disable the code verifier / verified loop").
+_UNSET = object()
+
 
 def select_verifier(task_type: str):
     """Select a deterministic verifier based on the detected task type.
@@ -229,6 +233,9 @@ class HybridReasoningOrchestrator:
         self,
         vibe_endpoint: str = "http://127.0.0.1:8080",
         generalist_endpoint: str = "http://127.0.0.1:8081",
+        code_specialist_endpoint: Optional[str] = None,
+        code_candidates: int = 3,
+        code_verifier: Optional["CodeVerifier"] = _UNSET,
         use_clr: bool = True,
         clr_k: int = 8,
         max_concurrent_clr: int = 6,
@@ -242,6 +249,22 @@ class HybridReasoningOrchestrator:
     ):
         self.vibe_endpoint = vibe_endpoint.rstrip("/")
         self.generalist_endpoint = generalist_endpoint.rstrip("/")
+        # Optional dedicated code-generation specialist (e.g. a small, fast
+        # coding model like ruvltra-claude-code-0.5b). When set, code tasks are
+        # routed here for plain generation instead of the VibeThinker CLR path.
+        # Disabled by default; set via CODE_SPECIALIST_URL / --code-specialist.
+        self.code_specialist_endpoint = (
+            code_specialist_endpoint.rstrip("/") if code_specialist_endpoint else None
+        )
+        # Multi-candidate code generation: generate N candidates from the code
+        # specialist, verify each in the sandbox, return the first that passes.
+        # This is the "shotgun + sandbox picks winner" loop. Requires a
+        # code_verifier (CodeVerifier with a sandbox executor). If no verifier
+        # is configured, falls back to single-candidate plain generation.
+        self.code_candidates = max(1, code_candidates)
+        # _UNSET -> default CodeVerifier (safe, fail-closed sandbox).
+        # None -> explicitly disabled (plain generation, no verification).
+        self.code_verifier = CodeVerifier() if code_verifier is _UNSET else code_verifier
         self.use_clr = use_clr
 
         self.reasoner = VibeThinkerCLRAsync(
@@ -642,6 +665,226 @@ class HybridReasoningOrchestrator:
             return await self.reasoner.generate_plain(session, query, max_tokens)
 
     # ------------------------------------------------------------------ #
+    # Code specialist (dedicated fast code-generation model, e.g. ruvltra)
+    # ------------------------------------------------------------------ #
+    async def _call_code_specialist(self, query: str, max_tokens: int = 4096) -> str:
+        """Call the dedicated code-specialist model via the OpenAI-compatible
+        /v1/chat/completions endpoint. Falls back to /completion with ChatML
+        if the chat endpoint fails. Raises RuntimeError if both fail.
+
+        Note: this is plain generation — it does NOT run the CLR claim-level
+        reliability loop. Code correctness is expected to be checked
+        downstream by the CodeVerifier (sandbox), not by self-claims.
+        """
+        if not self.code_specialist_endpoint:
+            raise RuntimeError("No code_specialist_endpoint configured")
+        async with aiohttp.ClientSession() as session:
+            chat_payload = {
+                "messages": [{"role": "user", "content": query}],
+                "max_tokens": max_tokens,
+                "temperature": 0.2,
+                "top_p": 0.95,
+            }
+            try:
+                async with session.post(
+                    f"{self.code_specialist_endpoint}/v1/chat/completions",
+                    json=chat_payload,
+                    timeout=aiohttp.ClientTimeout(total=600),
+                ) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json()
+                    content = data["choices"][0]["message"]["content"]
+                    if not content:
+                        raise RuntimeError("Code specialist returned empty response")
+                    return content
+            except RuntimeError:
+                raise
+            except Exception as e:
+                print(f"[CodeSpecialist] chat endpoint failed ({e}), falling back to /completion")
+                payload = {
+                    "prompt": f"<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n",
+                    "n_predict": max_tokens,
+                    "temperature": 0.2,
+                    "top_p": 0.95,
+                    "stop": ["<|im_end|>"],
+                }
+                try:
+                    async with session.post(
+                        f"{self.code_specialist_endpoint}/completion",
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=600),
+                    ) as resp:
+                        resp.raise_for_status()
+                        data = await resp.json()
+                        content = data.get("content", "")
+                        if not content:
+                            raise RuntimeError("Code specialist returned empty response on fallback")
+                        return content
+                except RuntimeError:
+                    raise
+                except Exception as e2:
+                    raise RuntimeError(
+                        f"Code specialist call failed (both endpoints): {e2}"
+                    ) from e2
+
+    # ------------------------------------------------------------------ #
+    # Multi-candidate code generation with sandbox verification
+    # ------------------------------------------------------------------ #
+    _TEST_SPEC_PROMPT = (
+        "You are a test engineer. Given the coding request below, write "
+        "Python unit tests as bare `assert` statements that verify a correct "
+        "solution. Output ONLY a single ```python code block containing the "
+        "assert statements — no explanation, no imports unless strictly "
+        "needed, no test framework. The asserts must call the functions/"
+        "classes the solution is expected to define.\n\n"
+        "Coding request:\n{query}\n\n"
+        "Output the test asserts now (```python block only):"
+    )
+
+    _CODE_GEN_PROMPT = (
+        "Write a Python solution for the request below. Output ONLY a "
+        "single ```python code block with the complete, runnable code — "
+        "no explanation.\n\n"
+        "Request:\n{query}\n\n"
+        "Your solution must pass these tests:\n{tests}\n\n"
+        "Output the ```python code block now:"
+    )
+
+    @staticmethod
+    def _extract_python_block(text: str) -> str:
+        """Extract the first ```python ... ``` block from text, or the whole
+        text if no fenced block is found."""
+        match = re.findall(r"```(?:python)?\n(.*?)```", text, re.DOTALL)
+        return match[0].strip() if match else text.strip()
+
+    async def _generate_test_spec(self, query: str) -> Optional[str]:
+        """Ask the generalist to produce unit-test asserts for the query.
+
+        Returns the extracted Python assert code, or None if the generalist
+        failed or produced nothing parseable. This is the "Software Architect"
+        step: the generalist defines correctness before the code specialist
+        writes any code.
+        """
+        prompt = self._TEST_SPEC_PROMPT.format(query=query)
+        try:
+            raw = await self._call_generalist(prompt, max_tokens=1024)
+        except Exception as e:
+            print(f"[CodeLoop] Test-spec generation failed: {e}")
+            return None
+        tests = self._extract_python_block(raw)
+        if not tests or "assert" not in tests:
+            print(f"[CodeLoop] Generalist produced no usable asserts — skipping verification")
+            return None
+        return tests
+
+    async def _run_code_specialist_verified(
+        self, query: str
+    ) -> OrchestratorResult:
+        """Multi-candidate code generation with sandbox verification.
+
+        Flow (the "shotgun + sandbox picks winner" loop):
+          1. Generalist writes unit-test asserts for the query (test spec).
+          2. Code specialist (ruvltra) generates N candidate solutions in
+             parallel with diverse temperatures.
+          3. CodeVerifier runs each candidate against the test spec in the
+             sandbox. The first candidate that passes (ALL_TESTS_PASSED)
+             wins and is returned with score 1.0.
+          4. If no candidate passes, return the first candidate with score
+             0.0 and an honest "no candidate passed verification" note.
+
+        If no test spec can be generated, or no verifier/sandbox is
+        available, falls back to single-candidate plain generation with
+        score 0.0 (unverified — fail-closed, never fake verification).
+        """
+        tests = await self._generate_test_spec(query)
+
+        # Without tests or a verifier, we cannot verify — fall back to plain.
+        if tests is None:
+            print("[CodeLoop] No test spec — single-candidate unverified generation")
+            answer = await self._call_code_specialist(query)
+            return OrchestratorResult(
+                final_answer=answer,
+                route_taken="code_specialist_unverified",
+                specialist_used="Code Specialist (ruvltra-claude-code)",
+                clr_score=0.0,
+                routing_confidence=0.0,
+                raw_traces={"verified": False, "reason": "no test spec generated"},
+            )
+
+        # Generate N candidates in parallel with diverse temperatures.
+        temps = [0.2] + [0.7] * (self.code_candidates - 1)
+        gen_prompt = self._CODE_GEN_PROMPT.format(query=query, tests=tests)
+        print(f"[CodeLoop] Generating {self.code_candidates} candidates + test spec verification")
+        candidates_raw = await asyncio.gather(
+            *[self._call_code_specialist(gen_prompt, max_tokens=2048) for _ in temps],
+            return_exceptions=True,
+        )
+        candidates = [
+            (raw, self._extract_python_block(raw))
+            for raw in candidates_raw if isinstance(raw, str)
+        ]
+        if not candidates:
+            return OrchestratorResult(
+                final_answer="",
+                route_taken="code_specialist_failed",
+                specialist_used="Code Specialist (ruvltra-claude-code)",
+                clr_score=0.0,
+                routing_confidence=0.0,
+                raw_traces={"verified": False, "reason": "all candidate generations failed"},
+            )
+
+        # Verify each candidate against the test spec in the sandbox.
+        # First passing candidate wins.
+        verification_traces = []
+        for i, (raw, code) in enumerate(candidates):
+            result = await self.code_verifier.verify(
+                query, code, {"unit_tests": tests}
+            )
+            trace = {
+                "candidate_index": i,
+                "verified": result.verified,
+                "score": result.score,
+                "method": result.method,
+                "error": result.error,
+            }
+            verification_traces.append(trace)
+            if result.verified:
+                print(f"[CodeLoop] Candidate {i} PASSED verification — returning")
+                return OrchestratorResult(
+                    final_answer=code,
+                    route_taken="code_specialist_verified",
+                    specialist_used="Code Specialist (ruvltra-claude-code)",
+                    clr_score=1.0,
+                    routing_confidence=1.0,
+                    raw_traces={
+                        "verified": True,
+                        "verification_method": result.method,
+                        "candidates_generated": len(candidates),
+                        "candidate_index": i,
+                        "unit_tests": tests,
+                        "all_verification_traces": verification_traces,
+                    },
+                )
+            print(f"[CodeLoop] Candidate {i} failed: {result.error or 'not verified'}")
+
+        # No candidate passed — return the first with honest score 0.0.
+        print(f"[CodeLoop] No candidate passed verification — returning best-effort (unverified)")
+        return OrchestratorResult(
+            final_answer=candidates[0][1],
+            route_taken="code_specialist_unverified",
+            specialist_used="Code Specialist (ruvltra-claude-code)",
+            clr_score=0.0,
+            routing_confidence=0.0,
+            raw_traces={
+                "verified": False,
+                "reason": "no candidate passed sandbox verification",
+                "candidates_generated": len(candidates),
+                "unit_tests": tests,
+                "all_verification_traces": verification_traces,
+            },
+        )
+
+    # ------------------------------------------------------------------ #
     # CLR with semantic cache
     # ------------------------------------------------------------------ #
     # Answers that must NEVER be cached, regardless of score.
@@ -832,6 +1075,25 @@ class HybridReasoningOrchestrator:
         print(f"\n[Orchestrator] Route: {route.upper()} (conf={confidence:.3f})")
 
         if route == "specialist":
+            # If a dedicated code specialist is configured and this is a code
+            # task, route to it. When a code verifier is available, run the
+            # multi-candidate sandbox-verified loop; otherwise plain generation.
+            # Math/reasoning still uses VibeThinker CLR.
+            if self.code_specialist_endpoint:
+                task_type, _, _ = self._detect_task_type(query)
+                if task_type == "code":
+                    if self.code_verifier is not None:
+                        print("[Orchestrator] Code task -> code specialist + sandbox verification")
+                        return await self._run_code_specialist_verified(query)
+                    print("[Orchestrator] Code task -> code specialist (no verifier)")
+                    answer = await self._call_code_specialist(query)
+                    return OrchestratorResult(
+                        final_answer=answer,
+                        route_taken="code_specialist",
+                        specialist_used="Code Specialist (ruvltra-claude-code)",
+                        routing_confidence=confidence,
+                        raw_traces={"task_type": task_type},
+                    )
             if self.use_clr:
                 clr_result, cache_hit = await self._run_clr_with_cache(query)
                 return OrchestratorResult(
