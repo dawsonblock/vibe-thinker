@@ -1,7 +1,7 @@
 # vibe-thinker — project notes for agents
 
 ## Verify / test
-- Full suite: `python3 -m pytest -q` (714 tests, ~120s, no live servers needed)
+- Full suite: `python3 -m pytest -q` (724 tests, ~130s, no live servers needed)
 - Routing + REPL only: `python3 -m pytest tests/test_routing.py tests/test_repl.py -q`
 - Warm pool + code verifier: `python3 -m pytest tests/test_warm_pool.py tests/test_code_verifier.py -q`
 - Trajectory store: `python3 -m pytest tests/test_trajectory_store.py -q`
@@ -432,6 +432,39 @@ Both compile and link cleanly. Full report at `docs/rust_dependency_report.md`.
 - Zero `unsafe` blocks, but the crate is scaffolding, not a working
   federation.
 - Next: implement federation in Python with well-maintained crypto.
+
+## Local web UI (v0.4.0)
+A FastAPI backend + single-page HTML frontend for running queries,
+viewing results, inspecting traces, and browsing stored data.
+
+### Running
+```
+python3 run_ui.py [--vibe URL] [--generalist URL] [--port 8000]
+```
+All orchestrator CLI flags are accepted (`--ruvllm-url`, `--code-specialist`,
+`--network-allowlist`, `--local-specialist-model`, etc.). The UI server
+binds to `127.0.0.1:8000` by default.
+
+### Architecture
+- `web/app.py` — FastAPI app wrapping `HybridReasoningOrchestrator`.
+  REST endpoints for status/query/jobs/memory/trajectories/audit-log.
+  WebSocket at `/ws` for live job updates (pending → running → done/error).
+- `web/static/index.html` — single-page UI (no build step, no JS framework).
+  Dark theme, tabbed interface: Query, Jobs, Memory, Trajectories, Audit Log.
+- `run_ui.py` — entry point that parses CLI flags, builds the orchestrator,
+  and launches uvicorn.
+
+### API endpoints
+- `GET /api/status` — system config + job counts
+- `POST /api/query` — submit a query (`{"query": "...", "force_route": null}`)
+- `GET /api/jobs` — list all jobs
+- `GET /api/jobs/{id}` — single job detail
+- `GET /api/memory?limit=50` — orchestrator memory vault (JSONL)
+- `GET /api/trajectories?limit=50` — verified trajectory store
+- `GET /api/audit-log?limit=100` — bi-temporal audit log
+- `POST /api/synthesize` — synthesize trajectories from memory
+- `WS /ws` — live job updates (init message + job_update events)
+- `GET /api/docs` — Swagger/OpenAPI docs
 
 ## Security hardening (v0.3.8)
 Ten fixes from a full codebase audit. All stdlib-only, no new dependencies.

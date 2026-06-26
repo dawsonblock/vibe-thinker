@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>vibe-thinker</title>
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --border: #30363d;
+    --text: #c9d1d9; --text-dim: #8b949e; --accent: #58a6ff;
+    --green: #3fb950; --red: #f85149; --yellow: #d29922; --purple: #bc8cff;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: var(--bg); color: var(--text); height: 100vh;
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  header {
+    background: var(--surface); border-bottom: 1px solid var(--border);
+    padding: 10px 20px; display: flex; align-items: center; gap: 16px;
+    flex-shrink: 0;
+  }
+  header h1 { font-size: 16px; font-weight: 600; color: var(--accent); }
+  .status-pill {
+    font-size: 11px; padding: 3px 10px; border-radius: 12px;
+    background: var(--bg); border: 1px solid var(--border); color: var(--text-dim);
+  }
+  .status-pill .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 5px; }
+  .dot-green { background: var(--green); } .dot-red { background: var(--red); }
+  .dot-yellow { background: var(--yellow); } .dot-gray { background: var(--text-dim); }
+
+  .tabs {
+    display: flex; gap: 0; background: var(--surface);
+    border-bottom: 1px solid var(--border); flex-shrink: 0;
+  }
+  .tab {
+    padding: 8px 18px; cursor: pointer; font-size: 13px; color: var(--text-dim);
+    border-bottom: 2px solid transparent; transition: all 0.15s;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+  .main { flex: 1; display: flex; overflow: hidden; }
+  .panel { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+  /* Query panel */
+  .query-bar {
+    padding: 12px 16px; background: var(--surface); border-bottom: 1px solid var(--border);
+    display: flex; gap: 10px; flex-shrink: 0;
+  }
+  .query-bar textarea {
+    flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    color: var(--text); padding: 8px 12px; font-size: 13px; resize: none; min-height: 38px; max-height: 100px;
+    font-family: inherit;
+  }
+  .query-bar textarea:focus { outline: none; border-color: var(--accent); }
+  .query-bar select {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    color: var(--text); padding: 0 10px; font-size: 12px; cursor: pointer;
+  }
+  .query-bar button {
+    background: var(--accent); color: var(--bg); border: none; border-radius: 6px;
+    padding: 0 20px; font-size: 13px; font-weight: 600; cursor: pointer; white-space: nowrap;
+  }
+  .query-bar button:hover { opacity: 0.9; }
+  .query-bar button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  /* Content area */
+  .content { flex: 1; overflow-y: auto; padding: 16px; }
+
+  /* Job cards */
+  .job-card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    padding: 14px 16px; margin-bottom: 12px; cursor: pointer; transition: border-color 0.15s;
+  }
+  .job-card:hover { border-color: var(--accent); }
+  .job-card.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .job-header { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+  .job-id { font-size: 11px; color: var(--text-dim); font-family: monospace; }
+  .job-status {
+    font-size: 10px; padding: 2px 8px; border-radius: 10px; font-weight: 600; text-transform: uppercase;
+  }
+  .st-pending { background: rgba(210,153,34,0.15); color: var(--yellow); }
+  .st-running { background: rgba(88,166,255,0.15); color: var(--accent); }
+  .st-done { background: rgba(63,185,80,0.15); color: var(--green); }
+  .st-error { background: rgba(248,81,73,0.15); color: var(--red); }
+  .job-query { font-size: 13px; color: var(--text); margin-bottom: 6px; }
+  .job-meta { font-size: 11px; color: var(--text-dim); display: flex; gap: 14px; }
+
+  /* Detail view */
+  .detail { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+  .detail h3 { font-size: 13px; color: var(--accent); margin-bottom: 12px; }
+  .detail-section { margin-bottom: 16px; }
+  .detail-section h4 { font-size: 11px; color: var(--text-dim); text-transform: uppercase; margin-bottom: 6px; letter-spacing: 0.5px; }
+  .detail-answer {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    padding: 12px; font-size: 13px; white-space: pre-wrap; word-break: break-word; line-height: 1.5;
+  }
+  .detail-traces {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    padding: 10px; font-size: 12px; font-family: 'SF Mono', monospace; white-space: pre-wrap;
+    word-break: break-word; max-height: 400px; overflow-y: auto; line-height: 1.4;
+  }
+  .badge { display: inline-block; font-size: 10px; padding: 2px 7px; border-radius: 8px; margin-right: 4px; }
+  .badge-green { background: rgba(63,185,80,0.15); color: var(--green); }
+  .badge-blue { background: rgba(88,166,255,0.15); color: var(--accent); }
+  .badge-purple { background: rgba(188,140,255,0.15); color: var(--purple); }
+  .badge-gray { background: rgba(139,148,158,0.15); color: var(--text-dim); }
+
+  /* Data tables */
+  .data-item {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+    padding: 10px 14px; margin-bottom: 8px; font-size: 12px;
+  }
+  .data-item .query { color: var(--text); margin-bottom: 4px; }
+  .data-item .meta { color: var(--text-dim); font-size: 11px; }
+
+  .empty { text-align: center; color: var(--text-dim); padding: 40px; font-size: 13px; }
+  pre { white-space: pre-wrap; word-break: break-word; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>vibe-thinker</h1>
+  <span class="status-pill" id="conn-status"><span class="dot dot-gray"></span>connecting</span>
+  <span class="status-pill" id="job-counts"></span>
+  <div style="flex:1"></div>
+  <span class="status-pill" id="config-pill" style="cursor:pointer" title="System config">--</span>
+</header>
+
+<div class="tabs">
+  <div class="tab active" data-tab="query">Query</div>
+  <div class="tab" data-tab="jobs">Jobs</div>
+  <div class="tab" data-tab="memory">Memory</div>
+  <div class="tab" data-tab="trajectories">Trajectories</div>
+  <div class="tab" data-tab="audit">Audit Log</div>
+</div>
+
+<div class="main">
+  <div class="panel" id="panel-query">
+    <div class="query-bar">
+      <textarea id="query-input" placeholder="Enter your query... (Ctrl+Enter to submit)" rows="1"></textarea>
+      <select id="route-select">
+        <option value="">Auto route</option>
+        <option value="specialist">Specialist</option>
+        <option value="generalist">Generalist</option>
+        <option value="hybrid">Hybrid</option>
+      </select>
+      <button id="submit-btn" onclick="submitQuery()">Submit</button>
+    </div>
+    <div class="content" id="query-results">
+      <div class="empty">Submit a query to see results here.</div>
+    </div>
+  </div>
+
+  <div class="panel" id="panel-jobs" style="display:none">
+    <div class="content" id="jobs-list">
+      <div class="empty">No jobs yet.</div>
+    </div>
+  </div>
+
+  <div class="panel" id="panel-memory" style="display:none">
+    <div class="content" id="memory-list"><div class="empty">Loading...</div></div>
+  </div>
+
+  <div class="panel" id="panel-trajectories" style="display:none">
+    <div class="content" id="trajectories-list"><div class="empty">Loading...</div></div>
+  </div>
+
+  <div class="panel" id="panel-audit" style="display:none">
+    <div class="content" id="audit-list"><div class="empty">Loading...</div></div>
+  </div>
+</div>
+
+<script>
+let ws = null;
+let jobs = {};
+let selectedJob = null;
+let currentTab = 'query';
+
+// ---- WebSocket ----
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onopen = () => {
+    document.getElementById('conn-status').innerHTML = '<span class="dot dot-green"></span>connected';
+  };
+  ws.onclose = () => {
+    document.getElementById('conn-status').innerHTML = '<span class="dot dot-red"></span>disconnected';
+    setTimeout(connectWS, 2000);
+  };
+  ws.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === 'init') {
+      jobs = {};
+      msg.jobs.forEach(j => jobs[j.job_id] = j);
+      renderJobs(); updateCounts();
+    } else if (msg.type === 'job_update') {
+      jobs[msg.job.job_id] = msg.job;
+      renderJobs(); updateCounts();
+      if (msg.job.status === 'done' || msg.job.status === 'error') {
+        renderQueryResults();
+      }
+    }
+  };
+}
+connectWS();
+
+// ---- Status ----
+async function fetchStatus() {
+  try {
+    const r = await fetch('/api/status');
+    const s = await r.json();
+    const cfg = [];
+    if (s.specialist_endpoint) cfg.push(`specialist:${s.specialist_endpoint}`);
+    if (s.generalist_endpoint) cfg.push(`generalist:${s.generalist_endpoint}`);
+    if (s.use_clr) cfg.push('CLR');
+    if (s.use_embedding_router) cfg.push('emb-router');
+    if (s.network_allowlist) cfg.push(`allowlist(${s.network_allowlist.entry_count})`);
+    document.getElementById('config-pill').textContent = cfg.join(' | ') || 'no config';
+  } catch(e) {}
+}
+fetchStatus(); setInterval(fetchStatus, 5000);
+
+function updateCounts() {
+  const c = { pending: 0, running: 0, done: 0, error: 0 };
+  Object.values(jobs).forEach(j => { c[j.status] = (c[j.status]||0)+1; });
+  const parts = [];
+  if (c.pending) parts.push(`<span class="dot dot-yellow"></span>${c.pending} pending`);
+  if (c.running) parts.push(`<span class="dot dot-blue" style="background:var(--accent)"></span>${c.running} running`);
+  if (c.done) parts.push(`<span class="dot dot-green"></span>${c.done} done`);
+  if (c.error) parts.push(`<span class="dot dot-red"></span>${c.error} error`);
+  document.getElementById('job-counts').innerHTML = parts.join(' &nbsp; ') || 'no jobs';
+}
+
+// ---- Tabs ----
+document.querySelectorAll('.tab').forEach(t => {
+  t.onclick = () => {
+    document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+    t.classList.add('active');
+    currentTab = t.dataset.tab;
+    document.querySelectorAll('.panel').forEach(p => p.style.display = 'none');
+    document.getElementById('panel-' + currentTab).style.display = 'flex';
+    if (currentTab === 'jobs') renderJobs();
+    if (currentTab === 'memory') loadMemory();
+    if (currentTab === 'trajectories') loadTrajectories();
+    if (currentTab === 'audit') loadAudit();
+  };
+});
+
+// ---- Query submission ----
+document.getElementById('query-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); submitQuery(); }
+});
+document.getElementById('query-input').addEventListener('input', function() {
+  this.style.height = 'auto'; this.style.height = Math.min(this.scrollHeight, 100) + 'px';
+});
+
+async function submitQuery() {
+  const q = document.getElementById('query-input').value.trim();
+  if (!q) return;
+  const route = document.getElementById('route-select').value || null;
+  document.getElementById('submit-btn').disabled = true;
+  try {
+    const r = await fetch('/api/query', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ query: q, force_route: route }),
+    });
+    const data = await r.json();
+    if (data.error) { alert(data.error); return; }
+    document.getElementById('query-input').value = '';
+    document.getElementById('query-input').style.height = 'auto';
+    selectedJob = data.job_id;
+    renderQueryResults();
+  } catch(e) { alert('Submit failed: ' + e.message); }
+  finally { document.getElementById('submit-btn').disabled = false; }
+}
+
+// ---- Rendering ----
+function renderQueryResults() {
+  const container = document.getElementById('query-results');
+  if (!selectedJob || !jobs[selectedJob]) {
+    container.innerHTML = '<div class="empty">Submit a query to see results here.</div>';
+    return;
+  }
+  container.innerHTML = renderJobDetail(jobs[selectedJob]);
+}
+
+function renderJobs() {
+  const container = document.getElementById('jobs-list');
+  const list = Object.values(jobs).sort((a,b) => b.created_at - a.created_at);
+  if (list.length === 0) { container.innerHTML = '<div class="empty">No jobs yet.</div>'; return; }
+  container.innerHTML = list.map(j => `
+    <div class="job-card ${selectedJob === j.job_id ? 'selected' : ''}" onclick="selectJob('${j.job_id}')">
+      <div class="job-header">
+        <span class="job-id">${j.job_id}</span>
+        <span class="job-status st-${j.status}">${j.status}</span>
+        ${j.force_route ? `<span class="badge badge-purple">${j.force_route}</span>` : ''}
+        ${j.result?.route_taken ? `<span class="badge badge-blue">${j.result.route_taken}</span>` : ''}
+        ${j.result?.clr_score != null ? `<span class="badge badge-gray">CLR ${j.result.clr_score.toFixed(2)}</span>` : ''}
+      </div>
+      <div class="job-query">${esc(j.query)}</div>
+      <div class="job-meta">
+        ${j.duration_ms ? `<span>${j.duration_ms}ms</span>` : ''}
+        ${j.error ? `<span style="color:var(--red)">${esc(j.error)}</span>` : ''}
+      </div>
+    </div>
+  `).join('');
+}
+
+function selectJob(id) {
+  selectedJob = id;
+  if (currentTab === 'query') renderQueryResults();
+  if (currentTab === 'jobs') renderJobs();
+}
+
+function renderJobDetail(j) {
+  if (j.status === 'pending' || j.status === 'running') {
+    return `<div class="detail"><h3>${j.job_id} — ${j.status}</h3>
+      <div class="detail-section"><h4>Query</h4><div class="detail-answer">${esc(j.query)}</div></div>
+      <div class="empty">Running... results will appear when complete.</div></div>`;
+  }
+  if (j.status === 'error') {
+    return `<div class="detail"><h3>${j.job_id} — error</h3>
+      <div class="detail-section"><h4>Query</h4><div class="detail-answer">${esc(j.query)}</div></div>
+      <div class="detail-section"><h4>Error</h4><div class="detail-answer" style="color:var(--red)">${esc(j.error||'unknown')}</div></div>
+      <div class="job-meta">${j.duration_ms}ms</div></div>`;
+  }
+  const r = j.result || {};
+  const traces = r.raw_traces ? JSON.stringify(r.raw_traces, null, 2) : '';
+  const routeBadges = [];
+  if (r.route_taken) routeBadges.push(`<span class="badge badge-blue">route: ${r.route_taken}</span>`);
+  if (r.specialist_used) routeBadges.push(`<span class="badge badge-purple">${r.specialist_used}</span>`);
+  if (r.clr_score != null) routeBadges.push(`<span class="badge ${r.clr_score >= 0.75 ? 'badge-green' : 'badge-gray'}">CLR ${r.clr_score.toFixed(3)}</span>`);
+  if (r.routing_confidence) routeBadges.push(`<span class="badge badge-gray">conf ${r.routing_confidence.toFixed(2)}</span>`);
+
+  // Check for verification in traces
+  let verifiedBadge = '';
+  if (traces.includes('"verified": true')) verifiedBadge = '<span class="badge badge-green">verified</span>';
+  else if (traces.includes('"verified": false')) verifiedBadge = '<span class="badge badge-gray">unverified</span>';
+
+  return `<div class="detail">
+    <div class="job-header">
+      <h3>${j.job_id}</h3>
+      <span class="job-status st-done">done</span>
+      ${routeBadges.join('')} ${verifiedBadge}
+      <span class="job-meta">${j.duration_ms}ms</span>
+    </div>
+    <div class="detail-section"><h4>Query</h4><div class="detail-answer">${esc(j.query)}</div></div>
+    <div class="detail-section"><h4>Answer</h4><div class="detail-answer">${esc(r.final_answer || '(empty)')}</div></div>
+    ${traces ? `<div class="detail-section"><h4>Traces <button onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display==='none'?'block':'none'" style="font-size:10px;background:none;border:1px solid var(--border);color:var(--text-dim);border-radius:4px;padding:1px 6px;cursor:pointer;margin-left:6px">toggle</button></h4><div class="detail-traces">${esc(traces)}</div></div>` : ''}
+  </div>`;
+}
+
+function esc(s) {
+  if (s == null) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ---- Data tabs ----
+async function loadMemory() {
+  try {
+    const r = await fetch('/api/memory?limit=50');
+    const items = await r.json();
+    const c = document.getElementById('memory-list');
+    if (!items.length) { c.innerHTML = '<div class="empty">No memory entries yet.</div>'; return; }
+    c.innerHTML = items.reverse().map(m => `
+      <div class="data-item">
+        <div class="query">${esc(m.query || m.final_answer?.slice(0,80) || '?')}</div>
+        <div class="meta">
+          ${m.route_taken ? `route: ${m.route_taken}` : ''}
+          ${m.clr_score != null ? ` | CLR: ${m.clr_score.toFixed(3)}` : ''}
+          ${m.timestamp ? ` | ${m.timestamp}` : ''}
+        </div>
+      </div>`).join('');
+  } catch(e) { document.getElementById('memory-list').innerHTML = '<div class="empty">Failed to load.</div>'; }
+}
+
+async function loadTrajectories() {
+  try {
+    const r = await fetch('/api/trajectories?limit=50');
+    const items = await r.json();
+    const c = document.getElementById('trajectories-list');
+    if (!items.length) { c.innerHTML = '<div class="empty">No verified trajectories yet.</div>'; return; }
+    c.innerHTML = items.reverse().map(t => `
+      <div class="data-item">
+        <div class="query">${esc(t.query || '?')}</div>
+        <div class="meta">
+          ${t.verified ? '<span class="badge badge-green">verified</span>' : ''}
+          ${t.verification_method ? `method: ${t.verification_method}` : ''}
+          ${t.score != null ? ` | score: ${t.score.toFixed(3)}` : ''}
+        </div>
+      </div>`).join('');
+  } catch(e) { document.getElementById('trajectories-list').innerHTML = '<div class="empty">Failed to load.</div>'; }
+}
+
+async function loadAudit() {
+  try {
+    const r = await fetch('/api/audit-log?limit=100');
+    const items = await r.json();
+    const c = document.getElementById('audit-list');
+    if (!items.length) { c.innerHTML = '<div class="empty">No audit log entries yet.</div>'; return; }
+    c.innerHTML = items.reverse().slice(0, 50).map(e => `
+      <div class="data-item">
+        <div class="meta">
+          <span class="job-id">${e.job_id || '?'}</span>
+          ${e.event ? ` | ${e.event}` : ''}
+          ${e.valid_time ? ` | valid: ${e.valid_time}` : ''}
+          ${e.signature ? ' | signed' : ''}
+        </div>
+      </div>`).join('');
+  } catch(e) { document.getElementById('audit-list').innerHTML = '<div class="empty">Failed to load.</div>'; }
+}
+</script>
+</body>
+</html>
