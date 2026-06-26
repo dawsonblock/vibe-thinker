@@ -1703,6 +1703,167 @@ class HybridReasoningOrchestrator:
         return self.trajectory_store.build_few_shot_prefix(query, task_type=task_type)
 
     # ------------------------------------------------------------------ #
+    # Trajectory synthesis (v0.4.0) — memory pruning
+    # ------------------------------------------------------------------ #
+    _SYNTHESIS_PROMPT = (
+        "You are a knowledge distillation engine. Below are {n} similar "
+        "problems that were each independently verified correct, along with "
+        "their verified answers. Synthesize them into a single general "
+        "rule or master solution that captures the common pattern.\n\n"
+        "The master solution should:\n"
+        "  - Be more general than any individual solution\n"
+        "  - Capture the reusable pattern across all examples\n"
+        "  - Be concise (shorter than the {n} solutions combined)\n"
+        "  - Not reference specific problem instances — generalize\n\n"
+        "Verified examples:\n{examples}\n\n"
+        "Output the synthesized master solution now (no preamble):"
+    )
+
+    async def synthesize_trajectories(
+        self,
+        similarity_threshold: float = 0.85,
+        min_cluster_size: int = 3,
+        task_type: Optional[str] = None,
+        max_clusters: int = 5,
+    ) -> Dict[str, Any]:
+        """Synthesize clusters of similar verified trajectories into master
+        trajectories to prune memory.
+
+        For each cluster of highly-similar verified trajectories, the
+        generalist model distills them into a single "master trajectory"
+        (a general rule capturing the common pattern). The master is stored
+        with ``verification_method="synthesized"`` (NOT independently
+        verified — it is a compression of verified data, not a new proof).
+        The raw entries are then removed to save memory.
+
+        Trust model (fail-closed, no epistemic contamination):
+          - Synthesized masters are stored with ``verified=False`` and
+            ``verification_method="synthesized"``. The existing trust check
+            in ``retrieve()`` (``is_cache_entry_trustworthy``) filters them
+            out — they are NEVER served as few-shot "verified examples."
+            They exist for provenance/audit and potential future re-
+            verification, not as substitute evidence.
+          - Only independently-verified entries (``verified=True`` with a
+            deterministic method) are eligible for clustering. Synthesized
+            entries themselves are never re-synthesized.
+          - If the generalist fails to produce a synthesis for a cluster,
+            the raw entries are kept (no data loss).
+
+        Args:
+            similarity_threshold: cosine similarity to consider two
+                trajectories "similar" (default 0.85 — high, only near-
+                duplicates are merged).
+            min_cluster_size: minimum cluster size to synthesize (default 3
+                — merging 2 into 1 saves little).
+            task_type: restrict synthesis to one task type (default None =
+                all task types).
+            max_clusters: cap on clusters processed per call (default 5 —
+                bounded to avoid unbounded generalist calls).
+
+        Returns:
+            A summary dict: {clusters_found, clusters_synthesized,
+            entries_removed, masters_stored, errors}.
+        """
+        if not self.use_trajectory_store or self.trajectory_store is None:
+            return {"error": "trajectory store not enabled"}
+        if self.trajectory_store is None:
+            return {"error": "trajectory store not enabled"}
+
+        clusters = self.trajectory_store.find_clusters(
+            similarity_threshold=similarity_threshold,
+            min_cluster_size=min_cluster_size,
+            task_type=task_type,
+        )
+        if not clusters:
+            print("[Synthesis] No clusters of similar trajectories found — "
+                  "nothing to synthesize")
+            return {
+                "clusters_found": 0, "clusters_synthesized": 0,
+                "entries_removed": 0, "masters_stored": 0, "errors": [],
+            }
+
+        clusters = clusters[:max_clusters]
+        print(f"[Synthesis] Found {len(clusters)} cluster(s) to synthesize "
+              f"(similarity >= {similarity_threshold}, min_size {min_cluster_size})")
+
+        masters_stored = 0
+        entries_removed = 0
+        errors: List[str] = []
+        all_removed_indices: List[int] = []
+
+        for cluster_idx, cluster in enumerate(clusters):
+            # Gather the verified entries in this cluster.
+            entries = [
+                self.trajectory_store.entries[i]
+                for i in cluster
+                if i < len(self.trajectory_store.entries)
+            ]
+            # Skip any already-synthesized entries (don't re-synthesize).
+            entries = [e for e in entries if not e.get("synthesized")]
+            if len(entries) < min_cluster_size:
+                continue
+
+            # Build the examples string for the generalist.
+            examples = "\n\n".join(
+                f"Problem {i+1}: {e['query']}\n"
+                f"Verified answer: {e['answer']}\n"
+                f"(verified via {e.get('verification_method', '?')})"
+                for i, e in enumerate(entries)
+            )
+            prompt = self._SYNTHESIS_PROMPT.format(
+                n=len(entries), examples=examples,
+            )
+
+            try:
+                master = await self._call_generalist(prompt, max_tokens=1024)
+            except Exception as e:
+                msg = f"cluster {cluster_idx}: generalist failed: {e}"
+                print(f"[Synthesis] {msg} — keeping raw entries")
+                errors.append(msg)
+                continue
+
+            if not master or not master.strip():
+                msg = f"cluster {cluster_idx}: empty synthesis"
+                errors.append(msg)
+                continue
+
+            # Use the highest-score entry's query as the representative query.
+            representative = max(entries, key=lambda e: e.get("score", 0.0))
+            source_queries = [e["query"] for e in entries]
+
+            # Store the synthesized master (NOT verified — provenance only).
+            self.trajectory_store.store_synthesized(
+                query=representative["query"],
+                answer=master.strip(),
+                task_type=representative.get("task_type", "unknown"),
+                source_count=len(entries),
+                source_queries=source_queries,
+            )
+            masters_stored += 1
+
+            # Mark the raw entries for removal. Adjust indices for already-
+            # removed entries (removal shifts indices, so we collect all and
+            # remove in one batch at the end).
+            all_removed_indices.extend(cluster)
+            entries_removed += len(entries)
+            print(f"[Synthesis] Cluster {cluster_idx}: synthesized "
+                  f"{len(entries)} trajectories into 1 master")
+
+        # Remove all synthesized-from entries in one batch.
+        if all_removed_indices:
+            # Deduplicate (a cluster index could appear once; but be safe).
+            unique_indices = sorted(set(all_removed_indices), reverse=True)
+            self.trajectory_store.remove_entries(unique_indices)
+
+        return {
+            "clusters_found": len(clusters),
+            "clusters_synthesized": masters_stored,
+            "entries_removed": entries_removed,
+            "masters_stored": masters_stored,
+            "errors": errors,
+        }
+
+    # ------------------------------------------------------------------ #
     # Lifecycle: warm pool start/cleanup
     # ------------------------------------------------------------------ #
     async def start(self) -> None:

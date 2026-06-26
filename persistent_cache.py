@@ -823,3 +823,158 @@ class VerifiedTrajectoryStore:
 
     def __len__(self) -> int:
         return len(self.entries)
+
+    # ----------------------- synthesis (v0.4.0) ----------------------- #
+    def find_clusters(
+        self, similarity_threshold: float = 0.85,
+        min_cluster_size: int = 3,
+        task_type: Optional[str] = None,
+    ) -> List[List[int]]:
+        """Find clusters of highly-similar verified trajectories.
+
+        Uses greedy agglomerative clustering on the embedding matrix: for
+        each entry, find all other entries above ``similarity_threshold``
+        and group them. Returns a list of clusters, each a list of entry
+        indices. Clusters smaller than ``min_cluster_size`` are excluded
+        (synthesizing 2 entries into 1 saves little memory).
+
+        When ``task_type`` is given, only clusters within that task type
+        are returned (math trajectories cluster with math, code with code).
+
+        This is the first half of trajectory synthesis (Phase 4.1): the
+        orchestrator's ``synthesize_trajectories`` method calls this, then
+        asks the generalist to merge each cluster into a single "master
+        trajectory" and removes the raw entries.
+        """
+        if not self.entries or self._embeddings_matrix is None:
+            return []
+        if len(self.entries) < min_cluster_size:
+            return []
+
+        # Filter by task_type if requested.
+        if task_type is not None:
+            indices = [
+                i for i, e in enumerate(self.entries)
+                if e.get("task_type") == task_type
+            ]
+        else:
+            indices = list(range(len(self.entries)))
+        if len(indices) < min_cluster_size:
+            return []
+
+        sub_matrix = self._embeddings_matrix[indices]
+        sims = cosine_similarity(sub_matrix)
+
+        # Greedy clustering: assign each entry to the first cluster it
+        # matches, or start a new cluster. O(n^2) but n is bounded by
+        # max_entries (default 512).
+        assigned: Dict[int, int] = {}
+        clusters: List[List[int]] = []
+        for i in range(len(indices)):
+            if i in assigned:
+                continue
+            cluster = [i]
+            assigned[i] = len(clusters)
+            for j in range(i + 1, len(indices)):
+                if j in assigned:
+                    continue
+                if sims[i][j] >= similarity_threshold:
+                    cluster.append(j)
+                    assigned[j] = assigned[i]
+            if len(cluster) >= min_cluster_size:
+                # Map back to original entry indices.
+                clusters.append([indices[k] for k in cluster])
+        return clusters
+
+    def remove_entries(self, indices: List[int]) -> None:
+        """Remove entries at the given indices and rebuild the embedding matrix.
+
+        Used by trajectory synthesis: after a cluster is synthesized into a
+        master trajectory, the raw entries are removed to save memory. The
+        synthesized master is stored separately via ``store()``.
+        """
+        if not indices:
+            return
+        remove_set = set(indices)
+        self.entries = [
+            e for i, e in enumerate(self.entries) if i not in remove_set
+        ]
+        self._rebuild_embeddings_matrix()
+        if self.autosave:
+            self.save()
+        print(f"[TrajectoryStore] Removed {len(remove_set)} entries — "
+              f"store now has {len(self.entries)} entries")
+
+    def store_synthesized(
+        self,
+        query: str,
+        answer: str,
+        task_type: str,
+        source_count: int,
+        source_queries: List[str],
+    ) -> None:
+        """Store a synthesized "master trajectory".
+
+        A master trajectory is a general rule distilled from a cluster of
+        similar verified trajectories by the generalist model. It is NOT
+        independently verified — it is a compression of verified data. The
+        trust model:
+
+          - ``verification_method`` is ``"synthesized"`` (NOT a deterministic
+            verifier). This means it is excluded from the cache trust check
+            (``is_cache_entry_trustworthy`` rejects ``self_claims_only``,
+            and ``synthesized`` is treated the same way — it cannot be
+            returned as a cached verified answer).
+          - It IS retrievable as few-shot context (the ``retrieve`` method
+            checks ``is_cache_entry_trustworthy``, which requires
+            ``verification_method != self_claims_only`` — but synthesized
+            entries are explicitly filtered out in retrieve to avoid
+            presenting a model-generated summary as a "verified example").
+          - The ``synthesized`` flag and ``source_queries`` list provide
+            provenance: the master can be traced back to the raw verified
+            trajectories it was distilled from.
+
+        Args:
+            query: a representative query for the cluster (e.g. the
+                highest-similarity entry's query, or a generalized prompt).
+            answer: the synthesized master trajectory / general rule text.
+            task_type: the task type of the source cluster.
+            source_count: how many raw trajectories were synthesized.
+            source_queries: the queries of the source trajectories
+                (provenance for debugging / audit).
+        """
+        if not answer or not answer.strip():
+            return
+        embedding = self.model.encode([query])[0].tolist()
+        entry = {
+            "query": query,
+            "embedding": embedding,
+            "answer": answer,
+            "score": 0.0,  # synthesized — no independent verification score
+            "verification_method": "synthesized",
+            "task_type": task_type,
+            "route_taken": "synthesized",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "verified": False,  # NOT verified — synthesized, not proven
+            "synthesized": True,
+            "source_count": source_count,
+            "source_queries": source_queries,
+            "schema_version": CURRENT_CACHE_SCHEMA_VERSION,
+            "best_answer": answer,
+            "best_score": 0.0,
+            "claim_count": 0,
+        }
+        self.entries.append(entry)
+        # Evict if over capacity (same LRU + score policy as store()).
+        if len(self.entries) > self.max_entries:
+            self.entries.sort(
+                key=lambda e: (e.get("access_count", 0), e.get("score", 0)),
+                reverse=True,
+            )
+            self.entries = self.entries[: self.max_entries]
+        self._rebuild_embeddings_matrix()
+        if self.autosave:
+            self.save()
+        print(f"[TrajectoryStore] Stored synthesized master trajectory "
+              f"(task_type={task_type}, source_count={source_count}) — "
+              f"store now has {len(self.entries)} entries")
