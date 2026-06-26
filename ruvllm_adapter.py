@@ -210,7 +210,25 @@ class RuvLLMBinding:
     ):
         try:
             import ruvllm_py  # type: ignore
+            # v0.4.0: check for the compiled Engine class, not just the
+            # import. A bare directory named ruvllm_py (the Rust project
+            # scaffold) is importable but doesn't have Engine.
+            if not hasattr(ruvllm_py, "Engine"):
+                raise AttributeError(
+                    "ruvllm_py is importable but has no 'Engine' class — "
+                    "the PyO3 extension is not compiled. Run "
+                    "`maturin develop --release` in the ruvllm_py directory."
+                )
         except ImportError as e:
+            raise ImportError(
+                "RuvLLMBinding requires the 'ruvllm_py' PyO3 extension, "
+                "which is not yet published. To use RuvLLM in-process, "
+                "build the PyO3 wrapper from the ruvllm Rust crate:\n"
+                "  cd ruvllm-py && maturin develop --release\n"
+                "Until then, use RuvLLM as an HTTP sidecar via --ruvllm-url "
+                "(points VIBE_THINKER_URL at the RuvLLM server port)."
+            ) from e
+        except AttributeError as e:
             raise ImportError(
                 "RuvLLMBinding requires the 'ruvllm_py' PyO3 extension, "
                 "which is not yet published. To use RuvLLM in-process, "
@@ -262,9 +280,17 @@ class RuvLLMBinding:
 
 
 def is_ruvllm_binding_available() -> bool:
-    """Check if the ruvllm_py in-process binding is installed."""
+    """Check if the ruvllm_py in-process binding is installed AND compiled.
+
+    A bare directory named ``ruvllm_py`` (e.g. the Rust project scaffold)
+    is importable but doesn't have the compiled ``Engine`` class. We check
+    for the ``Engine`` attribute to distinguish the compiled extension from
+    the scaffold.
+    """
     try:
         import ruvllm_py  # type: ignore  # noqa: F401
-        return True
+        # The compiled extension exposes an Engine class. The Rust
+        # scaffold directory does not (it's just source code, not built).
+        return hasattr(ruvllm_py, "Engine")
     except ImportError:
         return False

@@ -38,6 +38,7 @@ Usage:
 import asyncio
 import json
 import os
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -117,6 +118,11 @@ class JobQueue:
         self.max_concurrent = max_concurrent
         self.audit_log = audit_log
         self.persist_path = persist_path
+        # Lock for disk persistence operations. _unpersist_job does a
+        # read-filter-write pattern that races when multiple jobs complete
+        # concurrently (max_concurrent > 1). This lock serializes all
+        # persistence file access to prevent lost updates and corruption.
+        self._persist_lock = threading.Lock()
         # Bi-temporal log: records both valid_time (event time) and
         # transaction_time (record time) for every state transition.
         # Signing (v0.3.9): Ed25519 (asymmetric, SLSA L2) takes precedence
@@ -148,33 +154,39 @@ class JobQueue:
         if not self.persist_path:
             return
         try:
-            with open(self.persist_path, "a") as f:
-                f.write(json.dumps({
-                    "job_id": job.job_id,
-                    "query": job.query,
-                    "priority": job.priority,
-                    "force_route": job.force_route,
-                    "created_at": job.created_at,
-                }) + "\n")
+            with self._persist_lock:
+                with open(self.persist_path, "a") as f:
+                    f.write(json.dumps({
+                        "job_id": job.job_id,
+                        "query": job.query,
+                        "priority": job.priority,
+                        "force_route": job.force_route,
+                        "created_at": job.created_at,
+                    }) + "\n")
         except OSError as e:
             print(f"[JobQueue] persist write failed: {e}")
 
     def _unpersist_job(self, job_id: str) -> None:
-        """Remove a job from the persistence file (it reached a terminal state)."""
+        """Remove a job from the persistence file (it reached a terminal state).
+
+        Thread-safe: acquires _persist_lock to prevent concurrent
+        read-filter-write races when multiple jobs complete simultaneously.
+        """
         if not self.persist_path or not os.path.exists(self.persist_path):
             return
         try:
-            with open(self.persist_path, "r") as f:
-                lines = f.readlines()
-            remaining = [
-                line for line in lines
-                if json.loads(line.strip()).get("job_id") != job_id
-            ]
-            # Atomic rewrite
-            tmp = self.persist_path + ".tmp"
-            with open(tmp, "w") as f:
-                f.writelines(remaining)
-            os.replace(tmp, self.persist_path)
+            with self._persist_lock:
+                with open(self.persist_path, "r") as f:
+                    lines = f.readlines()
+                remaining = [
+                    line for line in lines
+                    if json.loads(line.strip()).get("job_id") != job_id
+                ]
+                # Atomic rewrite
+                tmp = self.persist_path + ".tmp"
+                with open(tmp, "w") as f:
+                    f.writelines(remaining)
+                os.replace(tmp, self.persist_path)
         except (OSError, json.JSONDecodeError) as e:
             print(f"[JobQueue] persist cleanup failed: {e}")
 

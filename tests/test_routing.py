@@ -653,3 +653,37 @@ class TestExtractPythonBlock:
         assert "assert add(1,2)==3" in result
         assert "assert add(0,0)==0" in result
 
+    def test_selects_last_valid_python_block(self):
+        """v0.4.0: when multiple fenced blocks exist, select the last
+        valid Python AST block (LLMs output reasoning first, solution last)."""
+        text = (
+            "First, install dependencies:\n"
+            "```bash\npip install numpy\n```\n"
+            "Here's the solution:\n"
+            "```python\nassert add(1,2)==3\n```"
+        )
+        result = HybridReasoningOrchestrator._extract_python_block(text)
+        assert result == "assert add(1,2)==3"
+        assert "pip install" not in result
+
+    def test_selects_last_valid_among_multiple_python_blocks(self):
+        """When multiple Python blocks exist, select the last parseable one."""
+        text = (
+            "```python\n# draft solution\nimport os\n```\n"
+            "Actually, here's the final version:\n"
+            "```python\ndef add(a, b):\n    return a + b\n```"
+        )
+        result = HybridReasoningOrchestrator._extract_python_block(text)
+        assert "def add" in result
+        assert "draft" not in result
+
+    def test_falls_back_to_last_block_if_none_parse(self):
+        """If no block parses as valid Python, return the last block
+        (let the verifier reject it rather than evaluating the wrong block)."""
+        text = (
+            "```python\nthis is not valid python !!!\n```\n"
+            "```python\nalso not valid @@@\n```"
+        )
+        result = HybridReasoningOrchestrator._extract_python_block(text)
+        assert "also not valid" in result
+

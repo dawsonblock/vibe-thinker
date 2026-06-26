@@ -53,7 +53,9 @@ class TestWarmPoolUnit:
 
     def test_get_container_returns_none_when_empty(self):
         pool = WarmDockerPool(pool_size=2)
-        assert pool._get_container() is None
+        container, idx = pool._get_container()
+        assert container is None
+        assert idx == -1
 
     def test_get_container_round_robin(self):
         pool = WarmDockerPool(pool_size=3)
@@ -63,7 +65,8 @@ class TestWarmPoolUnit:
             {"name": "c2", "uses": 0},
         ]
         # Round-robin: c0, c1, c2, c0, c1, ...
-        names = [pool._get_container()["name"] for _ in range(7)]
+        results = [pool._get_container() for _ in range(7)]
+        names = [r[0]["name"] for r in results]
         assert names == ["c0", "c1", "c2", "c0", "c1", "c2", "c0"]
 
     @pytest.mark.asyncio

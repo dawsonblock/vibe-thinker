@@ -1,0 +1,28 @@
+[package]
+name = "ruvllm_py"
+version = "0.1.0"
+edition = "2021"
+description = "Python bindings for the RuvLLM Rust inference engine with TurboQuant KV cache compression"
+license = "MIT"
+repository = "https://github.com/ruvnet/ruvllm"
+
+[lib]
+name = "ruvllm_py"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"] }
+# The ruvllm crate is not yet published to crates.io. When it is,
+# uncomment this line:
+# ruvllm = { version = "0.1", features = ["turboquant"] }
+# For now, this scaffold compiles with stub implementations.
+
+[features]
+default = []
+# Enable when the ruvllm crate is available:
+# turboquant = ["ruvllm/turboquant"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

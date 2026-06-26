@@ -295,20 +295,75 @@ class FederatedJobQueue:
             )
             self._publish_failed = True
 
-    def _publish_to_federation(self, job: Job) -> bool:
-        """Publish a job to the exo-federation network.
+    def _publish_to_federation(self, job: Job) -> None:
+        """Publish a job to the exo-federation network (fire-and-forget).
 
-        Returns True if the publish succeeded, False otherwise. On
-        failure, the caller falls back to local submission (the job is
-        already in the local queue's tracking via _local.submit).
+        This method is called from the synchronous submit() method. To
+        avoid blocking the asyncio event loop with synchronous network
+        I/O, it schedules the actual HTTP POST as a background asyncio
+        task via asyncio.create_task(). The task runs concurrently and
+        its result (success/failure) is logged but does not affect the
+        submit() return — the job is already in the local queue and
+        will run locally if the federation publish fails.
 
-        This is a synchronous HTTP call (the federation's POST /submit
-        endpoint). For async callers, the submit() method handles the
-        bridging.
+        If no event loop is running (rare — submit() called outside
+        async context), falls back to a thread pool executor.
         """
         if not self._federation_configured():
             self._warn_fallback("mTLS certs or federation URL not configured")
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            # Fire-and-forget: schedule the async publish without
+            # blocking submit(). The task handles its own errors.
+            loop.create_task(self._publish_to_federation_async(job))
+        except RuntimeError:
+            # No running event loop — run in a thread to avoid blocking.
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                pool.submit(self._publish_to_federation_sync, job)
+
+    async def _publish_to_federation_async(self, job: Job) -> bool:
+        """Async federation publish using aiohttp (non-blocking).
+
+        Uses a short-lived aiohttp session with mTLS. This runs as a
+        background task — errors are logged but do not propagate to
+        submit().
+        """
+        try:
+            import aiohttp
+            import ssl
+            payload = {
+                "job_id": job.job_id,
+                "query": job.query,
+                "priority": job.priority,
+                "force_route": job.force_route,
+                "submitted_by": self._node_id,
+            }
+            ctx = ssl.create_default_context(cafile=self._mtls_ca)
+            ctx.load_cert_chain(self._mtls_cert, self._mtls_key)
+            timeout = aiohttp.ClientTimeout(total=5.0)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    f"{self._federation_url}/submit",
+                    json=payload,
+                    ssl=ctx,
+                    headers={"Content-Type": "application/json"},
+                ) as resp:
+                    if resp.status < 400:
+                        self._federation_available = True
+                        return True
+                    self._warn_fallback(f"HTTP {resp.status}")
+                    return False
+        except Exception as e:
+            self._warn_fallback(f"connection error: {e}")
             return False
+
+    def _publish_to_federation_sync(self, job: Job) -> bool:
+        """Synchronous federation publish (fallback for non-async contexts).
+
+        Uses urllib with mTLS. Only called when no event loop is running.
+        """
         try:
             import urllib.request
             import ssl
@@ -333,11 +388,8 @@ class FederatedJobQueue:
                     return True
                 self._warn_fallback(f"HTTP {resp.status}")
                 return False
-        except (OSError, urllib.error.URLError) as e:
-            self._warn_fallback(f"connection error: {e}")
-            return False
         except Exception as e:
-            self._warn_fallback(f"unexpected error: {e}")
+            self._warn_fallback(f"connection error: {e}")
             return False
 
     # ----------------------- BaseJobQueue protocol ----------------------- #

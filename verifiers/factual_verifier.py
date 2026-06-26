@@ -1,21 +1,24 @@
-"""Factual/retrieval verifier — NLI judge with hardened lexical fallback.
+"""Factual/retrieval verifier — NLI judge with fail-closed semantics.
 
 For now, do NOT pretend factual claims are verified unless sources exist.
 The honesty matters: returning ``verified=True`` without evidence would
 make this system a liar. When retrieval sources are available in the
 context, this verifier checks claims against them.
 
-Two verification paths:
+Verification path (v0.4.0):
   1. **LLM-judge NLI** (when ``llm_judge`` is configured): prompts a local
      LLM to classify the answer against each source as ENTAILMENT,
      CONTRADICTION, or NEUTRAL. This catches contradictions that lexical
      overlap misses (e.g. "Paris is NOT the capital" vs a source saying
      "Paris is the capital"). Uses the orchestrator's existing
      ``_call_generalist`` — no new dependencies.
-  2. **Hardened lexical overlap** (fallback): checks if key fragments of
-     the answer appear in a source, with negation detection that rejects
-     answers whose negation contradicts the source (e.g. an answer saying
-     "X is NOT Y" when the source says "X is Y").
+
+  2. **Fail-closed** (when no judge, judge fails, or all sources NEUTRAL):
+     returns ``verified=False``. The lexical overlap fallback was removed
+     in v0.4.0 because word counting cannot approximate semantic truth —
+     it produced false positives (e.g. "Berlin is a beautiful capital"
+     passed verification against a source about Germany because of >40%
+     word overlap). Factual truth requires NLI, not word counting.
 
 Behavior:
   - No retrieval source in context -> verified=False, method="unsupported_factual"
@@ -91,13 +94,27 @@ class FactualVerifier:
         if self._llm_judge is not None:
             return await self._verify_with_nli(answer, sources)
 
-        # Fallback: hardened lexical overlap with negation detection.
-        return self._verify_with_lexical(answer, sources)
+        # No LLM judge available — fail-closed. Factual truth cannot be
+        # approximated by word counting (the lexical fallback was removed
+        # in v0.4.0 because it produced false positives: answers with high
+        # word overlap but wrong semantics passed verification).
+        return VerificationResult(
+            verified=False,
+            score=0.0,
+            method="nli_unavailable",
+            evidence={"answer": answer[:200], "source_count": len(sources)},
+            error="no LLM judge configured; factual claims require NLI verification",
+        )
 
     async def _verify_with_nli(
         self, answer: str, sources: list
     ) -> VerificationResult:
-        """Use the LLM judge to classify entailment per source."""
+        """Use the LLM judge to classify entailment per source.
+
+        Fail-closed: if the judge fails or all sources return NEUTRAL,
+        returns verified=False. Lexical overlap is NOT used as a fallback
+        — word counting cannot approximate semantic truth (v0.4.0).
+        """
         for src in sources:
             prompt = _NLI_JUDGE_PROMPT.format(
                 source=str(src)[:2000], claim=answer[:1000],
@@ -105,10 +122,16 @@ class FactualVerifier:
             try:
                 raw = await self._llm_judge(prompt)
             except Exception as e:
-                # If the judge call fails, fall back to lexical rather than
-                # crashing — but record the failure.
-                print(f"[FactualVerifier] LLM judge failed ({e}), falling back to lexical")
-                return self._verify_with_lexical(answer, sources)
+                # Judge call failed — fail-closed. Do NOT fall back to
+                # lexical overlap (it produces false positives).
+                print(f"[FactualVerifier] LLM judge failed ({e}) — fail-closed")
+                return VerificationResult(
+                    verified=False,
+                    score=0.0,
+                    method="nli_judge_error",
+                    evidence={"answer": answer[:200], "source_count": len(sources)},
+                    error=f"LLM judge failed: {e}",
+                )
 
             verdict = self._parse_nli_verdict(raw)
             if verdict == "ENTAILMENT":
@@ -133,10 +156,16 @@ class FactualVerifier:
                 )
             # NEUTRAL: try the next source
 
-        # All sources were NEUTRAL — fall back to lexical overlap as a
-        # last resort (it may catch overlap the NLI judge was too strict
-        # to classify as entailment).
-        return self._verify_with_lexical(answer, sources)
+        # All sources were NEUTRAL — fail-closed. The answer is neither
+        # supported nor contradicted by the sources. Lexical overlap
+        # cannot substitute for semantic entailment (v0.4.0).
+        return VerificationResult(
+            verified=False,
+            score=0.0,
+            method="nli_neutral",
+            evidence={"answer": answer[:200], "source_count": len(sources)},
+            error="all sources returned NEUTRAL; answer is not supported by any source",
+        )
 
     @staticmethod
     def _parse_nli_verdict(raw: str) -> str:

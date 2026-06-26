@@ -65,6 +65,7 @@ class DockerSandboxExecutor:
         # Build the docker command
         cmd = [
             "docker", "run", "--rm",
+            "--init",  # v0.4.0: tini sub-init for zombie reaping
             "--network", "none" if not network else "default",
             "--memory", memory_limit,
             "--read-only",

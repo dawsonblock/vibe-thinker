@@ -837,23 +837,81 @@ class HybridReasoningOrchestrator:
 
     @staticmethod
     def _extract_python_block(text: str) -> str:
-        """Extract the first ```python ... ``` block from text, or the whole
-        text if no fenced block is found.
+        """Extract the best Python code block from text.
+
+        v0.4.0: instead of blindly taking the first fenced block (which
+        might be a bash install command or pseudo-code example), parse
+        ALL matched blocks with ast.parse() and select the LAST valid
+        Python AST. LLMs typically output reasoning/explanation first
+        and the final solution last.
 
         Handles common model output variants:
           - ```python\n...```  (standard)
           - ```py\n...```      (abbreviated language tag)
           - ```\n...```        (no language tag)
           - bare code with no fence (returns the stripped text)
+
+        v0.4.0: line-by-line parsing replaces the regex approach. The
+        old regex couldn't distinguish opening and closing fences,
+        causing it to match text between a closing ```bash fence and
+        an opening ```python fence as if it were a code block.
+
+        Fallback order:
+          1. Last fenced block that parses as valid Python AST
+          2. First fenced block (if none parse — let the verifier reject it)
+          3. The stripped text itself (no fences found)
         """
-        # Match fenced blocks with optional language tag (python, py, or none).
-        # The tag must be immediately after the opening backticks, no space.
-        match = re.findall(r"```(?:python|py)?\n(.*?)```", text, re.DOTALL)
-        if match:
-            return match[0].strip()
-        # No fenced block found — return the stripped text as-is (the model
-        # may have emitted bare code without fences).
-        return text.strip()
+        import ast as _ast
+
+        # v0.4.0: parse line by line to correctly handle fenced blocks.
+        # This avoids the regex ambiguity between opening and closing fences.
+        lines = text.split("\n")
+        blocks: list = []  # list of (tag, content) tuples
+        current_block = None
+        current_tag = None
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("```"):
+                if current_block is not None:
+                    # Closing fence — save the block
+                    blocks.append((current_tag, "\n".join(current_block)))
+                    current_block = None
+                    current_tag = None
+                else:
+                    # Opening fence — extract the language tag
+                    tag = stripped[3:].strip().lower()
+                    current_tag = tag if tag else None
+                    current_block = []
+            elif current_block is not None:
+                current_block.append(line)
+
+        # Filter to only Python blocks (python, py, or no tag).
+        # Non-Python blocks (bash, sh, json, etc.) are excluded.
+        python_blocks = [
+            content for tag, content in blocks
+            if tag in ("python", "py", None)
+        ]
+
+        if not python_blocks:
+            # No fenced Python block found — return the stripped text
+            # as-is (the model may have emitted bare code without fences).
+            return text.strip()
+
+        # v0.4.0: try all blocks in reverse order (last first). LLMs
+        # typically output explanation first, final solution last.
+        # Select the last block that parses as valid Python.
+        for block in reversed(python_blocks):
+            stripped = block.strip()
+            try:
+                _ast.parse(stripped)
+                return stripped
+            except SyntaxError:
+                continue
+
+        # No block parsed as valid Python. Return the last block anyway —
+        # the verifier will reject it, but at least we're evaluating the
+        # model's final output, not its first (which might be bash/pseudo).
+        return python_blocks[-1].strip()
 
     @staticmethod
     def _validate_test_spec(tests: str) -> bool:
