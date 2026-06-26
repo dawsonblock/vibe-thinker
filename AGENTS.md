@@ -129,9 +129,58 @@ llama-server -m ~/models/ruvltra-claude-code-0.5b-q4_k_m.gguf --host 127.0.0.1 -
 Use `hf download <repo> <file> --local-dir ~/models` (NOT `huggingface-cli download`,
 which prints help on the installed version).
 
+## TurboQuant+ (optional llama-server backend)
+[TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant) is a
+fork of llama.cpp that adds Walsh-Hadamard rotated polar quantization for both
+KV cache (`turbo2`/`turbo3`/`turbo4`) and weights (`TQ3_1S`/`TQ4_1S`). It is
+additive — every existing llama.cpp quant/model/backend still works. vibe-thinker
+uses it as a drop-in replacement for the `llama-server` binary; no Python changes
+needed.
+
+### What it helps with on 16GB M2 Pro
+TurboQuant+ does NOT make Command R 35B fit (weights alone are ~19.7GB at
+`TQ4_1S` ~4.5 bits). What it DOES help with is **long-context KV cache
+compression** for models that already fit in RAM:
+- VibeThinker-3B with `-c 32768` (32k context) instead of the default 8192
+- Qwen 2.5 Coder 7B with `-c 32768` for large codebase ingestion
+- The asymmetric finding: **V tolerates aggressive compression, K does not**.
+  Always keep K at higher precision than V.
+
+### Build (Apple Silicon / Metal)
+```bash
+git clone -b feature/turboquant-kv-cache https://github.com/TheTom/llama-cpp-turboquant.git
+cd llama-cpp-turboquant
+cmake -B build -DGGML_METAL=ON && cmake --build build -j
+# Use build/bin/llama-server instead of the stock binary
+```
+
+### Recommended KV cache configs (start light, then compress)
+| Config | `--cache-type-k` | `--cache-type-v` | When |
+|---|---|---|---|
+| Safest start | `f16` | `turbo4` | First contact with any new model |
+| Conservative | `q8_0` | `turbo4` | Verified safe, want a memory win |
+| **Recommended default** | `q8_0` | `turbo3` | Most models — ~4.6× V compression, <1.5% PPL loss |
+| Aggressive V | `q8_0` | `turbo2` | Memory-bound long context, after validating step 3 |
+
+Never start with symmetric turbo K compression (both sides `turbo*`) — that's
+where models break. See the fork's
+[asymmetric-kv-compression paper](https://github.com/TheTom/turboquant_plus/blob/main/docs/papers/asymmetric-kv-compression.md).
+
+### Example: VibeThinker-3B with 32k context (TurboQuant+)
+```bash
+# Stock llama-server: 32k context would blow up RAM on 16GB
+# TurboQuant+ with asymmetric KV: fits comfortably
+llama-server -m ~/models/vibethinker-3b-q4_k_m.gguf \
+  --host 127.0.0.1 --port 8080 -c 32768 -t 6 --jinja \
+  --cache-type-k q8_0 --cache-type-v turbo3
+```
+
 ## Hardware constraints learned
-- 16GB unified memory is too small for Command R 35B (Q4 weights alone ~20GB).
-  TurboQuant compresses the KV cache, not the weights, so it does not rescue this.
+- 16GB unified memory is too small for Command R 35B. Even with TurboQuant+
+  weight quantization (`TQ4_1S` ~4.5 bits/param), 35B weights alone are
+  ~19.7GB — still over budget. KV cache compression doesn't help when the
+  weights don't fit. See the TurboQuant+ section below for what DOES help
+  on 16GB (long-context KV compression for models that already fit).
 - ruvLLM's "SONA self-learning" is stubs and mocks (training loop body is
   `// would go here`, embeddings are zero vectors, inference is mock templates).
   The verified trajectory store is the honest version of this concept.

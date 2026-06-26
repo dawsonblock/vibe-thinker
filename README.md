@@ -342,6 +342,38 @@ Gated behind `--fast-specialist` / `RFSN_FAST_SPECIALIST` (default off). **Do
 not enable with a 3B+ specialist on 16GB RAM** — 15 parallel trajectories will
 thrash or OOM. The default 1/2/6 policy is unchanged.
 
+## TurboQuant+ (optional llama-server backend)
+
+[TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant)
+is a fork of llama.cpp that adds Walsh-Hadamard rotated polar quantization for
+both KV cache (`turbo2`/`turbo3`/`turbo4`) and weights (`TQ3_1S`/`TQ4_1S`).
+vibe-thinker uses it as a drop-in replacement for the `llama-server` binary —
+no Python changes needed.
+
+**What it helps with on 16GB**: long-context KV cache compression for models
+that already fit in RAM (VibeThinker-3B with 32k context, Qwen 7B with large
+codebases). It does NOT make Command R 35B fit — weights alone are ~19.7GB
+even at `TQ4_1S` (~4.5 bits/param).
+
+The core finding: **V tolerates aggressive compression, K does not**. Always
+keep K at higher precision than V. Recommended default: `--cache-type-k q8_0
+--cache-type-v turbo3` (~4.6× V compression, <1.5% PPL loss).
+
+```bash
+# Build (Apple Silicon / Metal)
+git clone -b feature/turboquant-kv-cache https://github.com/TheTom/llama-cpp-turboquant.git
+cd llama-cpp-turboquant
+cmake -B build -DGGML_METAL=ON && cmake --build build -j
+
+# VibeThinker-3B with 32k context (fits on 16GB with TurboQuant+ KV compression)
+llama-server -m ~/models/vibethinker-3b-q4_k_m.gguf \
+  --host 127.0.0.1 --port 8080 -c 32768 -t 6 --jinja \
+  --cache-type-k q8_0 --cache-type-v turbo3
+```
+
+See AGENTS.md for the full config ladder and the asymmetric K/V compression
+details.
+
 ## Cache promotion rules
 
 Bad answers are never cached. The strict `should_cache()` policy rejects:
