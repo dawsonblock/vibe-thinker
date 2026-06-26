@@ -845,6 +845,16 @@ class VerifiedTrajectoryStore:
         orchestrator's ``synthesize_trajectories`` method calls this, then
         asks the generalist to merge each cluster into a single "master
         trajectory" and removes the raw entries.
+
+        Performance (v0.4.1 fix):
+          For small N (<=512, the default max_entries), the full N×N
+          similarity matrix is computed in one shot — fast and simple.
+          For large N (>512), we use chunked computation to avoid
+          materializing the entire N×N matrix in memory at once. Each
+          chunk computes similarity of a batch of rows against the full
+          matrix, keeping memory bounded at O(chunk_size × N) instead
+          of O(N^2). The greedy clustering loop is also optimized to
+          skip already-assigned entries early.
         """
         if not self.entries or self._embeddings_matrix is None:
             return []
@@ -862,29 +872,65 @@ class VerifiedTrajectoryStore:
         if len(indices) < min_cluster_size:
             return []
 
+        n = len(indices)
         sub_matrix = self._embeddings_matrix[indices]
-        sims = cosine_similarity(sub_matrix)
 
-        # Greedy clustering: assign each entry to the first cluster it
-        # matches, or start a new cluster. O(n^2) but n is bounded by
-        # max_entries (default 512).
-        assigned: Dict[int, int] = {}
-        clusters: List[List[int]] = []
-        for i in range(len(indices)):
-            if i in assigned:
-                continue
-            cluster = [i]
-            assigned[i] = len(clusters)
-            for j in range(i + 1, len(indices)):
-                if j in assigned:
+        # For small N, compute the full similarity matrix (fast, simple).
+        # For large N, use chunked computation to bound memory.
+        CHUNK_THRESHOLD = 512
+        CHUNK_SIZE = 256
+
+        if n <= CHUNK_THRESHOLD:
+            sims = cosine_similarity(sub_matrix)
+            # Greedy clustering: assign each entry to the first cluster it
+            # matches, or start a new cluster.
+            assigned: Dict[int, int] = {}
+            clusters: List[List[int]] = []
+            for i in range(n):
+                if i in assigned:
                     continue
-                if sims[i][j] >= similarity_threshold:
-                    cluster.append(j)
-                    assigned[j] = assigned[i]
-            if len(cluster) >= min_cluster_size:
-                # Map back to original entry indices.
-                clusters.append([indices[k] for k in cluster])
-        return clusters
+                cluster = [i]
+                assigned[i] = len(clusters)
+                for j in range(i + 1, n):
+                    if j in assigned:
+                        continue
+                    if sims[i][j] >= similarity_threshold:
+                        cluster.append(j)
+                        assigned[j] = assigned[i]
+                if len(cluster) >= min_cluster_size:
+                    clusters.append([indices[k] for k in cluster])
+            return clusters
+        else:
+            # Large N: chunked similarity computation to avoid O(N^2)
+            # memory. We compute similarity row-by-row in chunks and
+            # cluster greedily, keeping only the current chunk's
+            # similarities in memory.
+            assigned: Dict[int, int] = {}
+            clusters: List[List[int]] = []
+            # Precompute norms for efficient cosine similarity.
+            norms = np.linalg.norm(sub_matrix, axis=1, keepdims=True)
+            normalized = sub_matrix / (norms + 1e-10)
+            for chunk_start in range(0, n, CHUNK_SIZE):
+                chunk_end = min(chunk_start + CHUNK_SIZE, n)
+                chunk = normalized[chunk_start:chunk_end]
+                # Compute similarity of this chunk against ALL entries.
+                # This is O(chunk_size × N) — bounded memory.
+                chunk_sims = chunk @ normalized.T  # (chunk_size, N)
+                for li, i in enumerate(range(chunk_start, chunk_end)):
+                    if i in assigned:
+                        continue
+                    cluster = [i]
+                    assigned[i] = len(clusters)
+                    row = chunk_sims[li]
+                    for j in range(i + 1, n):
+                        if j in assigned:
+                            continue
+                        if row[j] >= similarity_threshold:
+                            cluster.append(j)
+                            assigned[j] = assigned[i]
+                    if len(cluster) >= min_cluster_size:
+                        clusters.append([indices[k] for k in cluster])
+            return clusters
 
     def remove_entries(self, indices: List[int]) -> None:
         """Remove entries at the given indices and rebuild the embedding matrix.

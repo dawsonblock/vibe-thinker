@@ -1,9 +1,13 @@
-//! API probe for ruvllm and exo-federation.
+//! API probe for ruvllm.
 //!
 //! This binary does NOT call any real model or network. It only checks
 //! that the crate APIs are reachable from Rust code — what types exist,
 //! what traits are implemented, what functions are exported. The output
 //! is printed to stdout for the dependency report.
+//!
+//! exo-federation was removed in v0.4.1 (stubbed crate, archived PQ
+//! crypto deps). Federation is now implemented in Python via
+//! federation_server.py.
 
 use std::io::{self, Write};
 
@@ -14,11 +18,6 @@ fn main() {
 
     // Try to access the ruvllm crate's public API.
     probe_ruvllm(&mut out);
-
-    println!("\n=== exo-federation API probe ===\n");
-
-    // Try to access the exo-federation crate's public API.
-    probe_exo(&mut out);
 
     println!("\n=== probe complete ===");
 }
@@ -44,15 +43,4 @@ fn probe_ruvllm(out: &mut impl Write) {
     //
     // We'll try the most likely entry points and let the compiler
     // guide us to the actual API.
-}
-
-fn probe_exo(out: &mut impl Write) {
-    let _ = writeln!(out, "exo-federation crate linked successfully");
-
-    // Common patterns for federation crates:
-    //   - exo_federation::Node::new(config)
-    //   - exo_federation::Network::join(url)
-    //   - exo_federation::Worker::register()
-    //
-    // Same approach — let the compiler tell us what's actually exported.
 }

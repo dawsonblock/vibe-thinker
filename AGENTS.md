@@ -32,7 +32,7 @@
 Four pluggable abstractions from the Vibe-Thinker + RuFlo Integration Plan.
 All are opt-in with backward-compatible defaults — no behavior change unless
 the new parameters/flags are used. External ruvnet repos (ruflo/AgentDB,
-ruvllm, exo-federation) are NOT required; the abstractions fail-closed to
+ruvllm) are NOT required; the abstractions fail-closed to
 the existing local behavior when the sidecars/bindings are absent.
 
 ### Ed25519 audit-log signatures (signers.py)
@@ -102,20 +102,45 @@ is configured.
 
 ### Federated job queue (federated_queue.py)
 Abstracts the job queue behind a `BaseJobQueue` protocol — the plan's
-Phase 4.1. Enables multi-node reasoning swarms via exo-federation:
+Phase 4.1. Enables multi-node reasoning swarms via a Python-native
+federation coordinator:
 - `LocalJobQueue` — thin wrapper around the existing `JobQueue`. The
   default; zero behavior change.
-- `FederatedJobQueue` — pushes jobs to an exo-federation network
-  (ruvnet/exo-federation, Rust crate) over mTLS. Any idle node on the
-  network can claim and run pending jobs. Fail-closed-fallback: when
-  the federation is unreachable (sidecar down, mTLS certs missing),
-  jobs still run locally via the wrapped `LocalJobQueue`. mTLS config
-  via `mtls_cert`, `mtls_key`, `mtls_ca` params.
+- `FederatedJobQueue` — pushes jobs to a Python-native federation
+  coordinator (`federation_server.py`, a FastAPI app) over mTLS. Any
+  idle node on the network can claim and run pending jobs.
+  Fail-closed-fallback: when the coordinator is unreachable (server
+  down, mTLS certs missing), jobs still run locally via the wrapped
+  `LocalJobQueue`. mTLS config via `mtls_cert`, `mtls_key`, `mtls_ca`
+  params.
+- `federation_server.py` — standalone FastAPI coordinator that any
+  node can run: `python3 -m federation_server --mtls-cert node.crt
+  --mtls-key node.key --mtls-ca ca.crt`. Implements POST /submit,
+  /claim, /complete, GET /jobs, /health. Replaces the stubbed
+  exo-federation Rust crate.
 - `make_job_queue()` factory: `federation_url` non-empty →
   FederatedJobQueue; empty/None → LocalJobQueue.
 The existing `JobQueue` satisfies `BaseJobQueue` structurally
 (runtime_checkable Protocol) — no changes needed to use it as a
 `BaseJobQueue`.
+
+## Robust answer extraction (v0.4.1)
+The system relies on regex to parse `\boxed{...}` from model output. Two
+fixes:
+1. **Whitespace-tolerant `\boxed` regex.** Models sometimes output
+   `\boxed {42}` (space before the brace). The regex now uses
+   `\\boxed\s*\{` to handle this. Fixed in `verifiers/math_verifier.py`
+   (`_extract_boxed`) and `vibe_clr_async.py` (`_extract_boxed_answer`
+   and the fallback in `_extract_claims_and_answer`).
+2. **Structured JSON output schema.** A new GBNF grammar
+   (`_STRUCTURED_OUTPUT_GRAMMAR` in `vibe_clr_async.py`) forces the
+   specialist to output JSON with distinct keys: `reasoning_steps`
+   (array), `boxed_answer` (string|null), `code_solution` (string|null).
+   The `parse_structured_output()` static method extracts these keys
+   directly — no regex scraping needed. When the specialist uses this
+   grammar, the orchestrator reads the answer from the `boxed_answer`
+   or `code_solution` key. Falls back to regex extraction for
+   unstructured outputs (backward-compatible).
 
 ## Iterative code repair (v0.4.0)
 Extends the multi-candidate code loop (`_run_code_specialist_verified`) with
@@ -251,6 +276,15 @@ satisfaction is mathematical, not approximate.
   the Z3 model as evidence.
 - Requires optional `z3-solver` package: `pip install z3-solver`.
 - Wired into `select_verifier(task_type="logic")`.
+- **v0.4.1: Z3 constraint translation.** `_build_verifier_context` now
+  has a `task_type == "logic"` branch that prompts the generalist to
+  translate the natural-language query into a JSON block with
+  `constraints`, `variables`, and `values` (Z3-compatible). The
+  `_translate_logic_constraints` method parses the JSON and feeds it
+  into the verifier context. Fail-closed: if the generalist is
+  unreachable or returns malformed JSON, no constraints are set — the
+  verifier returns `verified=False` (honest — we can't verify what we
+  can't parse).
 
 ## Dynamic compute limits (v0.4.0)
 The sandbox's memory and timeout were previously hardcoded (128m / 5.0s for
@@ -278,6 +312,12 @@ pruning memory without losing the distilled knowledge.
 - `VerifiedTrajectoryStore.find_clusters()` — greedy agglomerative
   clustering on the embedding matrix. Returns clusters of >= min_cluster_size
   (default 3) entries above the similarity threshold.
+  **v0.4.1: chunked computation for large N.** For N <= 512 (the default
+  max_entries), the full N×N similarity matrix is computed in one shot.
+  For N > 512, chunked computation keeps memory bounded at
+  O(chunk_size × N) instead of O(N²), using normalized dot-product
+  similarity. This prevents the event loop from locking up when the
+  memory vault grows to 10,000+ entries.
 - `VerifiedTrajectoryStore.store_synthesized()` — stores the master with
   `verification_method="synthesized"`, `verified=False`, `synthesized=True`,
   and `source_queries` for provenance.
@@ -407,8 +447,62 @@ restriction) is attached to the `ExecutionResult.evidence` dict.
 Env: `RFSN_NETWORK_ALLOWLIST`, `RFSN_NETWORK_ALLOWLIST_FILE`,
 `RFSN_DNS_RESOLVER`, `RFSN_SANDBOX_IMAGE`.
 
+## SNI-aware egress proxy (v0.4.1)
+Solves the CDN IP rotation problem with iptables-based allow-listing.
+Modern CDNs (Fastly, Cloudflare) rotate IPs constantly — iptables rules
+resolved at generation time break. The SNI proxy inspects the domain in
+the TLS ClientHello (SNI) or HTTP Host header and allows/denies based on
+the domain, not the IP.
+
+### `sandbox/sni_proxy.py`
+A lightweight async CONNECT proxy that inspects SNI without TLS
+interception (no MITM). The proxy reads the cleartext SNI from the
+TLS ClientHello and checks it against the allow-list. Allowed
+connections are tunneled to the destination; denied connections are
+closed.
+- Run: `python3 -m sandbox.sni_proxy --port 8888
+  --allowlist "pypi.org:443,*.pypi.org:443,files.pythonhosted.org:443"`
+- Wildcard support: `*.pypi.org` matches `foo.pypi.org` (single-level).
+- No TLS interception — the proxy only reads the SNI (cleartext) and
+  tunnels the connection. The actual TLS traffic passes through
+  untouched.
+
+### `--proxy-egress` CLI flag
+`--proxy-egress 127.0.0.1:8888` (or `RFSN_PROXY_EGRESS` env). When set,
+the sandbox container routes traffic through the proxy via
+HTTP_PROXY/HTTPS_PROXY env vars instead of using iptables. No
+NET_ADMIN capability needed. Audit evidence includes `network_mode:
+"proxy"` and the proxy address.
+
+## Python-native federation server (v0.4.1)
+Replaces the stubbed `exo-federation` Rust crate with a simple,
+maintained Python implementation. The Rust crate had no working
+networking layer and relied on archived post-quantum crypto deps
+(pqcrypto-kyber, pqcrypto-internals from PQClean).
+
+### `federation_server.py`
+A FastAPI app that any node can run to become a federation coordinator.
+Implements: POST /submit, /claim, /complete; GET /jobs, /health.
+- Run: `python3 -m federation_server --mtls-cert node.crt
+  --mtls-key node.key --mtls-ca ca.crt`
+- In-memory state (single-coordinator design). For multi-coordinator
+  deployments, back with Redis or a shared database.
+- mTLS: server presents cert and verifies client certs against CA.
+- `--no-tls` flag for dev mode.
+
+### FederatedJobQueue worker loop (v0.4.1)
+`FederatedJobQueue.start()` now launches a background claim loop that
+polls the coordinator for pending jobs every 2 seconds. When the local
+node has spare capacity, it claims a job and submits it locally for
+execution. This is the "pull" side of the federation — the "push" side
+(submit publishing) was already implemented.
+
 ## Rust dependency probe (v0.4.0)
 Probed `ruvllm 2.3.0` and `exo-federation 0.1.1` from crates.io.
+**exo-federation has been replaced** by a Python-native federation
+server (`federation_server.py`). The Rust crate was stubbed (no working
+networking, archived PQ crypto deps). The probe findings are kept below
+for historical reference.
 Both compile and link cleanly. Full report at `docs/rust_dependency_report.md`.
 
 ### ruvllm 2.3.0 — viable for sidecar
@@ -424,7 +518,7 @@ Both compile and link cleanly. Full report at `docs/rust_dependency_report.md`.
 - Dependency tree pinned and vendored at `rust/probes/ruvllm_exo_probe/vendor/`.
 - Next: build `rfsn-ruvllm-sidecar` HTTP binary wrapping `CandleBackend`.
 
-### exo-federation 0.1.1 — NOT viable
+### exo-federation 0.1.1 — NOT viable (replaced by Python-native server)
 - `FederatedMesh` networking is **stubbed** — `federated_query` returns
   placeholder data, `SubstrateInstance` is an empty struct.
 - Post-quantum crypto stack (`pqcrypto-kyber`, `pqcrypto-internals`) is
@@ -432,6 +526,8 @@ Both compile and link cleanly. Full report at `docs/rust_dependency_report.md`.
 - Zero `unsafe` blocks, but the crate is scaffolding, not a working
   federation.
 - Next: implement federation in Python with well-maintained crypto.
+- **DONE**: `federation_server.py` is a Python-native FastAPI coordinator
+  that replaces exo-federation. Standard mTLS, no post-quantum deps.
 
 ## Local web UI (v0.4.0)
 A FastAPI backend + single-page HTML frontend for running queries,

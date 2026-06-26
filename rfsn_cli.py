@@ -484,21 +484,23 @@ def build_argparser() -> argparse.ArgumentParser:
                         "and AgentDB (shadow mode). Reads fall back to local if AgentDB "
                         "is down. Empty = in-memory numpy (default, unchanged).")
     # --- Federated job queue (v0.3.9) ---
-    # When set, jobs are published to an exo-federation swarm network over mTLS.
-    # Any idle node can claim pending jobs. Fail-closed-fallback to local when
-    # the federation is unreachable.
+    # When set, jobs are published to a Python-native federation coordinator
+    # over mTLS. Any idle node can claim pending jobs. Fail-closed-fallback
+    # to local when the federation is unreachable.
     p.add_argument("--federation-url",
                    default=os.environ.get("FEDERATION_URL", ""),
-                   help="exo-federation HTTP endpoint for multi-node job distribution "
-                        "(e.g. https://swarm.local:7443). When set, jobs are published "
-                        "to the swarm; any idle node can claim them. Requires mTLS certs. "
-                        "Empty = local-only single-node queue (default).")
+                   help="Federation coordinator HTTP endpoint for multi-node job "
+                        "distribution (e.g. https://swarm.local:7443). Run the "
+                        "coordinator with: python3 -m federation_server. When set, "
+                        "jobs are published to the swarm; any idle node can claim "
+                        "them. Requires mTLS certs. Empty = local-only single-node "
+                        "queue (default).")
     p.add_argument("--mtls-cert",
                    default=os.environ.get("FEDERATION_MTLS_CERT", ""),
-                   help="Path to the mTLS client certificate (PEM) for exo-federation.")
+                   help="Path to the mTLS client certificate (PEM) for federation.")
     p.add_argument("--mtls-key",
                    default=os.environ.get("FEDERATION_MTLS_KEY", ""),
-                   help="Path to the mTLS client private key (PEM) for exo-federation.")
+                   help="Path to the mTLS client private key (PEM) for federation.")
     p.add_argument("--mtls-ca",
                    default=os.environ.get("FEDERATION_MTLS_CA", ""),
                    help="Path to the mTLS CA certificate (PEM) that signed all node certs.")
@@ -548,6 +550,16 @@ def build_argparser() -> argparse.ArgumentParser:
                         "purpose-built vibe-thinker-sandbox image with iptables "
                         "baked in. Build it with: docker build -f "
                         "sandbox/Dockerfile -t vibe-thinker-sandbox:latest .")
+    p.add_argument("--proxy-egress",
+                   default=os.environ.get("RFSN_PROXY_EGRESS", ""),
+                   help="Address of an SNI-aware egress proxy (e.g. "
+                        "127.0.0.1:8888). When set, the sandbox routes "
+                        "traffic through the proxy instead of using "
+                        "iptables IP-based filtering. This solves CDN IP "
+                        "rotation: the proxy inspects the TLS SNI / HTTP "
+                        "Host header and allows/denies based on the "
+                        "domain, not the IP. Run the proxy with: "
+                        "python3 -m sandbox.sni_proxy --allowlist '...'")
     p.add_argument("--embedding-router", dest="use_embedding_router",
                    action="store_true",
                    help="Use embedding-based semantic router (default)")
@@ -600,6 +612,7 @@ async def _amain() -> None:
         network_allowlist=_build_network_allowlist(args),
         dns_resolver=args.dns_resolver or None,
         sandbox_image=args.sandbox_image or None,
+        proxy_egress=args.proxy_egress or None,
     )
 
     # --- Audit-log signing (v0.3.9) ---

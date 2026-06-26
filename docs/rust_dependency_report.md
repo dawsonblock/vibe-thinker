@@ -1,18 +1,22 @@
 # Rust Dependency Probe Report
 
-**Date:** 2026-06-26
+**Date:** 2026-06-26 (updated 2026-06-27)
 **Probe location:** `rust/probes/ruvllm_exo_probe/`
 **Toolchain:** cargo 1.95.0 (f2d3ce0bd 2026-03-21), macOS arm64
 
 ## Summary
 
-Both `ruvllm 2.3.0` and `exo-federation 0.1.1` are published on crates.io,
-compile cleanly, and link successfully. The blocker table that previously
-listed them as "externally blocked" was stale — the crates exist and are
-usable. However, `cargo audit` found **3 vulnerabilities** and **10
-warnings** (including 1 unsound crate) in the transitive dependency tree.
-The API surface inspection also reveals that `exo-federation` is
-partially stubbed — its networking layer returns placeholder data.
+`ruvllm 2.3.0` is published on crates.io, compiles cleanly, and links
+successfully. `exo-federation 0.1.1` was **removed** in v0.4.1 — the
+crate is stubbed (no working networking layer, archived post-quantum
+crypto deps, unsound `lru 0.12.5` transitive dep). Federation is now
+implemented in Python via `federation_server.py`.
+
+Removing `exo-federation` eliminated all 3 vulnerabilities and the
+unsound crate warning in one stroke:
+- `rustls-webpki 0.101.7` (3 vulns) — gone, only 0.103.13 remains
+- `lru 0.12.5` (unsound, Stacked Borrows violation) — gone entirely
+- `pqcrypto-kyber` / `pqcrypto-internals` (archived PQClean) — gone
 
 ## Build results
 

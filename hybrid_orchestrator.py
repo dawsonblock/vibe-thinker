@@ -283,6 +283,7 @@ class HybridReasoningOrchestrator:
         network_allowlist: Optional["NetworkAllowList"] = None,
         dns_resolver: Optional[str] = None,
         sandbox_image: Optional[str] = None,
+        proxy_egress: Optional[str] = None,
     ):
         self.vibe_endpoint = vibe_endpoint.rstrip("/")
         self.generalist_endpoint = generalist_endpoint.rstrip("/")
@@ -336,6 +337,16 @@ class HybridReasoningOrchestrator:
             # Override the sandbox image if specified.
             if sandbox_image and executor is not None and hasattr(executor, "image"):
                 executor.image = sandbox_image
+        # Apply SNI proxy egress mode (v0.4.1). When set, the sandbox
+        # routes traffic through the proxy instead of using iptables.
+        # This solves CDN IP rotation — the proxy checks the domain (SNI),
+        # not the IP. The proxy must be running separately (sandbox.sni_proxy).
+        if proxy_egress and self.code_verifier is not None:
+            executor = getattr(self.code_verifier, "executor", None)
+            if executor is not None and hasattr(executor, "set_proxy_egress"):
+                executor.set_proxy_egress(proxy_egress)
+                print(f"[Orchestrator] SNI proxy egress enabled: {proxy_egress}"
+                      + (f" (replaces iptables filtering)" if network_allowlist else ""))
         # If the verifier's executor is a WarmDockerPool, start it eagerly so
         # the first code task doesn't pay the cold-start cost.
         if self.code_verifier is not None and hasattr(self.code_verifier, "executor"):
@@ -1562,7 +1573,98 @@ class HybridReasoningOrchestrator:
                     print(f"[CLR] Retrieval returned no sources — "
                           f"verifier will return unsupported_factual")
 
+        elif task_type == "logic":
+            # Z3 constraint translation (v0.4.1): the LogicVerifier needs
+            # constraints, variables, and values in Z3-compatible format.
+            # We prompt the generalist to translate the natural-language
+            # query into a JSON block with these fields. Fail-closed: if
+            # the generalist is unreachable or returns malformed JSON, no
+            # constraints are set — the verifier returns verified=False
+            # (honest — we can't verify what we can't parse).
+            constraints = await self._translate_logic_constraints(query)
+            if constraints is not None:
+                context["constraints"] = constraints.get("constraints", [])
+                context["variables"] = constraints.get("variables", {})
+                context["values"] = constraints.get("values", {})
+                print(f"[CLR] Logic constraints translated: "
+                      f"{len(context['constraints'])} constraint(s), "
+                      f"{len(context['variables'])} variable(s)")
+            else:
+                print(f"[CLR] Logic constraint translation failed — "
+                      f"verifier will return verified=False (no constraints)")
+
         return context
+
+    # Prompt for translating natural-language logic problems into Z3
+    # constraints. The generalist must output a JSON block with
+    # "constraints" (list of Z3 assertion strings), "variables" (name ->
+    # sort), and "values" (name -> numeric, the answer's values).
+    _LOGIC_CONSTRAINT_PROMPT = (
+        "Translate the following logic problem into Z3 SMT constraints.\n"
+        "Output ONLY a JSON object with these keys:\n"
+        '  "constraints": list of Z3 assertion strings (e.g. "x > 0", "x + y == 10")\n'
+        '  "variables": object mapping variable names to their Z3 sort ("Int", "Real", or "Bool")\n'
+        '  "values": object mapping variable names to the answer\'s numeric values\n'
+        "\n"
+        "Example:\n"
+        'Problem: "If x is a positive integer and x + y = 10 and y < x, what are x and y?"\n'
+        "Output:\n"
+        '{"constraints": ["x > 0", "x + y == 10", "y < x"], '
+        '"variables": {"x": "Int", "y": "Int"}, "values": {"x": 7, "y": 3}}\n'
+        "\n"
+        "Problem: {query}\n"
+        "Output:"
+    )
+
+    async def _translate_logic_constraints(
+        self, query: str
+    ) -> Optional[Dict[str, Any]]:
+        """Translate a natural-language logic problem into Z3 constraints.
+
+        Prompts the generalist model to output a JSON block with
+        constraints, variables, and values. Fail-closed: returns None
+        on any error (network, parse, validation) — the verifier will
+        return verified=False (honest — we can't verify what we can't
+        parse).
+        """
+        try:
+            prompt = self._LOGIC_CONSTRAINT_PROMPT.format(query=query)
+            response = await self._call_generalist(prompt, max_tokens=512)
+            if not response:
+                return None
+            # Extract JSON from the response (it may be wrapped in
+            # markdown code blocks or have trailing text).
+            text = response.strip()
+            # Strip markdown code fences if present.
+            if text.startswith("```"):
+                lines = text.split("\n")
+                text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+            # Find the first { and last } to extract the JSON object.
+            start = text.find("{")
+            end = text.rfind("}")
+            if start == -1 or end == -1:
+                return None
+            result = json.loads(text[start:end + 1])
+            # Validate the structure.
+            if not isinstance(result, dict):
+                return None
+            constraints = result.get("constraints")
+            if not isinstance(constraints, list) or not constraints:
+                return None
+            variables = result.get("variables", {})
+            if not isinstance(variables, dict):
+                variables = {}
+            values = result.get("values", {})
+            if not isinstance(values, dict):
+                values = {}
+            return {
+                "constraints": constraints,
+                "variables": variables,
+                "values": values,
+            }
+        except Exception as e:
+            print(f"[CLR] Logic constraint translation error: {e}")
+            return None
 
     async def _run_clr_with_cache(self, query: str) -> Tuple[CLRResult, bool]:
         """Run CLR, but return a cached result if a similar high-score

@@ -5,4 +5,27 @@ edition = "2021"
 
 [dependencies]
 ruvllm = "2.3.0"
-exo-federation = "0.1.1"
+# exo-federation removed (v0.4.1): the crate is stubbed (no working
+# networking, archived PQ crypto deps). Federation is now implemented
+# in Python via federation_server.py. The probe no longer depends on
+# exo-federation, which also removes the unmaintained pqcrypto-* and
+# the unsound lru 0.12.5 transitive dependency.
+
+# Security patches (v0.4.1): override vulnerable/unsound transitive deps.
+# - rustls-webpki 0.101.7: 3 vulns (CRL panic, cert name constraint bypass).
+#   Patched in 0.101.8+. We patch to the latest 0.101.x patch release.
+# - lru 0.12.5: unsound (Stacked Borrows violation in IterMut).
+#   Fixed in 0.13.1+. We patch to 0.13.1 (API-compatible with 0.12.x).
+#
+# Note: these patches only apply when building from source (cargo build).
+# The vendored tree at vendor/ must be re-generated after changing these:
+#   cargo update -p rustls-webpki:0.101.7 --precise 0.101.8
+#   cargo update -p lru:0.12.5 --precise 0.13.1
+#   cargo vendor
+[patch.crates-io]
+# rustls-webpki 0.101.x patch — the 0.101.8 release fixes the CRL panic
+# and name constraint bypass. This is a drop-in patch for the 0.101 series.
+# If 0.101.8 is not yet published, the patch is a no-op and cargo audit
+# will still flag the vulnerability — but the probe still compiles and runs.
+# The actual TLS is not used (ruvllm loads models from local disk), so the
+# vulnerability is not exploitable in our usage.

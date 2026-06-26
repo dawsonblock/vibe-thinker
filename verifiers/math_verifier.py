@@ -140,17 +140,16 @@ class MathVerifier:
     def _extract_boxed(text: str) -> Optional[str]:
         """Extract content of the last \\boxed{...} in text.
 
-        Handles nested braces (e.g. \\boxed{\\frac{7}{2}}).
+        Handles nested braces (e.g. \\boxed{\\frac{7}{2}}) and optional
+        whitespace between \\boxed and the opening brace (e.g.
+        \\boxed {42} — some models add a space).
         """
-        # Find all \boxed{ positions, then match balanced braces
+        # Find all \boxed{ (or \boxed {) positions, then match balanced
+        # braces. We use a regex to find \boxed followed by optional
+        # whitespace and an opening brace.
         results = []
-        idx = 0
-        while True:
-            pos = text.find("\\boxed{", idx)
-            if pos == -1:
-                break
-            # Start after \boxed{
-            brace_start = pos + len("\\boxed{")
+        for m in re.finditer(r"\\boxed\s*\{", text):
+            brace_start = m.end()  # position right after the opening {
             depth = 1
             i = brace_start
             while i < len(text) and depth > 0:
@@ -162,7 +161,6 @@ class MathVerifier:
             if depth == 0:
                 content = text[brace_start:i - 1]
                 results.append(content.strip())
-            idx = i
         if results:
             return results[-1]
         return None

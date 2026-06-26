@@ -13,18 +13,24 @@ and provides two implementations:
   - :class:`LocalJobQueue` — a thin wrapper around the existing
     :class:`rfsn_job_queue.JobQueue`. The default; zero behavior change.
     All jobs run locally on this machine.
-  - :class:`FederatedJobQueue` — pushes jobs to an exo-federation
-    network (ruvnet/exo-federation, a Rust crate) over mTLS. The local
-    node becomes a worker in a swarm: when ``submit()`` is called, the
-    job is published to the network; any idle node (including this one)
-    can pick it up. If the local node is at its ``max_concurrent`` limit,
-    other nodes automatically claim the pending jobs.
+  - :class:`FederatedJobQueue` — pushes jobs to a Python-native
+    federation coordinator (see :mod:`federation_server`) over mTLS.
+    The local node becomes a worker in a swarm: when ``submit()`` is
+    called, the job is published to the coordinator; any idle node
+    (including this one) can claim it. If the local node is at its
+    ``max_concurrent`` limit, other nodes automatically claim the
+    pending jobs.
 
-The exo-federation crate is NOT published as a Python package. When it
-is not reachable, :class:`FederatedJobQueue` fail-closed-fallbacks to
-local-only execution (jobs still run on this node, just not federated).
-This preserves the alpha's strict fail-closed philosophy: a federation
-outage degrades to single-node operation rather than dropping jobs.
+The federation coordinator is a simple FastAPI app
+(:mod:`federation_server`) that any node can run. It replaces the
+stubbed exo-federation Rust crate, which had no working networking
+layer and relied on archived post-quantum crypto dependencies.
+
+When the coordinator is NOT reachable, :class:`FederatedJobQueue`
+fail-closed-fallbacks to local-only execution (jobs still run on this
+node, just not federated). This preserves the strict fail-closed
+philosophy: a federation outage degrades to single-node operation
+rather than dropping jobs.
 
 The protocol (:class:`BaseJobQueue`) is a structural supertype of the
 existing :class:`JobQueue` — the existing class already implements
@@ -32,14 +38,8 @@ existing :class:`JobQueue` — the existing class already implements
 ``start``, and ``stop``. This means the existing :class:`JobQueue` can
 be used wherever a :class:`BaseJobQueue` is expected without changes.
 
-Integration plan reference: Phase 4.1 — "Decouple Local asyncio Queue
-with Swarm Federation". The plan's action items:
-  1. Abstract JobQueue into a BaseJobQueue protocol.
-  2. Implement FederatedJobQueue (push to exo-federation over mTLS).
-  3. _dispatch_loop() becomes a worker that pulls from the Swarm network.
-
 mTLS configuration:
-  The exo-federation network uses mutual TLS for node authentication.
+  The federation network uses mutual TLS for node authentication.
   Each node has a client certificate + key, and trusts a CA that signed
   all node certificates. Pass the paths via the ``mtls_cert``,
   ``mtls_key``, and ``mtls_ca`` parameters. When any of these is
@@ -173,24 +173,24 @@ class LocalJobQueue:
 
 
 class FederatedJobQueue:
-    """Federated job queue backed by an exo-federation swarm network.
+    """Federated job queue backed by a Python-native federation coordinator.
 
-    When the exo-federation network is reachable, jobs submitted via
+    When the federation coordinator is reachable, jobs submitted via
     :meth:`submit` are published to the swarm. Any idle node on the
     network can claim and run them. This lets vibe-thinker scale beyond
     a single machine's ``max_concurrent`` limit: if the local M2 Pro is
     busy, other nodes pick up the pending reasoning trajectories.
 
-    When the network is NOT reachable (the exo-federation sidecar is not
-    running, or mTLS certs are missing), the queue fail-closed-fallbacks
-    to local-only execution: jobs still run on this node via the wrapped
+    When the network is NOT reachable (the coordinator is not running,
+    or mTLS certs are missing), the queue fail-closed-fallbacks to
+    local-only execution: jobs still run on this node via the wrapped
     :class:`LocalJobQueue`, just not federated. A warning is printed on
-    the first failed publish. This preserves the alpha's strict
-    fail-closed philosophy — a federation outage degrades to single-node
-    operation rather than dropping jobs.
+    the first failed publish. This preserves the strict fail-closed
+    philosophy — a federation outage degrades to single-node operation
+    rather than dropping jobs.
 
     Architecture:
-      - ``submit()``: publish the job to the exo-federation network via
+      - ``submit()``: publish the job to the federation coordinator via
         HTTP POST. If the publish fails, fall back to local submission.
         Either way, the job is tracked locally so ``wait_for`` works.
       - The local node also runs a worker (the wrapped LocalJobQueue's
@@ -198,10 +198,10 @@ class FederatedJobQueue:
         capacity. This is the "pull" side of the federation.
       - ``wait_for()``: waits for the job to complete, whether it ran
         locally or on a remote node. Remote completion is signaled via
-        the federation network's result callback.
+        the federation coordinator's result callback.
 
     mTLS:
-      The exo-federation network uses mutual TLS. Pass the client cert,
+      The federation network uses mutual TLS. Pass the client cert,
       key, and CA paths. When any is missing, the queue starts in
       local-only fallback mode.
 
@@ -218,11 +218,13 @@ class FederatedJobQueue:
         node_id: this node's ID on the federation (default: hostname).
         audit_log: optional audit log path (passed to local fallback).
 
-    Note: The exo-federation crate (ruvnet/exo-federation) is a Rust
-    crate that runs as a sidecar process. This class talks to its HTTP
-    API. The crate is not yet published; when it is, this class will
-    work without changes. Until then, the local-only fallback ensures
-    the system remains functional.
+    Note: The federation coordinator is a Python-native FastAPI app
+    (see :mod:`federation_server`). Run it on any node with:
+        python3 -m federation_server --mtls-cert node.crt \\
+            --mtls-key node.key --mtls-ca ca.crt
+    This class talks to its HTTP API. When the coordinator is not
+    running, the local-only fallback ensures the system remains
+    functional.
     """
 
     def __init__(
@@ -392,17 +394,68 @@ class FederatedJobQueue:
             self._warn_fallback(f"connection error: {e}")
             return False
 
+    async def _claim_loop(self):
+        """Background worker loop: claim jobs from the federation coordinator
+        when the local node has spare capacity.
+
+        This is the "pull" side of the federation — the local node
+        periodically polls the coordinator for pending jobs. If it gets
+        one, it submits it to the local queue for execution.
+        """
+        import aiohttp
+        import ssl
+        ctx = ssl.create_default_context(cafile=self._mtls_ca)
+        ctx.load_cert_chain(self._mtls_cert, self._mtls_key)
+        timeout = aiohttp.ClientTimeout(total=10.0)
+        while True:
+            try:
+                await asyncio.sleep(2.0)  # poll interval
+                if not self._federation_configured():
+                    continue
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.post(
+                        f"{self._federation_url}/claim",
+                        json={"worker_id": self._node_id},
+                        ssl=ctx,
+                    ) as resp:
+                        if resp.status >= 400:
+                            continue
+                        data = await resp.json()
+                        if not data.get("job_id"):
+                            continue  # no pending jobs
+                        # We claimed a job — submit it locally for execution.
+                        job = self._local.submit(
+                            data["query"],
+                            priority=data.get("priority", 0),
+                            force_route=data.get("force_route"),
+                        )
+                        print(f"[FederatedQueue] Claimed job {data['job_id']} "
+                              f"from federation, running locally as {job.job_id}")
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass  # silent fail — the claim loop is best-effort
+
     # ----------------------- BaseJobQueue protocol ----------------------- #
     async def start(self) -> None:
         await self._local.start()
         if self._federation_configured():
             print(f"[FederatedQueue] Started (node={self._node_id}, "
                   f"federation={self._federation_url})")
+            # Start the claim loop — this node will pull jobs from the
+            # coordinator when it has spare capacity.
+            self._claim_task = asyncio.create_task(self._claim_loop())
         else:
             print(f"[FederatedQueue] Started in local-only mode "
                   f"(no federation configured)")
 
     async def stop(self) -> None:
+        if hasattr(self, "_claim_task"):
+            self._claim_task.cancel()
+            try:
+                await self._claim_task
+            except asyncio.CancelledError:
+                pass
         await self._local.stop()
 
     def submit(

@@ -44,6 +44,18 @@ string ::= "\"" ([^"\\] | "\\" .)* "\""
 ws ::= [ \t\n]*
 """
 
+# GBNF grammar for structured specialist output (v0.4.1).
+# Forces the specialist to output JSON with distinct keys for
+# reasoning_steps, boxed_answer, and code_solution — instead of
+# regex-scraping a markdown string. This makes answer extraction
+# robust: no more brittle \boxed{} parsing for structured outputs.
+# When the specialist uses this grammar, the orchestrator extracts
+# the answer directly from the "boxed_answer" or "code_solution" key.
+_STRUCTURED_OUTPUT_GRAMMAR = r"""root ::= "{" ws "\"reasoning_steps\"" ws ":" ws "[" ws string ("," ws string)* ws "]" ws "," ws "\"boxed_answer\"" ws ":" ws (string | "null") ws "," ws "\"code_solution\"" ws ":" ws (string | "null") ws "}"
+string ::= "\"" ([^"\\] | "\\" .)* "\""
+ws ::= [ \t\n]*
+"""
+
 
 @dataclass
 class AdaptivePolicy:
@@ -631,12 +643,60 @@ class VibeThinkerCLRAsync:
             text,
             re.IGNORECASE,
         )[:5]
-        answer_match = re.search(r"\\boxed\{(.*?)\}", text)
+        answer_match = re.search(r"\\boxed\s*\{(.*?)\}", text)
         return {
             "claims": claims,
             "final_answer": answer_match.group(1) if answer_match else None,
             "raw": text,
         }
+
+    @staticmethod
+    def parse_structured_output(text: str) -> Optional[Dict[str, Any]]:
+        """Parse a structured specialist output (v0.4.1).
+
+        When the specialist uses the _STRUCTURED_OUTPUT_GRAMMAR, its
+        output is a JSON object with:
+          - "reasoning_steps": list of strings
+          - "boxed_answer": string or null (the final answer)
+          - "code_solution": string or null (the code solution)
+
+        This method extracts and validates that JSON. Returns None if
+        the text is not valid structured output (caller falls back to
+        regex-based extraction).
+        """
+        try:
+            text = text.strip()
+            # Strip markdown code fences if present.
+            if text.startswith("```"):
+                lines = text.split("\n")
+                text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+            # Find the JSON object.
+            start = text.find("{")
+            end = text.rfind("}")
+            if start == -1 or end == -1:
+                return None
+            data = json.loads(text[start:end + 1])
+            if not isinstance(data, dict):
+                return None
+            # Validate required keys.
+            if "reasoning_steps" not in data:
+                return None
+            result: Dict[str, Any] = {
+                "reasoning_steps": data.get("reasoning_steps", []),
+                "boxed_answer": data.get("boxed_answer"),
+                "code_solution": data.get("code_solution"),
+            }
+            # Normalize boxed_answer: "null" string -> None.
+            ba = result["boxed_answer"]
+            if isinstance(ba, str) and ba.strip().lower() in ("null", "none", "", "n/a"):
+                result["boxed_answer"] = None
+            # Normalize code_solution similarly.
+            cs = result["code_solution"]
+            if isinstance(cs, str) and cs.strip().lower() in ("null", "none", "", "n/a"):
+                result["code_solution"] = None
+            return result
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return None
 
     # ------------------------------------------------------------------ #
     # Self-verification
@@ -727,9 +787,14 @@ class VibeThinkerCLRAsync:
     # ------------------------------------------------------------------ #
     @staticmethod
     def _extract_boxed_answer(text: str) -> Optional[str]:
-        """Extract the content of \\boxed{...} from a reasoning trace."""
-        # Find the last \boxed{...} in the text (the final answer)
-        matches = re.findall(r"\\boxed\{([^}]*)\}", text)
+        """Extract the content of \\boxed{...} from a reasoning trace.
+
+        Handles optional whitespace between \\boxed and the opening brace
+        (e.g. \\boxed {42} — some models add a space).
+        """
+        # Find the last \boxed{...} in the text (the final answer).
+        # Allow optional whitespace between \boxed and {.
+        matches = re.findall(r"\\boxed\s*\{([^}]*)\}", text)
         if matches:
             return matches[-1].strip()
         return None

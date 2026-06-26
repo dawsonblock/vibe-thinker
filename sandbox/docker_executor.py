@@ -106,6 +106,7 @@ class DockerSandboxExecutor:
         self.default_timeout = timeout
         self._allowlist = allowlist
         self._dns_resolver = dns_resolver
+        self._proxy_egress: Optional[str] = None
 
     def set_allowlist(self, allowlist: Optional["NetworkAllowList"]) -> None:
         """Update the network allow-list (e.g. from a CLI flag after init)."""
@@ -114,6 +115,16 @@ class DockerSandboxExecutor:
     def set_dns_resolver(self, resolver: Optional[str]) -> None:
         """Update the DNS resolver restriction."""
         self._dns_resolver = resolver
+
+    def set_proxy_egress(self, proxy_addr: Optional[str]) -> None:
+        """Set the SNI proxy egress address (e.g. '127.0.0.1:8888').
+
+        When set, the sandbox container routes traffic through the proxy
+        instead of using iptables IP-based filtering. The proxy inspects
+        the TLS SNI / HTTP Host header and allows/denies based on the
+        domain — solving CDN IP rotation.
+        """
+        self._proxy_egress = proxy_addr
 
     def _build_firewall_env(self) -> Dict[str, str]:
         """Build environment variables for the entrypoint's firewall setup.
@@ -168,15 +179,52 @@ class DockerSandboxExecutor:
         start = time.monotonic()
 
         # Determine network mode:
+        # - If proxy egress is configured, use --network=default with
+        #   HTTP_PROXY/HTTPS_PROXY env vars (v0.4.1 SNI proxy mode).
         # - If an allow-list is configured, use --network=default and
         #   pass firewall rules to the entrypoint (v0.4.0 hardened).
         # - Otherwise, use the binary --network=none / --network=default
         #   based on the `network` flag (unchanged behavior).
         use_allowlist = self._allowlist is not None and not self._allowlist.is_empty
+        use_proxy = self._proxy_egress is not None
         firewall_env = self._build_firewall_env() if use_allowlist else {}
         rules_hash = self._compute_rules_hash(firewall_env) if firewall_env else ""
 
-        if use_allowlist:
+        if use_proxy:
+            # SNI proxy egress mode (v0.4.1). The container routes traffic
+            # through the proxy via HTTP_PROXY/HTTPS_PROXY env vars. The
+            # proxy inspects the TLS SNI / HTTP Host header and
+            # allows/denies based on the domain — solving CDN IP rotation.
+            # No iptables needed, no NET_ADMIN needed.
+            cmd = [
+                "docker", "run", "--rm",
+                "--init",
+                "--network", "default",
+                "--memory", memory_limit,
+                "--read-only",
+                "--security-opt", "no-new-privileges",
+                "--cap-drop", "ALL",
+                "--pids-limit", "64",
+                "--tmpfs", "/tmp:rw,size=10m",
+                "--workdir", "/tmp",
+            ]
+            # Set proxy env vars so HTTP clients in the container use the proxy.
+            proxy_url = f"http://{self._proxy_egress}"
+            proxy_env = {
+                "HTTP_PROXY": proxy_url,
+                "HTTPS_PROXY": proxy_url,
+                "http_proxy": proxy_url,
+                "https_proxy": proxy_url,
+                "NO_PROXY": "localhost,127.0.0.1",
+                "no_proxy": "localhost,127.0.0.1",
+            }
+            merged_env = {**proxy_env}
+            if env:
+                merged_env.update(env)
+            for key, value in merged_env.items():
+                cmd.extend(["--env", f"{key}={value}"])
+            cmd.extend([self.image, "python3", "-c", script])
+        elif use_allowlist:
             # The sandbox image's entrypoint handles:
             #   1. Applying iptables rules (as root, from VT_IPTABLES_RULES)
             #   2. Denying IPv6 (ip6tables DROP)
@@ -277,7 +325,10 @@ class DockerSandboxExecutor:
             )
 
             # Attach audit evidence for the firewall configuration.
-            if rules_hash:
+            if use_proxy:
+                result.evidence["network_mode"] = "proxy"
+                result.evidence["proxy_egress"] = self._proxy_egress
+            elif rules_hash:
                 result.evidence["firewall_rules_hash"] = rules_hash
                 result.evidence["network_mode"] = "allowlist"
                 result.evidence["dns_restricted"] = bool(self._dns_resolver)
