@@ -309,6 +309,15 @@ class VibeThinkerCLRAsync:
             # Pre-compile the JSON claims grammar (shared across all instances).
             # llama_cpp enforces grammar natively — the model physically cannot
             # emit invalid JSON, mirroring the HTTP /completion grammar path.
+            #
+            # Thread safety: a single LlamaGrammar is shared across all pool
+            # instances. This is assumed safe because LlamaGrammar is a
+            # compiled representation of GBNF rules (read-only after
+            # construction). llama-cpp-python does not document this
+            # explicitly, but the grammar is not mutated during inference.
+            # If this assumption is wrong, symptoms would be corrupted JSON
+            # output under concurrent pool access — switch to per-instance
+            # grammars if that occurs.
             self._local_grammar = LlamaGrammar.from_string(_CLAIMS_JSON_GRAMMAR)
         except Exception as e:
             print(

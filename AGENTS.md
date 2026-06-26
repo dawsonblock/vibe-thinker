@@ -104,6 +104,28 @@ The retry prompt includes the error message so the generalist can fix the
 specific problem. Max 2 attempts (initial + 1 retry). If the retry also fails,
 returns best-effort unverified (score 0.0, fail-closed).
 
+## Performance fixes (v0.3.7)
+Seven fixes from a full codebase audit. The most impactful:
+- **Parallel claim verification**: `_verify_claims` was sequential (5 serial
+  LLM calls per trajectory, 40 total with k=8). Now uses `asyncio.gather`.
+  Single claim failures return verdict 0 instead of crashing the trajectory.
+- **Parallel candidate verification**: the code loop verified 6 candidates
+  one-by-one while 3 warm containers sat idle. Now uses `asyncio.gather` —
+  all candidates verified concurrently (~3x speedup).
+- **Shared HTTP session**: `_call_generalist` / `_call_code_specialist` /
+  `_call_specialist_plain` each created a new `aiohttp.ClientSession` per
+  call. Now one shared session via `_get_session()`, closed in `cleanup()`.
+- **Warm pool `cleanup()` fix**: was passing `["rm", "-f", name]` (missing
+  `"docker"`) to `create_subprocess_exec` — containers leaked on every
+  shutdown since v0.3.4.
+- **Timeout recycling**: a timed-out container is now recycled to a fresh
+  state (killed process may leave zombies/held file handles).
+- **Recycle failure handling**: if `docker run` fails twice during recycle,
+  the container is removed from the pool rather than leaving an invalid entry.
+- **In-process session skip**: `_run_adaptive` / `_run_static` use
+  `contextlib.nullcontext()` instead of creating an unused `aiohttp.ClientSession`
+  when the in-process backend is active.
+
 ## Fast-specialist adaptive profile (v0.3.5)
 `make_fast_specialist_policy(k=15)` returns an `AdaptivePolicy(3, 5, max_k=15)`
 (all capped at `k`) tuned for ultra-tiny fast specialists (e.g. ruvltra 0.5B, ~100+ tok/s). At
