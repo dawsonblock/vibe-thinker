@@ -54,12 +54,29 @@ string ::= "\"" ([^"\\] | "\\" .)* "\""
 ws ::= [ \t\n]*
 """
 
+# v3.2: Logic-constraints grammar for the Generalist->Z3 translation step.
+# Forces the generalist to emit valid JSON with the three keys the
+# LogicVerifier expects: constraints (array of Z3 assertion strings),
+# variables (object: name -> "Int"|"Real"|"Bool"), values (object: name ->
+# number). The variables/values objects are free-form JSON objects (the
+# GBNF `object` rule) because their keys are problem-dependent. This
+# eliminates the malformed-JSON parse failure mode that the
+# _translate_logic_constraints_with_retry loop was working around.
+LOGIC_CONSTRAINTS_GRAMMAR = r"""root ::= "{" ws "\"constraints\"" ws ":" ws "[" ws string ("," ws string)* ws "]" ws "," ws "\"variables\"" ws ":" ws object ws "," ws "\"values\"" ws ":" ws object ws "}"
+string ::= "\"" ([^"\\] | "\\" .)* "\""
+object ::= "{" ws (string ws ":" ws value ("," ws string ws ":" ws value)*)? ws "}"
+value ::= string | number | "true" | "false" | "null"
+number ::= "-"? ("0" | [1-9] [0-9]*) ("." [0-9]+)? ([eE] [-+]? [0-9]+)?
+ws ::= [ \t\n]*
+"""
+
 
 class SchemaKind(Enum):
     """Which structured-output contract an enforcer enforces."""
 
     STRUCTURED_OUTPUT = "structured_output"
     CLAIMS = "claims"
+    LOGIC_CONSTRAINTS = "logic_constraints"  # v3.2
 
 
 @dataclass
@@ -105,6 +122,18 @@ def _claims_schema() -> FormatSchema:
     )
 
 
+def _logic_constraints_schema() -> FormatSchema:
+    """v3.2: schema for the Generalist->Z3 translation step."""
+    return FormatSchema(
+        kind=SchemaKind.LOGIC_CONSTRAINTS,
+        fields=[
+            ("constraints", "string_array", True),
+            ("variables", "object", True),
+            ("values", "object", True),
+        ],
+    )
+
+
 # --------------------------------------------------------------------------- #
 # JSON-schema subset used for the OpenAI response_format mapping.
 # --------------------------------------------------------------------------- #
@@ -116,6 +145,8 @@ def _field_to_json_schema(ftype: str) -> Dict[str, Any]:
         return {"type": ["string", "null"]}
     if ftype == "string_array":
         return {"type": "array", "items": {"type": "string"}}
+    if ftype == "object":  # v3.2: free-form object (variables/values)
+        return {"type": "object"}
     return {"type": "string"}
 
 
@@ -306,6 +337,8 @@ class LlamaCppEnforcer(_BaseEnforcer):
     def to_llama_cpp_grammar(self) -> str:
         if self._schema.kind == SchemaKind.STRUCTURED_OUTPUT:
             return STRUCTURED_OUTPUT_GRAMMAR
+        if self._schema.kind == SchemaKind.LOGIC_CONSTRAINTS:  # v3.2
+            return LOGIC_CONSTRAINTS_GRAMMAR
         return CLAIMS_JSON_GRAMMAR
 
     def to_openai_response_format(self) -> Dict[str, Any]:
@@ -385,6 +418,8 @@ class AnthropicEnforcer(_BaseEnforcer):
     def to_llama_cpp_grammar(self) -> str:
         if self._schema.kind == SchemaKind.STRUCTURED_OUTPUT:
             return STRUCTURED_OUTPUT_GRAMMAR
+        if self._schema.kind == SchemaKind.LOGIC_CONSTRAINTS:  # v3.2
+            return LOGIC_CONSTRAINTS_GRAMMAR
         return CLAIMS_JSON_GRAMMAR
 
     def to_openai_response_format(self) -> Dict[str, Any]:
@@ -428,6 +463,8 @@ def make_enforcer(
     schema = (
         _structured_output_schema()
         if kind == SchemaKind.STRUCTURED_OUTPUT
+        else _logic_constraints_schema()
+        if kind == SchemaKind.LOGIC_CONSTRAINTS  # v3.2
         else _claims_schema()
     )
     if transport == "openai_chat":

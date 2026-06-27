@@ -99,9 +99,65 @@ mod backend {
     use ruvllm::{
         CandleBackend, DeviceType, GenerateParams, LlmBackend, ModelConfig,
     };
+    use candle_core::quantized::gguf_file;
+    use candle_core::{Device, DType, Tensor};
+    use candle_transformers::generation::LogitsProcessor;
+    use candle_transformers::models::quantized_llama;
+
+    /// A quantized Llama/Mistral model loaded directly via candle-transformers
+    /// for per-token log-probability computation.
+    ///
+    /// The ruvllm `CandleBackend` computes logits internally but its
+    /// `forward()` method is private and not exposed through the `LlmBackend`
+    /// trait. To obtain per-token log-probabilities (required for PPL
+    /// evaluation), we load the quantized GGUF weights ourselves via
+    /// `candle_transformers::models::quantized_llama` and run forward passes
+    /// directly. At each generation step we apply `log_softmax` over the full
+    /// vocabulary to get the natural-log probability of the sampled token.
+    struct LogprobsModel {
+        weights: quantized_llama::ModelWeights,
+        device: Device,
+    }
+
+    impl LogprobsModel {
+        /// Load quantized weights from a GGUF file on the given device.
+        fn load(model_path: &str, device: &Device) -> pyo3::PyResult<Self> {
+            let mut file = std::fs::File::open(model_path).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Failed to open GGUF file '{}': {}",
+                    model_path, e
+                ))
+            })?;
+            let content = gguf_file::Content::read(&mut file).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Failed to read GGUF content: {}",
+                    e
+                ))
+            })?;
+            let weights =
+                quantized_llama::ModelWeights::from_gguf(content, &mut file, device)
+                    .map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "Failed to load quantized weights: {}",
+                            e
+                        ))
+                    })?;
+            Ok(LogprobsModel {
+                weights,
+                device: device.clone(),
+            })
+        }
+    }
 
     pub struct RealBackend {
         inner: CandleBackend,
+        /// Lazily-loaded quantized model for logprob computation. Loaded from
+        /// the same GGUF file on the first `generate_with_logprobs()` call so
+        /// that callers who only use `generate()` don't pay the double-memory
+        /// cost. `Mutex` for interior mutability (`forward()` needs `&mut`).
+        logprobs_model: std::sync::Mutex<Option<LogprobsModel>>,
+        /// Path to the GGUF model file (retained for lazy logprobs loading).
+        model_path: String,
     }
 
     impl RealBackend {
@@ -119,7 +175,10 @@ mod backend {
             let mut backend = if use_metal {
                 CandleBackend::with_device(DeviceType::Metal).map_err(ruv_err)?
             } else {
-                CandleBackend::new().map_err(ruv_err)?
+                // Use DeviceType::Cpu explicitly — CandleBackend::new()
+                // defaults to DeviceType::Metal on macOS, which fails when
+                // the candle crate wasn't compiled with metal support.
+                CandleBackend::with_device(DeviceType::Cpu).map_err(ruv_err)?
             };
             // ModelConfig: the GGUF loader auto-detects architecture,
             // quantization, layer count, etc. from the file metadata.
@@ -133,10 +192,30 @@ mod backend {
             backend
                 .load_gguf(std::path::Path::new(model_path), &config)
                 .map_err(ruv_err)?;
-            backend
-                .load_tokenizer(std::path::Path::new(model_path))
-                .map_err(ruv_err)?;
-            Ok(RealBackend { inner: backend })
+            // Tokenizer: CandleBackend::load_tokenizer expects a
+            // tokenizer.json file, NOT a GGUF file. We look for
+            // tokenizer.json in the model's directory (same approach as
+            // ruvllm's load_model). If not found, generation and logprob
+            // scoring will fail with a clear error when called.
+            let tokenizer_path = std::path::Path::new(model_path)
+                .parent()
+                .map(|p| p.join("tokenizer.json"))
+                .filter(|p| p.exists());
+            if let Some(tok_path) = tokenizer_path {
+                backend.load_tokenizer(&tok_path).map_err(ruv_err)?;
+            } else {
+                eprintln!(
+                    "[ruvllm_py] Warning: no tokenizer.json found alongside \
+                     {}. Place a tokenizer.json in the model directory for \
+                     text generation and logprob scoring.",
+                    model_path
+                );
+            }
+            Ok(RealBackend {
+                inner: backend,
+                logprobs_model: std::sync::Mutex::new(None),
+                model_path: model_path.to_string(),
+            })
         }
 
         pub fn generate(
@@ -159,6 +238,123 @@ mod backend {
             self.inner.generate(prompt, params).map_err(ruv_err)
         }
 
+        /// Generate text from a prompt and return per-token log-probabilities.
+        ///
+        /// This runs the same candle quantized-llama forward path as
+        /// `generate()`, but at each step applies `log_softmax` over the full
+        /// vocabulary to obtain the natural-log probability of the sampled
+        /// token. Returns `(text, token_ids, logprobs)`.
+        pub fn generate_with_logprobs(
+            &self,
+            prompt: &str,
+            max_tokens: u32,
+            temperature: f32,
+            stop: Option<Vec<String>>,
+        ) -> pyo3::PyResult<(String, Vec<u32>, Vec<f32>)> {
+            // Tokenizer from the CandleBackend (loaded at construction).
+            let tokenizer = self.inner.tokenizer().ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    "no tokenizer loaded — place tokenizer.json alongside \
+                     the GGUF model",
+                )
+            })?;
+            let device = self.inner.device.clone();
+
+            // Encode the prompt.
+            let prompt_tokens = tokenizer.encode(prompt).map_err(ruv_err)?;
+            if prompt_tokens.is_empty() {
+                return Ok((String::new(), Vec::new(), Vec::new()));
+            }
+
+            let eos_token_id = tokenizer.special_tokens().eos_token_id;
+
+            // Lazily load the quantized model for forward passes. The
+            // CandleBackend doesn't expose logits, so we load the weights
+            // ourselves via candle-transformers.
+            let mut guard = self.logprobs_model.lock().unwrap();
+            if guard.is_none() {
+                let model = LogprobsModel::load(&self.model_path, &device)?;
+                *guard = Some(model);
+            }
+            let model = guard.as_mut().unwrap();
+
+            // Forward pass on the full prompt. The quantized_llama forward()
+            // returns logits for the last position only: [1, 1, vocab].
+            let input = Tensor::new(prompt_tokens.as_slice(), &model.device)
+                .map_err(candle_err)?
+                .unsqueeze(0)
+                .map_err(candle_err)?;
+            let mut logits =
+                model.weights.forward(&input, 0).map_err(candle_err)?;
+            let mut current_pos = prompt_tokens.len();
+
+            // LogitsProcessor for sampling (None temperature = greedy/argmax).
+            let seed: u64 = 299792456;
+            let temp_opt = if temperature <= 0.0 {
+                None
+            } else {
+                Some(temperature as f64)
+            };
+            let mut logits_processor = LogitsProcessor::new(seed, temp_opt, None);
+
+            let mut generated_tokens: Vec<u32> = Vec::new();
+            let mut logprobs: Vec<f32> = Vec::new();
+            let stop_seqs = stop.unwrap_or_default();
+
+            for _ in 0..max_tokens {
+                // Squeeze [1, 1, vocab] → [vocab] and ensure f32.
+                let last_logits = squeeze_logits(&logits)?;
+                let next_token = logits_processor
+                    .sample(&last_logits)
+                    .map_err(candle_err)?;
+
+                // log_softmax over the vocab → log-prob of the sampled token.
+                let logits_vec: Vec<f32> =
+                    last_logits.to_vec1().map_err(candle_err)?;
+                let lp = logprob_of_token(&logits_vec, next_token);
+                logprobs.push(lp);
+
+                // Check EOS.
+                if let Some(eos) = eos_token_id {
+                    if next_token == eos {
+                        break;
+                    }
+                }
+
+                generated_tokens.push(next_token);
+
+                // Check stop sequences.
+                if !stop_seqs.is_empty() {
+                    let text =
+                        tokenizer.decode(&generated_tokens).map_err(ruv_err)?;
+                    for s in &stop_seqs {
+                        if text.contains(s) {
+                            let trimmed = text
+                                .split(s)
+                                .next()
+                                .unwrap_or("")
+                                .to_string();
+                            return Ok((trimmed, generated_tokens, logprobs));
+                        }
+                    }
+                }
+
+                // Forward pass for the next token (single-token, KV-cached).
+                let next_input = Tensor::new(&[next_token], &model.device)
+                    .map_err(candle_err)?
+                    .unsqueeze(0)
+                    .map_err(candle_err)?;
+                logits = model
+                    .weights
+                    .forward(&next_input, current_pos)
+                    .map_err(candle_err)?;
+                current_pos += 1;
+            }
+
+            let text = tokenizer.decode(&generated_tokens).map_err(ruv_err)?;
+            Ok((text, generated_tokens, logprobs))
+        }
+
         pub fn is_loaded(&self) -> bool {
             self.inner.is_model_loaded()
         }
@@ -167,11 +363,44 @@ mod backend {
     fn ruv_err(e: ruvllm::error::RuvLLMError) -> pyo3::PyErr {
         pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
     }
+
+    fn candle_err(e: candle_core::Error) -> pyo3::PyErr {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("candle error: {}", e))
+    }
+
+    /// Squeeze the logits tensor from [1, 1, vocab] or [1, vocab] to [vocab]
+    /// and convert to f32 for sampling and logprob extraction.
+    fn squeeze_logits(logits: &Tensor) -> pyo3::PyResult<Tensor> {
+        let l = if logits.dims().len() >= 3 {
+            logits
+                .squeeze(0)
+                .map_err(candle_err)?
+                .squeeze(0)
+                .map_err(candle_err)?
+        } else if logits.dims().len() == 2 {
+            logits.squeeze(0).map_err(candle_err)?
+        } else {
+            logits.clone()
+        };
+        l.to_dtype(DType::F32).map_err(candle_err)
+    }
+
+    /// Compute log_softmax(logits) and return the log-probability of
+    /// `token_id`:
+    ///   log P(token | context) = logits[token] - logsumexp(logits)
+    fn logprob_of_token(logits: &[f32], token_id: u32) -> f32 {
+        let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let sum_exp: f32 = logits.iter().map(|&l| (l - max_l).exp()).sum();
+        let log_sum_exp = max_l + sum_exp.ln();
+        logits[token_id as usize] - log_sum_exp
+    }
 }
 
 #[cfg(not(feature = "candle"))]
 mod backend {
-    pub struct RealBackend;
+    pub struct RealBackend {
+        model_path: String,
+    }
 
     impl RealBackend {
         pub fn load(
@@ -192,7 +421,9 @@ mod backend {
                  --features candle for real inference.",
                 model_path
             );
-            Ok(RealBackend)
+            Ok(RealBackend {
+                model_path: model_path.to_string(),
+            })
         }
 
         pub fn generate(
@@ -205,6 +436,22 @@ mod backend {
             // Stub: return an empty string. The orchestrator's
             // format-enforcer / regex fallback handles empty output.
             Ok(String::new())
+        }
+
+        /// Stub: per-token logprobs are not available without the candle
+        /// feature. Returns an error so callers fail-closed.
+        pub fn generate_with_logprobs(
+            &self,
+            _prompt: &str,
+            _max_tokens: u32,
+            _temperature: f32,
+            _stop: Option<Vec<String>>,
+        ) -> pyo3::PyResult<(String, Vec<u32>, Vec<f32>)> {
+            let _ = &self.model_path; // suppress dead_code warning
+            Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "ruvllm_py stub — per-token logprobs are not available. \
+                 Build with --features candle for real inference.",
+            ))
         }
 
         pub fn is_loaded(&self) -> bool {
@@ -628,6 +875,80 @@ impl Engine {
         dict.set_item("usage", usage)?;
 
         Ok(dict)
+    }
+
+    /// Generate text from a prompt and return per-token log-probabilities.
+    ///
+    /// This is the in-process equivalent of llama-server `/completion` with
+    /// `logprobs` enabled. It generates tokens using the candle quantized
+    /// model, and at each step applies `log_softmax` over the vocabulary to
+    /// obtain the natural-log probability of the sampled token.
+    ///
+    /// The returned dict has the same `choices` / `usage` shape as
+    /// `complete()`, plus:
+    ///   - `logprobs`: list of `{"token_id": int, "logprob": float}` dicts
+    ///     for each generated token (compatible with
+    ///     `turboquant_ppl_check._extract_token_logprobs`).
+    ///   - `tokens`: list of generated token IDs.
+    ///
+    /// The GIL is released during generation.
+    #[pyo3(signature = (prompt, max_tokens = 128, temperature = 0.0, stop = None))]
+    fn complete_with_logprobs<'a>(
+        &self,
+        py: Python<'a>,
+        prompt: String,
+        max_tokens: u32,
+        temperature: f32,
+        stop: Option<Vec<String>>,
+    ) -> PyResult<pyo3::Bound<'a, PyDict>> {
+        let (text, token_ids, logprobs) = py.allow_threads(|| {
+            let backend = self.backend.lock().unwrap();
+            backend.generate_with_logprobs(
+                &prompt,
+                max_tokens,
+                temperature,
+                stop,
+            )
+        })?;
+
+        // Build the response dict (same structure as complete() + logprobs).
+        let dict = PyDict::new_bound(py);
+        let choices = PyDict::new_bound(py);
+        choices.set_item("text", &text)?;
+        dict.set_item("choices", vec![choices])?;
+
+        // logprobs: list of {token_id, logprob} dicts — matches the
+        // llama-server /completion response format that
+        // _extract_token_logprobs expects.
+        let mut lp_list: Vec<pyo3::Bound<'a, PyDict>> =
+            Vec::with_capacity(token_ids.len());
+        for (tid, lp) in token_ids.iter().zip(logprobs.iter()) {
+            let entry = PyDict::new_bound(py);
+            entry.set_item("token_id", *tid)?;
+            entry.set_item("logprob", *lp)?;
+            lp_list.push(entry);
+        }
+        dict.set_item("logprobs", lp_list)?;
+
+        // Token IDs (flat list for convenience).
+        dict.set_item("tokens", token_ids.clone())?;
+
+        let usage = PyDict::new_bound(py);
+        usage.set_item("prompt_tokens", 0u32)?;
+        usage.set_item("completion_tokens", token_ids.len() as u32)?;
+        usage.set_item("total_tokens", token_ids.len() as u32)?;
+        dict.set_item("usage", usage)?;
+
+        Ok(dict)
+    }
+
+    /// Whether this Engine exposes per-token log-probabilities.
+    ///
+    /// Returns `True` when built with the `candle` feature (real inference),
+    /// `False` for the stub build. The Python PPL checker uses this to decide
+    /// whether to use the in-process path or fall back to the HTTP path.
+    fn supports_logprobs(&self) -> bool {
+        cfg!(feature = "candle")
     }
 
     /// Compute a semantic embedding for `text` (Phase 2.2).
@@ -1064,6 +1385,11 @@ fn ruvllm_py(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Use add() instead of setattr() for __version__ — setattr on
     // module dunder attributes can fail silently in some PyO3 configs.
     m.add("__version__", "0.2.0")?;
+    // Module-level flag: True when built with the candle feature (real
+    // inference + logprobs), False for the stub. Lets Python callers check
+    // the logprobs capability without constructing an Engine (which requires
+    // a model file).
+    m.add("SUPPORTS_LOGPROBS", cfg!(feature = "candle"))?;
     let doc = if cfg!(feature = "candle") {
         "Python bindings for the RuvLLM Rust inference engine (candle backend)."
     } else {

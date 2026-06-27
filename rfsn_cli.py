@@ -504,6 +504,21 @@ def build_argparser() -> argparse.ArgumentParser:
                         "boxed_answer key. Falls back to regex for backends "
                         "without grammar support. Default: off (backward compat).")
     p.set_defaults(use_structured_output=_env_bool("RFSN_STRUCTURED_OUTPUT", False))
+    # --- Static-analysis fallback gate (v3.2) ---
+    # AST static analysis is NOT a security boundary. Off by default in
+    # production: when no sandbox (wasmtime/Docker) is available, the code
+    # route returns verified=False / score=0.0 instead of a 0.2 heuristic.
+    # Enable for local dev where you want the "parses + no restricted
+    # imports" signal but have no sandbox installed.
+    p.add_argument("--allow-static-fallback", dest="allow_static_fallback",
+                   action="store_true",
+                   help="Allow the deprecated AST static-analysis fallback "
+                        "when no sandbox is available. AST is NOT a security "
+                        "boundary — only the code's parse + restricted-import "
+                        "status is checked. Emits a 0.2 heuristic (verified=False). "
+                        "Default: off (production-safe).")
+    p.set_defaults(allow_static_fallback=_env_bool(
+        "VIBE_THINKER_ALLOW_STATIC_FALLBACK", False))
     p.add_argument("--audit-log",
                    default=os.environ.get("RFSN_AUDIT_LOG", "rfsn_jobs_bitemporal.jsonl"),
                    help="Bi-temporal audit log path (empty disables logging)")
@@ -766,6 +781,7 @@ async def _amain() -> None:
         sona_sync_url=args.sona_sync_url or None,
         sona_sync_interval=args.sona_sync_interval,
         federation_secret=args.federation_secret or None,
+        allow_static_fallback=args.allow_static_fallback,
     )
 
     # --- Envoy sidecar egress (v1.2) ---

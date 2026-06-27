@@ -143,6 +143,14 @@ class TestFederationState:
 # ---------------------------------------------------------------------- #
 # FastAPI endpoints (integration via TestClient)
 # ---------------------------------------------------------------------- #
+@pytest.fixture
+def client():
+    """Module-level TestClient fixture shared by all endpoint test classes."""
+    from fastapi.testclient import TestClient
+    app = create_federation_app()
+    return TestClient(app)
+
+
 class TestFederationApp:
     @pytest.fixture
     def client(self):
@@ -240,3 +248,182 @@ class TestFederationApp:
         job = resp.json()
         assert job["status"] == "done"
         assert job["result"] == {"answer": "42"}
+
+
+# ---------------------------------------------------------------------- #
+# v3.2: Sybil-resistant node reputation
+# ---------------------------------------------------------------------- #
+class TestReputationStore:
+    """Unit tests for the ReputationStore EMA + downweight logic."""
+
+    @pytest.mark.asyncio
+    async def test_verified_true_raises_score(self):
+        from federation_server import ReputationStore
+        r = ReputationStore()
+        s0 = await r.get_score("node-A")
+        assert s0 == 0.7  # default
+        s1 = await r.record_outcome("node-A", +1.0)
+        assert s1 > s0
+        # Clamped to [0,1].
+        for _ in range(20):
+            s = await r.record_outcome("node-A", +1.0)
+        assert s == 1.0
+
+    @pytest.mark.asyncio
+    async def test_verified_false_drops_below_floor(self):
+        """A node that repeatedly fails verification drops below the
+        gossip floor and its downweight factor becomes 0."""
+        from federation_server import ReputationStore
+        r = ReputationStore()
+        # ~3 consecutive -2 outcomes should drop a 0.7 default below 0.3.
+        for _ in range(4):
+            await r.record_outcome("bad-node", -2.0)
+        dw = await r.downweight_factor("bad-node")
+        assert dw == 0.0  # below floor -> discarded
+
+    @pytest.mark.asyncio
+    async def test_single_failure_does_not_zero_reputation(self):
+        """One fluke failure should NOT drop a good node below the floor
+        — the EMA is resistant to a single bad outcome."""
+        from federation_server import ReputationStore
+        r = ReputationStore()
+        # Build up trust.
+        for _ in range(5):
+            await r.record_outcome("good-node", +1.0)
+        # One failure.
+        await r.record_outcome("good-node", -2.0)
+        dw = await r.downweight_factor("good-node")
+        assert dw > 0.0  # still trusted
+
+    @pytest.mark.asyncio
+    async def test_separate_identities_separate_reputations(self):
+        """Sybil resistance: two different cert identities have
+        independent reputations. A bad identity cannot poison a good one."""
+        from federation_server import ReputationStore
+        r = ReputationStore()
+        await r.record_outcome("cn:good", +1.0)
+        await r.record_outcome("cn:bad", -2.0)
+        assert await r.get_score("cn:good") > await r.get_score("cn:bad")
+
+
+class TestReputationEndpoints:
+    """Integration tests for the /complete -> reputation -> SONA flow."""
+
+    def test_complete_verified_true_updates_reputation(self, client):
+        client.post("/submit", json={"job_id": "r1", "query": "q"})
+        client.post("/claim", json={"worker_id": "w1"})
+        client.post("/complete", json={
+            "job_id": "r1",
+            "worker_id": "w1",
+            "result": {"answer": "4", "verified": True},
+        })
+        resp = client.get("/api/reputation")
+        assert resp.status_code == 200
+        ids = resp.json()["identities"]
+        # In dev mode (no mTLS), identity is wid:w1.
+        assert any(k.startswith("wid:w1") for k in ids)
+        score = next(v["score"] for k, v in ids.items() if k.startswith("wid:w1"))
+        assert score > 0.7  # verified=True nudged it up
+
+    def test_complete_verified_false_drops_reputation(self, client):
+        client.post("/submit", json={"job_id": "r2", "query": "q"})
+        client.post("/claim", json={"worker_id": "w-bad"})
+        for _ in range(4):  # repeat to push below floor
+            client.post("/submit", json={"job_id": f"r2-{_}", "query": "q"})
+            client.post("/claim", json={"worker_id": "w-bad"})
+            client.post("/complete", json={
+                "job_id": f"r2-{_}",
+                "worker_id": "w-bad",
+                "result": {"answer": "wrong", "verified": False},
+            })
+        # Also complete the original r2.
+        client.post("/complete", json={
+            "job_id": "r2",
+            "worker_id": "w-bad",
+            "result": {"answer": "wrong", "verified": False},
+        })
+        resp = client.get("/api/reputation")
+        ids = resp.json()["identities"]
+        score = next(v["score"] for k, v in ids.items() if k.startswith("wid:w-bad"))
+        assert score < 0.3  # below gossip floor
+
+    def test_sona_sync_downweights_low_reputation_node(self, client):
+        """A node below the gossip floor has its SONA patterns discarded."""
+        # Drive w-bad below the floor.
+        for i in range(5):
+            client.post("/submit", json={"job_id": f"s{i}", "query": "q"})
+            client.post("/claim", json={"worker_id": "w-bad"})
+            client.post("/complete", json={
+                "job_id": f"s{i}",
+                "worker_id": "w-bad",
+                "result": {"answer": "wrong", "verified": False},
+            })
+        # w-bad tries to export SONA patterns.
+        resp = client.post("/api/sona/sync", json={
+            "worker_id": "w-bad",
+            "patterns": [{"id": "p1", "centroid": [0.1, 0.2]}],
+            "stats": {"total": 1},
+        })
+        assert resp.status_code == 200
+        body = resp.json()
+        # All patterns skipped because reputation is below floor.
+        assert body["skipped"] == 1
+        assert body["imported"] == 0
+        assert body["reputation_downweight"] == 0.0
+
+    def test_sona_sync_imports_high_reputation_node(self, client):
+        """A good node (verified=True completions) exports patterns normally."""
+        for i in range(3):
+            client.post("/submit", json={"job_id": f"g{i}", "query": "q"})
+            client.post("/claim", json={"worker_id": "w-good"})
+            client.post("/complete", json={
+                "job_id": f"g{i}",
+                "worker_id": "w-good",
+                "result": {"answer": "right", "verified": True},
+            })
+        resp = client.post("/api/sona/sync", json={
+            "worker_id": "w-good",
+            "patterns": [{"id": "p-good", "centroid": [0.3, 0.4]}],
+            "stats": {"total": 1},
+        })
+        body = resp.json()
+        assert body["imported"] == 1
+        assert body["skipped"] == 0
+        assert body["reputation_downweight"] > 0.0
+
+
+class TestExtractIdentity:
+    """Tests for the mTLS cert identity extraction (Sybil resistance)."""
+
+    def test_falls_back_to_worker_id_when_no_cert(self):
+        from federation_server import _extract_identity
+        from starlette.requests import Request
+        # A request with no ssl scope -> wid: fallback.
+        req = Request(scope={"type": "http", "ssl": None})
+        ident = _extract_identity(req, "w1")
+        assert ident == "wid:w1"
+
+    def test_uses_cert_common_name_when_present(self):
+        from federation_server import _extract_identity
+        from starlette.requests import Request
+        # uvicorn-style ssl scope with a subject CN.
+        scope = {
+            "type": "http",
+            "ssl": {
+                "subject": ((("commonName", "node-alpha"),),),
+            },
+        }
+        req = Request(scope=scope)
+        ident = _extract_identity(req, "w1")
+        assert ident == "cn:node-alpha"
+
+    def test_uses_cert_fingerprint_when_no_cn(self):
+        from federation_server import _extract_identity
+        from starlette.requests import Request
+        scope = {
+            "type": "http",
+            "ssl": {"subject": None, "cert": b"der-bytes-here"},
+        }
+        req = Request(scope=scope)
+        ident = _extract_identity(req, "w1")
+        assert ident.startswith("fp:")

@@ -716,29 +716,75 @@ def make_vector_store(
     agentdb_url: Optional[str] = None,
     collection: str = "default",
     shadow_primary: Optional[VectorStore] = None,
+    prefer_ruvllm: bool = True,
+    dim: Optional[int] = None,
     **kwargs,
 ) -> VectorStore:
     """Factory: build the appropriate vector store from config.
 
-    Precedence:
+    v3.2 precedence (revised):
       1. agentdb_url + shadow_primary -> ShadowVectorStore(local, agentdb)
-      2. agentdb_url                  -> AgentDBVectorStore
-      3. None                         -> LocalVectorStore (default)
+         (DEPRECATED — emits a warning; see notes below)
+      2. agentdb_url                  -> AgentDBVectorStore (HTTP sidecar)
+      3. prefer_ruvllm + binding avail -> RuvLLMVectorStore (in-process HNSW)
+      4. None                         -> LocalVectorStore (zero-build default)
+
+    Notes on the v3.2 revision:
+      - RuvLLMVectorStore (Rust HNSW via ruvllm_py) is now PREFERRED over
+        LocalVectorStore when the binding is installed, because it moves
+        the embedding matrix into Rust memory (zero Python RAM bloat, ~25us
+        lookups). It is opt-out via prefer_ruvllm=False.
+      - LocalVectorStore is KEPT as the zero-build default (not deprecated)
+        because it supports ``delete`` and ``cluster``, which the HNSW
+        binding does NOT expose (see RuvLLMVectorStore.delete/cluster).
+        Deprecating it would regress those features and force a hard Rust
+        build to run the orchestrator at all.
+      - ShadowVectorStore is DEPRECATED (not removed — backward compat).
+        It is a migration scaffold for the local->AgentDB cut-over. New
+        deployments should cut over directly to AgentDB-only mode
+        (--agentdb-only) rather than running shadow mode indefinitely.
+        A DeprecationWarning is emitted when it is selected.
+      - ``dim`` is required for RuvLLMVectorStore (HNSW needs the vector
+        dimension at construction). If dim is None and RuvLLM would be
+        selected, we fall through to LocalVectorStore (which is dim-agnostic).
 
     Args:
         agentdb_url: AgentDB HTTP endpoint. When set, AgentDB is used.
         collection: AgentDB collection/table name.
         shadow_primary: when provided WITH agentdb_url, wraps the two in
             a ShadowVectorStore for zero-downtime migration. Typically
-            you'd pass a LocalVectorStore here.
+            you'd pass a LocalVectorStore here. DEPRECATED in v3.2.
+        prefer_ruvllm: when True (default) and no agentdb_url is set and
+            the ruvllm_py HNSW binding is installed and dim is provided,
+            use RuvLLMVectorStore. Set False to force LocalVectorStore.
+        dim: vector dimension (required for RuvLLMVectorStore; ignored
+            by LocalVectorStore and AgentDBVectorStore).
         **kwargs: passed to AgentDBVectorStore (api_key, timeout).
 
     Returns:
         A VectorStore instance.
     """
+    import warnings
+
     if agentdb_url:
         agentdb = AgentDBVectorStore(agentdb_url, collection, **kwargs)
         if shadow_primary is not None:
+            warnings.warn(
+                "ShadowVectorStore is deprecated (v3.2). It is a migration "
+                "scaffold for the local->AgentDB cut-over. New deployments "
+                "should use --agentdb-only mode after verifying recall, "
+                "rather than running shadow mode indefinitely.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
             return ShadowVectorStore(shadow_primary, agentdb)
         return agentdb
+    # No AgentDB: prefer the in-process Rust HNSW when available + dim is
+    # known. Fall back to the zero-build LocalVectorStore otherwise.
+    if prefer_ruvllm and dim is not None and is_ruvllm_vector_store_available():
+        try:
+            return RuvLLMVectorStore(dim=dim)
+        except Exception as e:  # pragma: no cover - defensive
+            print(f"[vector_store] RuvLLMVectorStore construction failed "
+                  f"({e}); falling back to LocalVectorStore")
     return LocalVectorStore()

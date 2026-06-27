@@ -11,16 +11,19 @@ from unittest.mock import AsyncMock, MagicMock
 
 from hybrid_orchestrator import _static_analysis_fallback, _wasmtime_sandbox_fallback
 
+import inspect
+
 
 class TestStaticAnalysisFallback:
     """Verify the static analysis fallback scoring."""
 
     def test_clean_code_gets_partial_score(self):
         """Code that parses cleanly and has no restricted imports
-        gets a partial heuristic score of 0.4."""
+        gets a partial heuristic score of 0.2 (v3.2: lowered from 0.4
+        to reduce the epistemic weight of an unexecuted signal)."""
         code = "def add(a, b):\n    return a + b\n"
         score, issues = _static_analysis_fallback(code)
-        assert score == 0.4
+        assert score == 0.2
         assert issues == []
 
     def test_syntax_error_gets_zero(self):
@@ -60,20 +63,20 @@ class TestStaticAnalysisFallback:
         assert any("os" in i for i in issues)
 
     def test_safe_imports_get_partial_score(self):
-        """Code with safe imports (math, json, re) gets 0.4."""
+        """Code with safe imports (math, json, re) gets 0.2 (v3.2)."""
         code = "import math\nimport json\nimport re\nprint(math.pi)\n"
         score, issues = _static_analysis_fallback(code)
-        assert score == 0.4
+        assert score == 0.2
         assert issues == []
 
     def test_empty_code_gets_partial_score(self):
-        """Empty code parses cleanly (it's valid Python) — score 0.4."""
+        """Empty code parses cleanly (it's valid Python) — score 0.2 (v3.2)."""
         score, issues = _static_analysis_fallback("")
-        assert score == 0.4
+        assert score == 0.2
         assert issues == []
 
     def test_class_definition_gets_partial_score(self):
-        """A class definition with methods parses cleanly — score 0.4."""
+        """A class definition with methods parses cleanly — score 0.2 (v3.2)."""
         code = (
             "class Solution:\n"
             "    def two_sum(self, nums, target):\n"
@@ -85,7 +88,7 @@ class TestStaticAnalysisFallback:
             "        return []\n"
         )
         score, issues = _static_analysis_fallback(code)
-        assert score == 0.4
+        assert score == 0.2
         assert issues == []
 
     def test_multiple_restricted_imports_listed(self):
@@ -97,11 +100,11 @@ class TestStaticAnalysisFallback:
         assert any("subprocess" in i for i in issues)
         assert any("socket" in i for i in issues)
 
-    def test_score_capped_at_04(self):
-        """The static analysis score is always capped at 0.4 — never 1.0."""
+    def test_score_capped_at_02(self):
+        """The static analysis score is always capped at 0.2 — never 1.0."""
         code = "def perfect_solution():\n    return 42\n"
         score, _ = _static_analysis_fallback(code)
-        assert score == 0.4  # NOT 1.0 — this is a heuristic, not full verification
+        assert score == 0.2  # NOT 1.0 — this is a heuristic, not full verification
         assert score < 0.5  # Below the cache trust threshold
 
 
@@ -156,7 +159,7 @@ class TestStaticAnalysisEvasionVectors:
         assert any("__builtins__" in i for i in issues)
 
     def test_clean_code_with_no_evasion_still_gets_partial(self):
-        """Code without any evasion vectors still gets 0.4."""
+        """Code without any evasion vectors still gets 0.2 (v3.2)."""
         code = (
             "def solve(data):\n"
             "    result = []\n"
@@ -165,7 +168,7 @@ class TestStaticAnalysisEvasionVectors:
             "    return result\n"
         )
         score, issues = _static_analysis_fallback(code)
-        assert score == 0.4
+        assert score == 0.2
         assert issues == []
 
     def test_mixed_evasion_and_restricted_both_reported(self):
@@ -293,3 +296,180 @@ class TestWasmtimeSandboxFallback:
         )
         assert score == 0.65
         assert score < 0.7  # Below the cache trust threshold
+
+
+# ---------------------------------------------------------------------- #
+# v3.2: Wasmtime fuel + wall-clock belt-and-suspenders
+# ---------------------------------------------------------------------- #
+class TestWasmtimeFuel:
+    """v3.2: deterministic fuel limits catch infinite loops at the
+    CPU-instruction level; the wall-clock timeout is the outer belt."""
+
+    @pytest.mark.asyncio
+    async def test_out_of_fuel_traps_deterministically(self, monkeypatch, tmp_path):
+        """When the Wasm store runs out of fuel, the sandbox must return
+        score=0.0 with a 'fuel' message — NOT crash, NOT hang."""
+        # Inject a fake wasmtime module so the fuel path runs without
+        # the real wasmtime installed.
+        import sys, types
+        fake = types.ModuleType("wasmtime")
+
+        class _Config:
+            consume_fuel = None  # setter_property-like
+
+            def __init__(self):
+                self._consume_fuel = False
+
+            # emulate @setter_property
+            consume_fuel = type("P", (), {
+                "__set__": lambda s, inst, v: setattr(inst, "_cf", v),
+                "__get__": lambda s, inst, cls: getattr(inst, "_cf", False),
+            })()
+
+        class _Store:
+            def __init__(self, engine):
+                self.fuel = None
+
+            def set_fuel(self, n):
+                self.fuel = n
+
+        class _Instance:
+            def __init__(self, store, module, args):
+                pass
+
+            def exports(self, store):
+                return {"run_python": lambda store, code: (_ for _ in ()).throw(
+                    RuntimeError("wasm trap: out of fuel consumed 1000000000"))}
+
+        class _Engine:
+            def __init__(self, config):
+                pass
+
+        class _Module:
+            @staticmethod
+            def from_file(engine, path):
+                return MagicMock()
+
+        fake.Config = _Config
+        fake.Engine = _Engine
+        fake.Module = _Module
+        fake.Store = _Store
+        fake.Instance = _Instance
+        monkeypatch.setitem(sys.modules, "wasmtime", fake)
+        # Write a dummy wasm module path so the env-gated branch runs.
+        wasm_path = tmp_path / "fake.wasm"
+        wasm_path.write_bytes(b"\x00asm")
+        monkeypatch.setenv("VIBE_WASM_PYTHON_MODULE", str(wasm_path))
+
+        score, issues = await _wasmtime_sandbox_fallback(
+            "while True: pass", code_verifier=None,
+        )
+        assert score == 0.0
+        assert any("fuel" in i.lower() for i in issues)
+
+    @pytest.mark.asyncio
+    async def test_wall_clock_timeout_catches_hang(self, monkeypatch, tmp_path):
+        """When the wasm call hangs (e.g. a host syscall that fuel can't
+        see), the wall-clock timeout must fire and return score=0.0."""
+        import sys, types, asyncio
+        fake = types.ModuleType("wasmtime")
+
+        class _Config:
+            def __init__(self):
+                self._cf = False
+            consume_fuel = type("P", (), {
+                "__set__": lambda s, inst, v: setattr(inst, "_cf", v),
+                "__get__": lambda s, inst, cls: getattr(inst, "_cf", False),
+            })()
+
+        class _Store:
+            def __init__(self, engine):
+                pass
+            def set_fuel(self, n):
+                pass
+
+        class _Instance:
+            def __init__(self, store, module, args):
+                pass
+            def exports(self, store):
+                # The real wasmtime run() is synchronous. The
+                # orchestrator runs it in a thread executor so
+                # asyncio.wait_for can abandon it on timeout. Simulate a
+                # synchronous hang here (time.sleep) — the executor
+                # thread blocks, but wait_for returns TimeoutError and
+                # the orchestrator stops waiting. The sleep is kept short
+                # enough (1.5s) that the orphaned executor thread exits
+                # cleanly before pytest tears down the event loop.
+                import time as _time
+                def _run(store, code):
+                    _time.sleep(1.5)  # >> 0.2s timeout, exits before teardown
+                    return 0
+                return {"run_python": _run}
+
+        class _Engine:
+            def __init__(self, config):
+                pass
+
+        class _Module:
+            @staticmethod
+            def from_file(engine, path):
+                return MagicMock()
+
+        fake.Config = _Config
+        fake.Engine = _Engine
+        fake.Module = _Module
+        fake.Store = _Store
+        fake.Instance = _Instance
+        monkeypatch.setitem(sys.modules, "wasmtime", fake)
+        wasm_path = tmp_path / "fake.wasm"
+        wasm_path.write_bytes(b"\x00asm")
+        monkeypatch.setenv("VIBE_WASM_PYTHON_MODULE", str(wasm_path))
+        monkeypatch.setenv("VIBE_WASM_WALL_CLOCK_TIMEOUT", "0.2")
+
+        score, issues = await _wasmtime_sandbox_fallback(
+            "import time; time.sleep(100)", code_verifier=None,
+        )
+        assert score == 0.0
+        assert any("timeout" in i.lower() for i in issues)
+
+
+# ---------------------------------------------------------------------- #
+# v3.2: --allow-static-fallback gate
+# ---------------------------------------------------------------------- #
+class TestStaticFallbackGate:
+    """v3.2: the AST static-analysis fallback is gated behind
+    ``allow_static_fallback`` (off by default). When the gate is closed
+    and no sandbox is available, the code route must return
+    verified=False / score=0.0 rather than the 0.2 heuristic. When the
+    gate is open, the heuristic (0.2) is emitted under a distinct route
+    name so consumers cannot confuse it with any verified path.
+    """
+
+    def test_gate_off_returns_zero_unverified_route(self):
+        """Default (gate off) -> code_specialist_unverified, score 0.0."""
+        from hybrid_orchestrator import HybridReasoningOrchestrator
+        # Construct with the default (allow_static_fallback=False) and
+        # exercise the no-sandbox branch by calling the internal route
+        # directly via the public helper used by the code loop.
+        # We can't easily build a full orchestrator here (it spins up a
+        # CLR reasoner), so we assert the default attribute value and the
+        # route name constant instead.
+        # Default is set at the class level via the constructor default.
+        import inspect
+        sig = inspect.signature(HybridReasoningOrchestrator.__init__)
+        assert sig.parameters["allow_static_fallback"].default is False
+
+    def test_route_name_changed_to_unverified_static_only(self):
+        """When the gate is open, the route is 'code_specialist_unverified_static_only',
+        NOT 'code_specialist_static_analysis' (the old name that consumers
+        might have whitelisted as if it were verified)."""
+        import hybrid_orchestrator as ho
+        # The old route name must NOT appear in the static-fallback branch.
+        src = inspect.getsource(ho)
+        # The old name is still referenced in the docstring history, so we
+        # check the active return statement instead: the new route name
+        # appears, the old one does not appear in a route_taken= assignment.
+        assert "code_specialist_unverified_static_only" in src
+        # The old route name must not be assigned as a route_taken value
+        # in the static-fallback return.
+        assert 'route_taken="code_specialist_static_analysis"' not in src

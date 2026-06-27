@@ -1,0 +1,81 @@
+# vibe-thinker .dockerignore
+# Keep the orchestrator image small and free of dev/test artifacts + large
+# model files that should be mounted at runtime, not baked in.
+
+# Python bytecode + caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Tests — not needed in the runtime image
+tests/
+test_*.py
+test_clr.py
+test_demo.py
+test_full_stack.py
+
+# Git + CI
+.git/
+.github/
+.gitignore
+
+# Model files — mount these at runtime via volumes, never bake into the image
+*.gguf
+*.bin
+*.safetensors
+*.onnx
+
+# Trajectory / memory / cache JSON files (generated at runtime, not source)
+# These match the runtime artifacts in .gitignore.
+route_cache.json
+clr_result_cache.json
+clr_trace.json
+rfsn_jobs.jsonl
+rfsn_jobs_bitemporal.jsonl
+orchestrator_memory.jsonl
+verified_trajectories.json
+*.trajectory.json
+*.memory.json
+
+# Rust build artifacts (the ruvllm_py crate builds separately in its own image)
+ruvllm_py/target/
+rust/**/target/
+rust/**/vendor/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE + OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Docker metadata (avoid recursive context)
+Dockerfile
+docker-compose.yml
+.dockerignore
+docker/
+
+# Docs (not needed at runtime)
+docs/
+README.md
+AGENTS.md
+LICENSE
+examples/
+sandbox/README.md
+
+# Env files (secrets — pass via compose env, not bake into image)
+.env
+.env.*

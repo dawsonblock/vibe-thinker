@@ -50,12 +50,13 @@ Exit codes (compare):
       NOT ship this preset).
   2 — evaluation error (missing corpus, server unreachable, etc.).
 
-NOTE on the in-process path: ``ruvllm_py.Engine.complete()`` returns
-generated text but does NOT expose per-token log-probs. PPL requires
-log-probs. The HTTP path (llama-server ``/completion`` with
-``logprobs``) is the supported eval path today. The in-process path is
-stubbed and will raise NotImplementedError until a ``logprobs`` method is
-added to the Rust Engine (documented as a follow-up).
+NOTE on the in-process path: ``ruvllm_py.Engine.complete_with_logprobs()``
+generates tokens and returns per-token log-probabilities (computed via
+``log_softmax`` over the vocabulary by the Rust candle backend). When the
+binding is built with the ``candle`` feature and ``SUPPORTS_LOGPROBS`` is
+True, the in-process path produces a real PplResult. When the binding is
+absent or stubbed (no candle feature), it fail-closed raises
+NotImplementedError — use the HTTP path instead.
 """
 
 from __future__ import annotations
@@ -271,19 +272,70 @@ def eval_inprocess(
 ) -> PplResult:
     """Evaluate PPL via the in-process ruvllm_py Engine.
 
-    NOT YET IMPLEMENTED: ``ruvllm_py.Engine.complete()`` returns generated
-    text but does not expose per-token log-probs, which PPL requires. Use
-    the HTTP path (``eval_http``) until a ``logprobs`` method is added to
-    the Rust Engine. This stub raises NotImplementedError with guidance.
+    Uses ``ruvllm_py.Engine.complete_with_logprobs()`` to generate tokens
+    with per-token log-probabilities (computed via ``log_softmax`` over the
+    vocabulary by the Rust candle backend). The logprobs are fed into
+    ``_extract_token_logprobs`` and then into ``PplResult.from_log_probs``.
+
+    Fail-closed: when ``ruvllm_py`` is not importable, or is importable but
+    does not expose the logprobs capability (``SUPPORTS_LOGPROBS`` is False,
+    i.e. built without the ``candle`` feature), this raises
+    ``NotImplementedError`` with guidance to use the HTTP path.
     """
-    raise NotImplementedError(
-        "In-process PPL eval requires per-token log-probs, which "
-        "ruvllm_py.Engine.complete() does not expose. Use the HTTP path: "
-        "start llama-server/RuvLLM with --logprobs and run "
-        "`turboquant_ppl_check.py eval --base-url ...`. Adding a "
-        "`logprobs()` method to the Rust Engine is the documented "
-        "follow-up to enable this path."
+    # Fail-closed: check for the binding before doing any work.
+    try:
+        import ruvllm_py  # type: ignore
+    except ImportError:
+        raise NotImplementedError(
+            "In-process PPL eval requires the ruvllm_py PyO3 extension, "
+            "which is not installed. Use the HTTP path: start "
+            "llama-server/RuvLLM with --logprobs and run "
+            "`turboquant_ppl_check.py eval --base-url ...`. "
+            "Build the extension with `maturin develop --release "
+            "--features candle` in the ruvllm_py directory."
+        )
+
+    # Check the logprobs capability BEFORE creating an Engine (avoids a
+    # model-not-found error when the binding is present but stubbed).
+    if not getattr(ruvllm_py, "SUPPORTS_LOGPROBS", False):
+        raise NotImplementedError(
+            "In-process PPL eval requires per-token log-probs, which this "
+            "ruvllm_py build does not expose (built without the candle "
+            "feature). Use the HTTP path: start llama-server/RuvLLM with "
+            "--logprobs and run `turboquant_ppl_check.py eval --base-url "
+            "...`. Rebuild with `maturin develop --release --features "
+            "candle` to enable the in-process path."
+        )
+
+    engine = ruvllm_py.Engine(
+        model_path=model_path,
+        cache_type_k=cache_type_k,
+        cache_type_v=cache_type_v,
+        use_metal=use_metal,
+        n_threads=n_threads,
     )
+
+    # Generate tokens with per-token logprobs (greedy / temperature=0 for
+    # deterministic scoring). The Rust backend applies log_softmax over the
+    # full vocabulary at each step.
+    response = engine.complete_with_logprobs(
+        prompt=corpus,
+        max_tokens=128,
+        temperature=0.0,
+    )
+
+    # Extract per-token log-probs (same format as llama-server /completion).
+    log_probs = _extract_token_logprobs(response)
+    if not log_probs:
+        raise RuntimeError("no token log-probs extracted from in-process engine")
+
+    config: Dict[str, str] = {
+        "cache_type_k": cache_type_k,
+        "cache_type_v": cache_type_v,
+        "use_metal": str(use_metal),
+        "n_threads": str(n_threads),
+    }
+    return PplResult.from_log_probs(log_probs, config=config, source="ruvllm_py")
 
 
 # ---------------------------------------------------------------------------

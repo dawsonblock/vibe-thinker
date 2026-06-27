@@ -307,9 +307,17 @@ def _static_analysis_fallback(code: str) -> tuple:
        - Any reference to ``importlib`` or ``__builtins__`` in the AST
        If any are found, score 0.0.
     4. If the code parses cleanly and has no restricted imports or
-       evasion vectors, assign a partial heuristic score of 0.4 (capped
+       evasion vectors, assign a partial heuristic score of 0.2 (capped
        — this is NOT full verification, just a "syntactically valid and
        not obviously dangerous" signal).
+
+    v3.2: the partial score was lowered from 0.4 to 0.2 to reduce the
+    epistemic weight of an unexecuted signal. The static fallback is now
+    ALSO gated behind ``allow_static_fallback`` at the call site (off by
+    default in production) — when the gate is closed the caller gets
+    ``verified=False, score=0.0`` instead of this heuristic. This keeps
+    the "parses + no restricted imports" signal available for local dev
+    without letting it influence production confidence.
 
     Returns (score, issues) where issues is a list of strings describing
     any problems found (empty list if score > 0.0).
@@ -381,7 +389,7 @@ def _static_analysis_fallback(code: str) -> tuple:
         return (0.0, issues)
 
     # 4. Clean parse, no restricted imports, no evasion — partial score.
-    return (0.4, [])
+    return (0.2, [])
 
 
 # ====================================================================== #
@@ -434,22 +442,83 @@ async def _wasmtime_sandbox_fallback(
     if wasm_module_path:
         try:
             import wasmtime  # type: ignore
-            from wasmtime import Engine, Module, Store, Instance  # type: ignore
+            from wasmtime import Engine, Module, Store, Instance, Config  # type: ignore
 
-            engine = Engine()
+            # v3.2: deterministic fuel limit. Infinite loops burn fuel at
+            # the CPU-instruction level and trap deterministically; this
+            # catches them without waiting for the wall-clock timeout.
+            # Configurable via VIBE_WASM_FUEL (default 1e9 instructions,
+            # ~seconds of pure compute). Set very high to effectively
+            # disable fuel and rely on the wall-clock timeout alone.
+            fuel_limit = int(os.environ.get("VIBE_WASM_FUEL", "1000000000"))
+            config = Config()
+            fuel_enabled = False
+            try:
+                # consume_fuel enables fuel metering on the engine. The
+                # store is then seeded with `fuel_limit` units via
+                # set_fuel. Guarded: older wasmtime versions or builds
+                # without fuel support fall back to wall-clock only.
+                config.consume_fuel = True
+                fuel_enabled = True
+            except (AttributeError, TypeError):
+                # consume_fuel not supported — rely on wall-clock alone.
+                pass
+            engine = Engine(config)
             module = Module.from_file(engine, wasm_module_path)
             store = Store(engine)
+            if fuel_enabled:
+                try:
+                    store.set_fuel(fuel_limit)
+                except (AttributeError, TypeError, Exception):
+                    # set_fuel missing or rejected — disable fuel path.
+                    fuel_enabled = False
             instance = Instance(store, module, [])
             # The Wasm module exposes a `run_python` function that takes
             # the source code as a string and returns 0 on success.
             run = instance.exports(store)["run_python"]
-            result = run(store, code)
+
+            # v3.2: belt-and-suspenders. Fuel catches infinite loops
+            # deterministically; the wall-clock timeout catches a fuel
+            # accounting bug or a non-Wasm syscall hang that fuel can't
+            # see (the Wasm Python module may still block on a host
+            # import). The wall-clock is the OUTER timeout — fuel is the
+            # primary inner guarantee when available.
+            #
+            # The real wasmtime run() is SYNCHRONOUS and would block the
+            # event loop, so asyncio.wait_for alone could not cancel a
+            # sync hang. We therefore run the wasm call in a thread
+            # executor: wait_for can then abandon the future on timeout
+            # (the thread keeps running until it traps on fuel or
+            # returns, but the orchestrator no longer waits for it).
+            wall_clock_timeout = float(
+                os.environ.get("VIBE_WASM_WALL_CLOCK_TIMEOUT", "10.0")
+            )
+            loop = asyncio.get_event_loop()
+
+            async def _run_wasm():
+                return await loop.run_in_executor(None, lambda: run(store, code))
+
+            try:
+                result = await asyncio.wait_for(
+                    _run_wasm(), timeout=wall_clock_timeout,
+                )
+            except asyncio.TimeoutError:
+                return (0.0, [f"wasm sandbox: wall-clock timeout "
+                              f"({wall_clock_timeout}s) exceeded"])
+
             if result == 0:
                 return (_WASM_SANDBOX_SCORE, [])
             return (0.0, [f"wasm sandbox: code trapped (exit code {result})"])
         except ImportError:
             pass  # wasmtime not installed — fall through to Docker
         except Exception as e:
+            msg = str(e).lower()
+            # wasmtime raises an error mentioning "fuel" when the store
+            # runs out. Treat that as a deterministic "infinite loop"
+            # failure (score 0.0) rather than a crash.
+            if "fuel" in msg or "out of fuel" in msg:
+                return (0.0, [f"wasm sandbox: out of fuel — likely "
+                              f"infinite loop (fuel_limit={fuel_limit})"])
             # Wasm execution failed — the code is buggy or dangerous.
             return (0.0, [f"wasm sandbox: execution failed: {e}"])
 
@@ -521,6 +590,7 @@ class HybridReasoningOrchestrator:
         sona_sync_url: Optional[str] = None,
         sona_sync_interval: int = 3600,
         federation_secret: Optional[str] = None,
+        allow_static_fallback: bool = False,
     ):
         self.vibe_endpoint = vibe_endpoint.rstrip("/")
         self.generalist_endpoint = generalist_endpoint.rstrip("/")
@@ -603,6 +673,12 @@ class HybridReasoningOrchestrator:
         # the optional nli extra is installed. Opt-in (default False) —
         # the encoder model is downloaded from HuggingFace on first use.
         self.prefer_encoder_nli = prefer_encoder_nli
+        # v3.2: gate the deprecated AST static-analysis fallback. Off by
+        # default — AST is not a security boundary, so in production we
+        # return verified=False rather than emit a heuristic. Enable for
+        # local dev where you want the "parses + no restricted imports"
+        # signal but have no sandbox installed.
+        self.allow_static_fallback = allow_static_fallback
 
         # Shared HTTP session for all generalist/code-specialist calls.
         # Eagerly created in start() (inside the event loop) to avoid a
@@ -1119,13 +1195,22 @@ class HybridReasoningOrchestrator:
                     self._http_session = aiohttp.ClientSession()
         return self._http_session
 
-    async def _call_generalist(self, query: str, max_tokens: int = 4096) -> str:
+    async def _call_generalist(self, query: str, max_tokens: int = 4096,
+                               grammar: Optional[str] = None) -> str:
         """Call the generalist model via the OpenAI-compatible
         /v1/chat/completions endpoint so llama-server applies the model's
         own baked-in chat template (Llama 3.2 uses <|start_header_id|>, not
         ChatML). Falls back to /completion with ChatML if the chat endpoint
         fails. Raises RuntimeError if both endpoints fail — callers must
-        handle the exception, not silently proceed with an error string."""
+        handle the exception, not silently proceed with an error string.
+
+        v3.2: ``grammar`` optional GBNF string. When set, the chat payload
+        includes a ``response_format`` derived from the grammar (via
+        FormatEnforcer) and the /completion fallback passes ``grammar``
+        directly. This constrains the generalist to valid JSON for the
+        logic-constraints translation step, eliminating the malformed-JSON
+        parse failure mode the retry loop was working around.
+        """
         session = await self._get_session()
         chat_payload = {
             "messages": [{"role": "user", "content": query}],
@@ -1133,6 +1218,30 @@ class HybridReasoningOrchestrator:
             "temperature": 0.7,
             "top_p": 0.95,
         }
+        # v3.2: map the GBNF grammar to a response_format for the chat
+        # endpoint. llama-server's /v1/chat/completions accepts
+        # response_format with json_schema when the model supports it.
+        if grammar is not None:
+            try:
+                from format_enforcer import (
+                    make_enforcer, SchemaKind,
+                    STRUCTURED_OUTPUT_GRAMMAR, CLAIMS_JSON_GRAMMAR,
+                    LOGIC_CONSTRAINTS_GRAMMAR,
+                )
+                kind = (
+                    SchemaKind.STRUCTURED_OUTPUT
+                    if grammar == STRUCTURED_OUTPUT_GRAMMAR
+                    else SchemaKind.LOGIC_CONSTRAINTS
+                    if grammar == LOGIC_CONSTRAINTS_GRAMMAR
+                    else SchemaKind.CLAIMS
+                )
+                enforcer = make_enforcer(kind, transport="openai_chat")
+                chat_payload["response_format"] = enforcer.to_openai_response_format()
+            except Exception as e:
+                # If the enforcer mapping fails, proceed without it — the
+                # retry loop + validate_constraints still catch bad output.
+                print(f"[Generalist] grammar->response_format mapping failed "
+                      f"({e}); proceeding without structured constraint")
         try:
             async with session.post(
                 f"{self.generalist_endpoint}/v1/chat/completions",
@@ -1157,6 +1266,9 @@ class HybridReasoningOrchestrator:
                 "top_p": 0.95,
                 "stop": ["<|im_end|>"],
             }
+            # v3.2: /completion accepts the GBNF grammar string directly.
+            if grammar is not None:
+                payload["grammar"] = grammar
             try:
                 async with session.post(
                     f"{self.generalist_endpoint}/completion",
@@ -1302,32 +1414,65 @@ class HybridReasoningOrchestrator:
         causing it to match text between a closing ```bash fence and
         an opening ```python fence as if it were a code block.
 
+        v3.2: the fence matcher is now CommonMark-aware. The old
+        ``stripped.startswith("```")`` test treated any triple-backtick
+        line as a fence toggle, which broke on two real failure modes:
+          (a) a line of >3 backticks (``````) closed a ``` block early;
+          (b) nested backticks inside a markdown explanation (e.g. an
+              inline `` `code` `` or a fenced sub-example in the model's
+              reasoning) could flip the open/close state mid-block and
+              swallow real code as "explanation".
+        The matcher now (1) requires 3+ backticks with optional leading
+        spaces (<=3), (2) matches the closing fence's backtick count to
+        the opener's, (3) requires the closing fence to have NO info
+        string, and (4) parses the info string only on the opener. This
+        is the CommonMark fenced-code-block spec and is what every
+        renderer the model output is aimed at actually implements.
+
         Fallback order:
           1. Last fenced block that parses as valid Python AST
           2. First fenced block (if none parse — let the verifier reject it)
           3. The stripped text itself (no fences found)
         """
         import ast as _ast
+        import re as _re
 
-        # v0.4.0: parse line by line to correctly handle fenced blocks.
-        # This avoids the regex ambiguity between opening and closing fences.
+        # v3.2: CommonMark fence regex. An opening/closing fence line is:
+        #   - up to 3 leading spaces (indented code context)
+        #   - a run of 3+ backticks (`{3,}`)
+        #   - the rest of the line (info string for openers; must be
+        #     empty/whitespace for closers)
+        _FENCE_RE = _re.compile(r"^( {0,3})(`{3,})(.*)$")
+
         lines = text.split("\n")
         blocks: list = []  # list of (tag, content) tuples
         current_block = None
         current_tag = None
+        current_fence = None  # the exact backtick run of the opener
         for line in lines:
-            stripped = line.strip()
-            if stripped.startswith("```"):
-                if current_block is not None:
-                    # Closing fence — save the block
+            m = _FENCE_RE.match(line)
+            if m and current_block is not None:
+                # Inside a block — a fence line either closes it or is
+                # literal content. CommonMark: a closing fence must use
+                # >= the opener's backtick count AND have no info string.
+                _indent, ticks, info = m.group(1), m.group(2), m.group(3)
+                if len(ticks) >= len(current_fence) and info.strip() == "":
+                    # Closing fence — save the block.
                     blocks.append((current_tag, "\n".join(current_block)))
                     current_block = None
                     current_tag = None
-                else:
-                    # Opening fence — extract the language tag
-                    tag = stripped[3:].strip().lower()
-                    current_tag = tag if tag else None
-                    current_block = []
+                    current_fence = None
+                    continue
+                # Not a valid closer -> literal content inside the block.
+                current_block.append(line)
+            elif m and current_block is None:
+                # Opening fence — extract the language tag (info string).
+                # Only the first whitespace-delimited token is the lang.
+                _indent, ticks, info = m.group(1), m.group(2), m.group(3)
+                tag = info.strip().split()[0].lower() if info.strip() else ""
+                current_tag = tag if tag else None
+                current_fence = ticks
+                current_block = []
             elif current_block is not None:
                 current_block.append(line)
 
@@ -1585,28 +1730,39 @@ class HybridReasoningOrchestrator:
                         "sandbox_issues": sandbox_issues,
                     },
                 )
-            # No sandbox available — fall back to deprecated AST static
-            # analysis with a warning. AST is NOT a security boundary.
-            print("[CodeLoop] WARNING: no sandbox available — falling back "
-                  "to AST static analysis (NOT a security boundary)")
-            static_score, static_issues = _static_analysis_fallback(answer)
-            if static_score > 0.0:
-                print(f"[CodeLoop] AST fallback: score={static_score} "
-                      f"(parses OK, no restricted imports)")
-                return OrchestratorResult(
-                    final_answer=answer,
-                    route_taken="code_specialist_static_analysis",
-                    specialist_used="Code Specialist (ruvltra-claude-code)",
-                    clr_score=static_score,
-                    routing_confidence=0.3,
-                    raw_traces={
-                        "verified": False,
-                        "reason": "no test spec generated — AST static analysis fallback (no sandbox available)",
-                        "static_analysis": True,
-                        "static_score": static_score,
-                        "static_issues": static_issues,
-                    },
-                )
+            # No sandbox available. The deprecated AST static analysis is
+            # NOT a security boundary, so it is gated behind
+            # ``allow_static_fallback`` (off by default in production). When
+            # the gate is closed, we return verified=False / score=0.0
+            # rather than emit a heuristic that could blend into
+            # downstream confidence. When the gate is open (local dev), the
+            # AST pass still runs but emits only a low 0.2 heuristic and a
+            # loud "NOT a security boundary" warning.
+            if self.allow_static_fallback:
+                print("[CodeLoop] WARNING: no sandbox available — falling back "
+                      "to AST static analysis (NOT a security boundary, "
+                      "enabled via --allow-static-fallback)")
+                static_score, static_issues = _static_analysis_fallback(answer)
+                if static_score > 0.0:
+                    print(f"[CodeLoop] AST fallback: score={static_score} "
+                          f"(parses OK, no restricted imports)")
+                    return OrchestratorResult(
+                        final_answer=answer,
+                        route_taken="code_specialist_unverified_static_only",
+                        specialist_used="Code Specialist (ruvltra-claude-code)",
+                        clr_score=static_score,
+                        routing_confidence=0.3,
+                        raw_traces={
+                            "verified": False,
+                            "reason": "no test spec generated — AST static analysis fallback (no sandbox available)",
+                            "static_analysis": True,
+                            "static_score": static_score,
+                            "static_issues": static_issues,
+                        },
+                    )
+            else:
+                print("[CodeLoop] no sandbox available and static fallback "
+                      "disabled (default) — returning verified=False")
             return OrchestratorResult(
                 final_answer=answer,
                 route_taken="code_specialist_unverified",
@@ -2053,12 +2209,23 @@ class HybridReasoningOrchestrator:
     # constraints. The generalist must output a JSON block with
     # "constraints" (list of Z3 assertion strings), "variables" (name ->
     # sort), and "values" (name -> numeric, the answer's values).
+    #
+    # v3.2: the output is now constrained by LOGIC_CONSTRAINTS_GRAMMAR
+    # (passed to _call_generalist as the `grammar` arg), so the model
+    # physically cannot emit malformed JSON. The prompt still includes
+    # the few-shot examples and an explicit Z3-syntax allowlist so the
+    # constraints parse on the first try (reducing retry-loop trips).
     _LOGIC_CONSTRAINT_PROMPT = (
         "Translate the following logic problem into Z3 SMT constraints.\n"
         "Output ONLY a JSON object with these keys (no explanation, no markdown):\n"
         '  "constraints": list of Z3 assertion strings (e.g. "x > 0", "x + y == 10")\n'
         '  "variables": object mapping variable names to their Z3 sort ("Int", "Real", or "Bool")\n'
         '  "values": object mapping variable names to the answer\'s numeric values\n'
+        "\n"
+        "Z3 syntax allowed in constraint strings (use these EXACT names, no z3. prefix):\n"
+        "  Arithmetic: + - * / == != > < >= <=\n"
+        "  Boolean: And(...) Or(...) Not(...) Implies(a, b) If(c, a, b) Xor(a, b)\n"
+        "  Every variable referenced in a constraint MUST be declared in \"variables\".\n"
         "\n"
         "Examples:\n"
         "\n"
@@ -2093,10 +2260,20 @@ class HybridReasoningOrchestrator:
         on any error (network, parse, validation) — the verifier will
         return verified=False (honest — we can't verify what we can't
         parse).
+
+        v3.2: passes LOGIC_CONSTRAINTS_GRAMMAR so the generalist is
+        constrained to valid JSON with the required keys, eliminating
+        the malformed-JSON parse failure mode. The retry loop
+        (_translate_logic_constraints_with_retry) still validates that
+        the constraints parse as Z3 and retries on parse errors — the
+        grammar handles JSON shape, the validator handles Z3 semantics.
         """
         try:
+            from format_enforcer import LOGIC_CONSTRAINTS_GRAMMAR
             prompt = self._LOGIC_CONSTRAINT_PROMPT.format(query=query)
-            response = await self._call_generalist(prompt, max_tokens=512)
+            response = await self._call_generalist(
+                prompt, max_tokens=512, grammar=LOGIC_CONSTRAINTS_GRAMMAR,
+            )
             if not response:
                 return None
             # Extract JSON from the response (it may be wrapped in

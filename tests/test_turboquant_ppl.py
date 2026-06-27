@@ -138,14 +138,28 @@ class TestExtractLogprobs:
 
 
 class TestInProcessContract:
+    def _ruvllm_has_logprobs(self):
+        """Check if ruvllm_py is importable AND exposes logprobs."""
+        try:
+            import ruvllm_py  # type: ignore
+            return bool(getattr(ruvllm_py, "SUPPORTS_LOGPROBS", False))
+        except ImportError:
+            return False
+
     def test_inprocess_raises_not_implemented(self):
-        # The in-process path is intentionally stubbed until Engine exposes
-        # logprobs. It must fail clearly, not silently return a fake PPL.
+        # The in-process path must fail-closed (NotImplementedError) when
+        # the binding is absent or stubbed (no logprobs capability). When
+        # the binding HAS logprobs, this test is covered by
+        # test_inprocess_logprobs instead.
+        if self._ruvllm_has_logprobs():
+            pytest.skip("ruvllm_py has logprobs — see test_inprocess_logprobs")
         with pytest.raises(NotImplementedError):
             ppl.eval_inprocess("model.gguf", "hello world")
 
     def test_inprocess_does_not_return_fake_ppl(self):
         # Fail-closed contract: never fabricate a PPL value.
+        if self._ruvllm_has_logprobs():
+            pytest.skip("ruvllm_py has logprobs — see test_inprocess_logprobs")
         try:
             ppl.eval_inprocess("model.gguf", "hello world")
             assert False, "should have raised"
@@ -154,6 +168,33 @@ class TestInProcessContract:
         except Exception:
             # Any exception is acceptable as long as no PplResult is returned.
             pass
+
+    def test_inprocess_logprobs_returns_ppl_result(self):
+        # When ruvllm_py IS built with candle (SUPPORTS_LOGPROBS == True)
+        # and a real GGUF model is available, eval_inprocess should return a
+        # PplResult with real per-token log-probs computed via log_softmax
+        # over the vocabulary. Skips when the binding isn't built or no
+        # model is available.
+        if not self._ruvllm_has_logprobs():
+            pytest.skip(
+                "ruvllm_py not built with candle — no logprobs capability. "
+                "Run: cd ruvllm_py && maturin develop --release --features candle"
+            )
+
+        # A real GGUF model is required for the in-process path. The test
+        # model path comes from an env var so it doesn't hardcode a path.
+        model_path = os.environ.get("RUVLLM_PPL_TEST_MODEL", "")
+        if not model_path or not os.path.isfile(model_path):
+            pytest.skip(
+                "no test model available — set RUVLLM_PPL_TEST_MODEL to a "
+                "GGUF file path (with a tokenizer.json alongside it)"
+            )
+
+        result = ppl.eval_inprocess(model_path, "hello world from the test corpus")
+        assert isinstance(result, ppl.PplResult)
+        assert result.n_tokens > 0
+        assert result.ppl > 0
+        assert result.source == "ruvllm_py"
 
 
 class TestCLI:

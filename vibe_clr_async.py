@@ -288,8 +288,45 @@ class VibeThinkerCLRAsync:
         # Mirrors the code-specialist max_repair_attempts pattern. Fail-closed:
         # if no repair parses, the caller falls back to regex extraction.
         self.max_parse_repairs = max(0, max_parse_repairs)
+        # v3.2: structured-output vs regex-fallback telemetry. Counts how
+        # often the structured JSON path succeeds vs falls back to regex
+        # \boxed{} scraping. The fallback rate = fallback / (success +
+        # fallback) is the metric for the metric-gated rollout: once it
+        # drops below a threshold (e.g. 2%) over a sufficient sample, the
+        # regex fallback can be removed. Until then, keeping the fallback
+        # prevents a single upstream schema bug from marking everything
+        # verified=False. Counters are plain ints (not locks) — they're
+        # updated inside the per-trajectory coroutine which is serialized
+        # by the CLR concurrency limiter; a rare lost increment is
+        # acceptable for a telemetry signal.
+        self._structured_success_count = 0
+        self._structured_fallback_count = 0
         if local_model:
             self._init_local_backend(local_model, local_n_ctx, local_n_threads)
+
+    def structured_fallback_rate(self) -> float:
+        """v3.2: the fraction of structured-output attempts that fell back
+        to regex \\boxed{} scraping.
+
+        Returns 0.0 when no structured attempts have been made yet (no
+        division by zero). The metric-gated rollout removes the regex
+        fallback once this drops below a threshold (e.g. 2%) over a
+        sufficient sample — until then the fallback is kept so a single
+        upstream schema bug doesn't mark everything verified=False.
+        """
+        total = self._structured_success_count + self._structured_fallback_count
+        if total == 0:
+            return 0.0
+        return self._structured_fallback_count / total
+
+    def structured_telemetry(self) -> Dict[str, int]:
+        """v3.2: return the raw telemetry counters for logging/admin."""
+        return {
+            "structured_success": self._structured_success_count,
+            "structured_fallback": self._structured_fallback_count,
+            "total": self._structured_success_count + self._structured_fallback_count,
+            "fallback_rate": round(self.structured_fallback_rate(), 4),
+        }
 
     def _init_local_backend(
         self, local_model: str, n_ctx: int, n_threads: int
@@ -1415,10 +1452,20 @@ class VibeThinkerCLRAsync:
                 parsed = await self._extract_claims_and_answer(session, raw_trace)
                 # Override the answer with the structured one (more reliable).
                 parsed["final_answer"] = final_answer
+                # v3.2: telemetry — structured JSON path succeeded.
+                self._structured_success_count += 1
             else:
                 # Fallback: grammar wasn't enforced or all repairs failed.
                 # Fall back to regex extraction (fail-closed).
                 parsed = await self._extract_claims_and_answer(session, raw_trace)
+                # v3.2: telemetry — structured JSON failed, fell back to
+                # regex. Tracked so the fallback rate can be monitored
+                # before the regex path is removed (metric-gated rollout).
+                self._structured_fallback_count += 1
+                print(f"[CLR] structured-output fallback to regex "
+                      f"(success={self._structured_success_count}, "
+                      f"fallback={self._structured_fallback_count}, "
+                      f"rate={self.structured_fallback_rate():.1%})")
         else:
             reasoning_prompt = (
                 "<|im_start|>user\n"

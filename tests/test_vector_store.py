@@ -195,6 +195,63 @@ class TestMakeVectorStoreFactory:
         )
         assert isinstance(s, ShadowVectorStore)
 
+    @skip_no_embeddings
+    def test_shadow_primary_emits_deprecation_warning(self):
+        """v3.2: ShadowVectorStore is deprecated. Selecting it emits a
+        DeprecationWarning so operators know to migrate to --agentdb-only."""
+        import warnings
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            make_vector_store(
+                agentdb_url="http://127.0.0.1:1",
+                shadow_primary=LocalVectorStore(),
+            )
+        assert any(issubclass(w.category, DeprecationWarning) for w in caught)
+
+    def test_ruvllm_preferred_when_available_and_dim_given(self, monkeypatch):
+        """v3.2: when the ruvllm_py HNSW binding is available AND dim is
+        provided AND no agentdb_url, RuvLLMVectorStore is preferred over
+        LocalVectorStore."""
+        import sys, types
+        # Inject a fake ruvllm_py with HnswIndex so
+        # is_ruvllm_vector_store_available() returns True.
+        fake = types.ModuleType("ruvllm_py")
+        class _HnswIndex:
+            def __init__(self, **kw): pass
+            def add(self, *a, **kw): pass
+            def search(self, *a, **kw): return []
+            def stats(self): return {"total_vectors": 0}
+        fake.HnswIndex = _HnswIndex
+        monkeypatch.setitem(sys.modules, "ruvllm_py", fake)
+        from vector_store import RuvLLMVectorStore
+        s = make_vector_store(dim=384)
+        assert isinstance(s, RuvLLMVectorStore)
+
+    def test_ruvllm_not_selected_without_dim(self, monkeypatch):
+        """v3.2: without dim, RuvLLMVectorStore can't be constructed (HNSW
+        needs the dimension), so we fall back to LocalVectorStore even
+        if the binding is available."""
+        import sys, types
+        fake = types.ModuleType("ruvllm_py")
+        class _HnswIndex:
+            def __init__(self, **kw): pass
+        fake.HnswIndex = _HnswIndex
+        monkeypatch.setitem(sys.modules, "ruvllm_py", fake)
+        s = make_vector_store()  # no dim
+        assert isinstance(s, LocalVectorStore)
+
+    def test_prefer_ruvllm_false_forces_local(self, monkeypatch):
+        """v3.2: prefer_ruvllm=False forces LocalVectorStore even when
+        the binding is available and dim is given."""
+        import sys, types
+        fake = types.ModuleType("ruvllm_py")
+        class _HnswIndex:
+            def __init__(self, **kw): pass
+        fake.HnswIndex = _HnswIndex
+        monkeypatch.setitem(sys.modules, "ruvllm_py", fake)
+        s = make_vector_store(dim=384, prefer_ruvllm=False)
+        assert isinstance(s, LocalVectorStore)
+
 
 @skip_no_embeddings
 class TestVectorStoreClustering:

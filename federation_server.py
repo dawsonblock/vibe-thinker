@@ -254,6 +254,156 @@ FederationState = InMemoryFederationState
 
 
 # ---------------------------------------------------------------------------
+# Sybil-resistant node reputation (v3.2)
+# ---------------------------------------------------------------------------
+
+# Reputation is bound to the mTLS client cert's cryptographic identity, NOT
+# the self-asserted ``worker_id``. This prevents a Sybil attack where a
+# single bad node mints many ``worker_id``s to inflate its influence: a new
+# cert = a new identity = a fresh reputation, but one cert cannot have many
+# reputations. The cert identity is the cert's subject Common Name when
+# available, falling back to a SHA-256 fingerprint of the DER cert. When the
+# federation is run WITHOUT mTLS (dev mode), there is no cert and reputation
+# is keyed on the raw ``worker_id`` — clearly weaker, but documented as such.
+
+# Reputation update weights. Outcomes are extracted from the ``result``
+# payload submitted to /complete. The ``verified`` field is the orchestrator's
+# independent verification verdict (not the worker's self-claim).
+_REP_WEIGHT_VERIFIED_TRUE = +1.0   # independently verified correct
+_REP_WEIGHT_VERIFIED_FALSE = -2.0  # failed verification (hallucination / wrong)
+_REP_WEIGHT_ERROR = -1.0           # crashed / timed out (less bad than hallucination)
+# Exponential moving average decay. New outcomes weigh alpha; history weighs
+# (1-alpha). alpha=0.3 means a node needs ~3 consecutive bad outcomes to
+# drop from 1.0 to ~0.4 — resistant to a single fluke, responsive to a
+# pattern of failure.
+_REP_EMA_ALPHA = 0.3
+# Default reputation for a newly-seen identity. Slightly below 1.0 so a new
+# node earns trust rather than starting with maximum influence.
+_REP_DEFAULT = 0.7
+# Below this reputation, a node's SONA gossip imports are downweighted to 0
+# (its patterns are not broadcast to the swarm). Above it, the downweight
+# factor is the reputation itself (so a 0.5-rep node's patterns count half).
+_REP_GOSSIP_FLOOR = 0.3
+
+
+class ReputationStore:
+    """In-memory Sybil-resistant node reputation.
+
+    Reputation is an EMA in [0, 1] keyed on the mTLS cert identity (or the
+    raw worker_id when mTLS is not used). ``record_outcome`` updates the
+    score; ``downweight_factor`` returns the multiplier to apply to a node's
+    SONA gossip imports (0 below the floor, else the score itself).
+
+    Thread-safe via an asyncio.Lock. Pluggable: a Redis-backed
+    implementation would store per-identity EMAs in Redis hashes.
+    """
+
+    def __init__(self, alpha: float = _REP_EMA_ALPHA,
+                 default: float = _REP_DEFAULT,
+                 floor: float = _REP_GOSSIP_FLOOR):
+        self._scores: Dict[str, float] = {}
+        self._counts: Dict[str, int] = {}
+        self._lock = asyncio.Lock()
+        self._alpha = alpha
+        self._default = default
+        self._floor = floor
+
+    async def record_outcome(self, identity: str, weight: float) -> float:
+        """Update the EMA for ``identity`` by ``weight`` (signed).
+
+        Returns the new score in [0, 1]. A weight of +1 nudges up, −2
+        nudges down sharply. The EMA is clamped to [0, 1] so scores stay
+        interpretable as a trust fraction.
+        """
+        async with self._lock:
+            prev = self._scores.get(identity, self._default)
+            # Treat the signed weight as a target delta: new = prev + alpha*weight,
+            # clamped. This is a smoothed additive update — simpler and more
+            # interpretable than a true EMA of an outcome stream.
+            new = max(0.0, min(1.0, prev + self._alpha * weight))
+            self._scores[identity] = new
+            self._counts[identity] = self._counts.get(identity, 0) + 1
+            return new
+
+    async def get_score(self, identity: str) -> float:
+        async with self._lock:
+            return self._scores.get(identity, self._default)
+
+    async def downweight_factor(self, identity: str) -> float:
+        """Multiplier in [0, 1] to apply to a node's SONA gossip imports.
+
+        0.0 below the floor (patterns discarded), else the score itself
+        (a 0.5-rep node's patterns count at half weight).
+        """
+        score = await self.get_score(identity)
+        return 0.0 if score < self._floor else score
+
+    async def snapshot(self) -> Dict[str, Dict[str, float]]:
+        """Return {identity: {score, count}} for diagnostics/admin."""
+        async with self._lock:
+            return {
+                ident: {"score": s, "count": self._counts.get(ident, 0)}
+                for ident, s in self._scores.items()
+            }
+
+
+def _extract_identity(req: Request, worker_id: str) -> str:
+    """Extract the Sybil-resistant identity for a federation request.
+
+    Prefer the mTLS client cert subject CN; fall back to the cert's
+    SHA-256 fingerprint; fall back to the raw worker_id when no cert is
+    present (dev mode without mTLS — documented as weaker).
+
+    The cert is available on ``req.scope['ssl']`` or via the ASGI
+    ``client_cert`` scope key depending on the server. uvicorn populates
+    ``request.scope.get('ssl', {})`` with a dict including ``subject``
+    (a tuple of RDNs) when mTLS is configured with ssl_cert_reqs.
+    """
+    scope = req.scope if hasattr(req, "scope") else {}
+    ssl_info = scope.get("ssl") or {}
+    if isinstance(ssl_info, dict):
+        # uvicorn/hypercorn style: {"subject": ((("commonName","node-A"),), ...)}
+        subject = ssl_info.get("subject")
+        if subject:
+            # subject is a tuple of RDN sequences; flatten to find CN.
+            for rdn_seq in subject:
+                for rdn in rdn_seq:
+                    if len(rdn) >= 2 and rdn[0].lower() == "commonname":
+                        return f"cn:{rdn[1]}"
+        # Fall back to a binary cert fingerprint if present.
+        cert_der = ssl_info.get("cert") or ssl_info.get("peer_cert")
+        if cert_der:
+            import hashlib
+            if isinstance(cert_der, str):
+                cert_der = cert_der.encode("utf-8")
+            return "fp:" + hashlib.sha256(cert_der).hexdigest()[:16]
+    # No cert — dev mode. Key on worker_id but mark it so it's clear this
+    # is the weaker trust model.
+    return f"wid:{worker_id}"
+
+
+def _outcome_weight_from_result(result: Optional[Dict], error: Optional[str]) -> float:
+    """Map a /complete payload to a reputation update weight.
+
+    A non-None error is a crash/timeout (weight -1). Otherwise we look at
+    result.verified (the orchestrator's INDEPENDENT verdict — never the
+    worker's self-claim): True -> +1, False -> -2 (hallucination is the
+    worst outcome). An absent verified field is treated as neutral (0)
+    so a result with no verification signal doesn't move the needle.
+    """
+    if error:
+        return _REP_WEIGHT_ERROR
+    if not isinstance(result, dict):
+        return 0.0
+    verified = result.get("verified")
+    if verified is True:
+        return _REP_WEIGHT_VERIFIED_TRUE
+    if verified is False:
+        return _REP_WEIGHT_VERIFIED_FALSE
+    return 0.0
+
+
+# ---------------------------------------------------------------------------
 # Redis-backed HA federation state (v1.2)
 # ---------------------------------------------------------------------------
 
@@ -706,6 +856,13 @@ def create_federation_app(
     if state is None:
         state = InMemoryFederationState()
 
+    # v3.2: Sybil-resistant node reputation. Bound to the mTLS cert
+    # identity (see _extract_identity). /complete updates it from the
+    # result's independent `verified` verdict; /api/sona/sync downweights
+    # a low-reputation node's gossip imports so its hallucinated patterns
+    # don't propagate to the swarm.
+    reputation = ReputationStore()
+
     # Security middleware: API key auth, CORS, rate limiting, body size.
     configure_security(
         app,
@@ -833,6 +990,19 @@ def create_federation_app(
         ok = await state.complete(job_id, result=result, error=error)
         if not ok:
             return JSONResponse({"error": "job not found"}, status_code=404)
+        # v3.2: record the outcome against the completing node's
+        # reputation. Identity is the mTLS cert subject (Sybil-resistant)
+        # or the raw worker_id in dev mode without mTLS. The weight is
+        # derived from the result's INDEPENDENT `verified` verdict, not
+        # the worker's self-claim — so a node that lies about its own
+        # success loses reputation when verification disagrees.
+        worker_id = body.get("worker_id", "unknown")
+        identity = _extract_identity(req, worker_id)
+        weight = _outcome_weight_from_result(result, error)
+        if weight != 0.0:
+            new_score = await reputation.record_outcome(identity, weight)
+            print(f"[Federation] reputation: {identity} -> {new_score:.3f} "
+                  f"(weight {weight:+.1f})")
         return {"status": "ok"}
 
     # Phase 4.2: Heartbeat endpoint — workers call this periodically
@@ -957,10 +1127,44 @@ def create_federation_app(
             stats = {}
 
         # Merge patterns into the global set (dedup by pattern ID).
-        for p in patterns:
-            pid = str(p.get("id", ""))
-            if pid:
+        # v3.2: downweight by the exporting node's reputation. A node
+        # below _REP_GOSSIP_FLOOR contributes nothing (its hallucinated
+        # patterns don't propagate); a mid-reputation node contributes at
+        # reduced weight. The downweight factor is recorded on each
+        # pattern so consumers can see it and the merge is still by ID
+        # (a high-rep node's pattern overrides a low-rep node's same-ID
+        # pattern).
+        identity = _extract_identity(req, worker_id)
+        downweight = await reputation.downweight_factor(identity)
+        imported = 0
+        skipped = 0
+        if downweight <= 0.0:
+            skipped = len(patterns)
+            print(f"[Federation] SONA: discarding {skipped} patterns from "
+                  f"{identity} (reputation below floor)")
+        else:
+            for p in patterns:
+                pid = str(p.get("id", ""))
+                if not pid:
+                    continue
+                # Tag the pattern with the contributor's reputation
+                # downweight so downstream consumers can weight it.
+                p = dict(p)
+                p["_reputation_weight"] = downweight
+                # If a higher-reputation node already contributed this
+                # pattern ID, don't let a lower-reputation node overwrite
+                # it. Compare existing weight if present.
+                existing = _sona_global_patterns.get(pid)
+                if existing:
+                    existing_w = existing.get("_reputation_weight", 1.0)
+                    if downweight < existing_w:
+                        skipped += 1
+                        continue
                 _sona_global_patterns[pid] = p
+                imported += 1
+            if downweight < 1.0:
+                print(f"[Federation] SONA: imported {imported} patterns "
+                      f"from {identity} at downweight {downweight:.2f}")
 
         _sona_worker_stats[worker_id] = stats
 
@@ -968,6 +1172,9 @@ def create_federation_app(
             "status": "ok",
             "global_pattern_count": len(_sona_global_patterns),
             "worker_count": len(_sona_worker_stats),
+            "imported": imported,
+            "skipped": skipped,
+            "reputation_downweight": round(downweight, 3),
         }
 
     @app.get("/api/sona/sync")
@@ -985,6 +1192,16 @@ def create_federation_app(
             "worker_stats": _sona_worker_stats,
             "total_patterns": len(_sona_global_patterns),
         })
+
+    @app.get("/api/reputation")
+    async def get_reputation():
+        """v3.2: diagnostic endpoint — per-identity reputation snapshot.
+
+        Returns {identities: {identity: {score, count}}}. Useful for
+        admins to see which nodes are being downweighted and why. The
+        reputation is keyed on mTLS cert identity (Sybil-resistant).
+        """
+        return {"identities": await reputation.snapshot()}
 
     return app
 

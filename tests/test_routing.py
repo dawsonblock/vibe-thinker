@@ -363,9 +363,10 @@ class TestCodeSpecialistRouting:
 
     @pytest.mark.asyncio
     async def test_code_task_no_test_spec_static_analysis_fallback(self):
-        """v3.1: When no test spec but no sandbox is available, the AST
-        static analysis fallback assigns a partial heuristic score (0.4)
-        if the code parses cleanly with no restricted imports."""
+        """v3.2: When no test spec and no sandbox is available, the AST
+        static analysis fallback is GATED OFF by default — the route
+        returns code_specialist_unverified with score 0.0 (not the old
+        0.4 heuristic). AST is not a security boundary."""
         o = HybridReasoningOrchestrator(
             vibe_endpoint="http://localhost:0",
             generalist_endpoint="http://localhost:0",
@@ -374,17 +375,46 @@ class TestCodeSpecialistRouting:
             use_embedding_router=False,
             use_clr_cache=False,
             use_trajectory_store=False,
+            # default: allow_static_fallback=False
         )
         o._generate_test_spec = AsyncMock(return_value=None)
         o._call_code_specialist = AsyncMock(return_value="def square(n): return n*n")
         # Mock the sandbox fallback to return (None, []) — no sandbox
-        # available — so the code falls through to AST static analysis.
+        # available — so the code falls through to the static gate.
         async def _mock_sandbox(code, code_verifier=None):
             return (None, [])
         with patch("hybrid_orchestrator._wasmtime_sandbox_fallback", _mock_sandbox):
             result = await o.run("Write a Python function to square a number")
-        assert result.route_taken == "code_specialist_static_analysis"
-        assert result.clr_score == 0.4
+        assert result.route_taken == "code_specialist_unverified"
+        assert result.clr_score == 0.0
+        o._call_code_specialist.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_code_task_static_analysis_fallback_when_enabled(self):
+        """v3.2: When allow_static_fallback=True (local dev), no sandbox,
+        clean code -> the AST fallback runs and emits the renamed route
+        'code_specialist_unverified_static_only' with a 0.2 heuristic
+        (lowered from the old 0.4) and verified=False."""
+        o = HybridReasoningOrchestrator(
+            vibe_endpoint="http://localhost:0",
+            generalist_endpoint="http://localhost:0",
+            code_specialist_endpoint="http://127.0.0.1:8082",
+            use_clr=True,
+            use_embedding_router=False,
+            use_clr_cache=False,
+            use_trajectory_store=False,
+            allow_static_fallback=True,
+        )
+        o._generate_test_spec = AsyncMock(return_value=None)
+        o._call_code_specialist = AsyncMock(return_value="def square(n): return n*n")
+        async def _mock_sandbox(code, code_verifier=None):
+            return (None, [])
+        with patch("hybrid_orchestrator._wasmtime_sandbox_fallback", _mock_sandbox):
+            result = await o.run("Write a Python function to square a number")
+        assert result.route_taken == "code_specialist_unverified_static_only"
+        assert result.clr_score == 0.2
+        assert result.raw_traces["verified"] is False
+        assert result.raw_traces["static_analysis"] is True
         o._call_code_specialist.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -1004,6 +1034,64 @@ class TestExtractPythonBlock:
         result = HybridReasoningOrchestrator._extract_python_block(text)
         assert "also not valid" in result
 
+    # --- v3.2: CommonMark-aware fence matching ------------------------- #
+
+    def test_four_backtick_opener_closed_by_four(self):
+        """CommonMark: a `````` opener must be closed by >=4 backticks
+        with no info string. A ``` line inside is literal content."""
+        text = "````python\nx = 1\n```\nstill in block\n````"
+        result = HybridReasoningOrchestrator._extract_python_block(text)
+        # The ``` line is literal content, so the block contains all of it.
+        assert "x = 1" in result
+        assert "still in block" in result
+
+    def test_closing_fence_with_info_string_is_content(self):
+        """CommonMark: a closing fence must have NO info string. A line
+        like ```python inside an open block is literal content, not a
+        close — so the block continues until a bare fence appears."""
+        text = "```python\nx = 1\n```python\ny = 2\n```"
+        result = HybridReasoningOrchestrator._extract_python_block(text)
+        # The ```python line in the middle is literal content; the block
+        # closes at the final bare ```. Result parses as valid Python.
+        assert "x = 1" in result
+        assert "y = 2" in result
+
+    def test_nested_backticks_in_explanation_do_not_close(self):
+        """v3.2 regression: the old matcher toggled on any ```-prefixed
+        line, so an inline `` `os.getcwd()` `` or a fenced sub-example in
+        the model's reasoning could swallow real code. The CommonMark
+        matcher requires the closer to have no info string, so an inner
+        ```bash inside a python block (which the model might emit as an
+        example command in its reasoning) does NOT close the block."""
+        text = (
+            "```python\n"
+            "# Example: don't run this in your shell:\n"
+            "# ```bash\n"
+            "# rm -rf /tmp/old\n"
+            "# ```\n"
+            "def clean(tmpdir):\n"
+            "    return sorted(tmpdir)\n"
+            "```"
+        )
+        result = HybridReasoningOrchestrator._extract_python_block(text)
+        # The whole python block survives — the inner ```bash / ``` lines
+        # are literal comment content, not fence toggles.
+        assert "def clean" in result
+        assert "rm -rf" in result
+
+    def test_indented_fence_up_to_three_spaces(self):
+        """CommonMark: up to 3 leading spaces are allowed on a fence."""
+        text = "   ```python\nx = 1\n   ```"
+        result = HybridReasoningOrchestrator._extract_python_block(text)
+        assert result == "x = 1"
+
+    def test_info_string_with_extra_args_ignored_after_first_token(self):
+        """CommonMark: only the first whitespace-delimited token of the
+        info string is the language tag; the rest is ignored."""
+        text = "```python title=\"solution\"\nx = 1\n```"
+        result = HybridReasoningOrchestrator._extract_python_block(text)
+        assert result == "x = 1"
+
 
 class TestLogicTranslationRetry:
     """Phase 3.2: Z3/SMT translation retry loop tests."""
@@ -1110,4 +1198,25 @@ class TestLogicTranslationRetry:
         second_call_args = o._translate_logic_constraints.call_args_list[1]
         query_arg = second_call_args[0][0]  # positional arg
         assert "Z3 PARSE ERROR" in query_arg or "parse" in query_arg.lower()
+
+    @pytest.mark.asyncio
+    async def test_translation_passes_logic_grammar(self):
+        """v3.2: _translate_logic_constraints passes LOGIC_CONSTRAINTS_GRAMMAR
+        to _call_generalist so the generalist is constrained to valid JSON
+        with the constraints/variables/values keys."""
+        from format_enforcer import LOGIC_CONSTRAINTS_GRAMMAR
+        o = self._make_orch()
+        # Mock _call_generalist to return a valid JSON response and
+        # capture the grammar kwarg it was called with.
+        o._call_generalist = AsyncMock(return_value=(
+            '{"constraints": ["x > 0"], '
+            '"variables": {"x": "Int"}, '
+            '"values": {"x": 5}}'
+        ))
+        result = await o._translate_logic_constraints("test problem")
+        assert result is not None
+        assert result["constraints"] == ["x > 0"]
+        # The grammar kwarg must be the LOGIC_CONSTRAINTS_GRAMMAR.
+        call_kwargs = o._call_generalist.call_args.kwargs
+        assert call_kwargs.get("grammar") == LOGIC_CONSTRAINTS_GRAMMAR
 

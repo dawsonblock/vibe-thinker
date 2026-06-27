@@ -1,0 +1,361 @@
+# =============================================================================
+# vibe-thinker unified Docker deployment stack
+# =============================================================================
+# Bundles the sidecars the orchestrator normally requires you to run by hand:
+#   - redis    : federation heartbeat/reaping + web UI Pub/Sub fan-out
+#   - envoy    : SNI-aware egress proxy sidecar (sandbox egress filtering)
+#   - agentdb  : RuFlo/AgentDB vector store sidecar (HTTP /v1/vector/search)
+#   - orchestrator: the vibe-thinker control plane (python3 rfsn_cli.py)
+#
+# Pick a topology with a single --profile flag:
+#   --profile cpu     : CPU-only orchestrator pointing at an external/host LLM URL
+#   --profile gpu     : orchestrator + a GPU llama.cpp inference server
+#   --profile ruvllm  : orchestrator + a RuvLLM inference server (build from ruvllm_py/)
+#
+# The redis/envoy/agentdb sidecars are in the base compose file (no profile),
+# so they always start regardless of which --profile you pass.
+#
+# Quick start (CPU, external LLM):
+#   VIBE_THINKER_URL=http://host.docker.internal:8080 \
+#   GENERALIST_URL=http://host.docker.internal:8081 \
+#   docker compose --profile cpu up
+#
+# Env var -> CLI flag mapping (verified in rfsn_cli.py build_argparser):
+#   VIBE_THINKER_URL            -> --vibe              (rfsn_cli.py:351)
+#   GENERALIST_URL              -> --generalist        (rfsn_cli.py:402)
+#   CODE_SPECIALIST_URL         -> --code-specialist   (rfsn_cli.py:405)
+#   RUVLLM_URL                  -> --ruvllm-url        (rfsn_cli.py:476)
+#   AGENTDB_URL                 -> --agentdb-url       (rfsn_cli.py:538)
+#   VIBE_THINKER_AGENTDB_ONLY   -> --agentdb-only      (rfsn_cli.py:545)
+#   RFSN_ENVOY_SIDECAR          -> --envoy-sidecar     (rfsn_cli.py:655)
+#   RFSN_PROXY_EGRESS           -> --proxy-egress      (rfsn_cli.py:641)
+#   RFSN_NETWORK_ALLOWLIST      -> --network-allowlist (rfsn_cli.py:616)
+#   FEDERATION_URL              -> --federation-url    (rfsn_cli.py:556)
+#   RFSN_MAX_CONCURRENT         -> --max-concurrent    (rfsn_cli.py:431)
+#   RFSN_USE_CLR                -> --clr/--no-clr      (rfsn_cli.py:437)
+#   RFSN_CLR_K                  -> --clr-k             (rfsn_cli.py:439)
+#   RFSN_USE_EMBEDDING_ROUTER   -> --embedding-router  (rfsn_cli.py:671)
+#   RFSN_USE_TRAJECTORY_STORE   -> --trajectory-store  (rfsn_cli.py:426)
+#   TRAJECTORY_STORE_PATH       -> --trajectory-store-path (rfsn_cli.py:428)
+#   RFSN_AUDIT_LOG              -> --audit-log         (rfsn_cli.py:508)
+#   VIBE_THINKER_LOCAL_MODEL    -> --local-specialist-model (rfsn_cli.py:450)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Shared default environment for the orchestrator. Override anything here on
+# the `docker compose` command line, e.g.
+#   docker compose --profile cpu up -e VIBE_THINKER_URL=http://10.0.0.5:8080
+# -----------------------------------------------------------------------------
+x-orchestrator-env: &orchestrator-env
+  # --- LLM endpoints (see profile-specific overrides below) ---
+  VIBE_THINKER_URL: ${VIBE_THINKER_URL:-http://127.0.0.1:8080}
+  GENERALIST_URL: ${GENERALIST_URL:-http://127.0.0.1:8081}
+  CODE_SPECIALIST_URL: ${CODE_SPECIALIST_URL:-}
+  RUVLLM_URL: ${RUVLLM_URL:-}
+  # Specialist transport for OpenAI-compatible / Anthropic providers.
+  VIBE_THINKER_SPECIALIST_TRANSPORT: ${VIBE_THINKER_SPECIALIST_TRANSPORT:-completion}
+  VIBE_THINKER_SPECIALIST_API_KEY: ${VIBE_THINKER_SPECIALIST_API_KEY:-}
+  VIBE_THINKER_SPECIALIST_MODEL_NAME: ${VIBE_THINKER_SPECIALIST_MODEL_NAME:-}
+  # --- Vector store (AgentDB sidecar) ---
+  # Points at the agentdb service below. Port 8088 + POST /v1/vector/search
+  # is what AgentDBVectorStore calls (vector_store.py:299,405).
+  AGENTDB_URL: ${AGENTDB_URL:-http://agentdb:8088}
+  VIBE_THINKER_AGENTDB_ONLY: ${VIBE_THINKER_AGENTDB_ONLY:-false}
+  # --- Egress proxy (Envoy sidecar) ---
+  # RFSN_ENVOY_SIDECAR set to any non-empty value enables --envoy-sidecar
+  # (rfsn_cli.py:655: default = os.environ.get("RFSN_ENVOY_SIDECAR", "") != "").
+  # RFSN_PROXY_EGRESS points the sandbox at the envoy listener
+  # (envoy_sidecar.py: listen_port default 8888; docker_executor.py:74
+  #  DEFAULT_PROXY_EGRESS = "127.0.0.1:8888").
+  RFSN_ENVOY_SIDECAR: ${RFSN_ENVOY_SIDECAR:-1}
+  RFSN_PROXY_EGRESS: ${RFSN_PROXY_EGRESS:-envoy:8888}
+  # Allow-list of domains the sandbox may reach. EDIT THIS for your workload.
+  # Empty = deny all egress (fail-closed, same as --network=none).
+  RFSN_NETWORK_ALLOWLIST: ${RFSN_NETWORK_ALLOWLIST:-pypi.org:443,files.pythonhosted.org:443}
+  RFSN_DNS_RESOLVER: ${RFSN_DNS_RESOLVER:-}
+  # --- Federation (Redis-backed coordinator state) ---
+  # The federation coordinator URL. When set, jobs are published to the swarm.
+  # Leave empty for single-node. Redis is always started for the web UI Pub/Sub
+  # fan-out and federation heartbeat/reaping (redis://redis:6379/0,
+  # federation_server.py:384).
+  FEDERATION_URL: ${FEDERATION_URL:-}
+  # --- Job queue / CLR / routing ---
+  RFSN_MAX_CONCURRENT: ${RFSN_MAX_CONCURRENT:-2}
+  RFSN_USE_CLR: ${RFSN_USE_CLR:-true}
+  RFSN_CLR_K: ${RFSN_CLR_K:-8}
+  RFSN_USE_EMBEDDING_ROUTER: ${RFSN_USE_EMBEDDING_ROUTER:-true}
+  RFSN_USE_TRAJECTORY_STORE: ${RFSN_USE_TRAJECTORY_STORE:-true}
+  TRAJECTORY_STORE_PATH: ${TRAJECTORY_STORE_PATH:-/data/verified_trajectories.json}
+  RFSN_AUDIT_LOG: ${RFSN_AUDIT_LOG:-/data/rfsn_jobs_bitemporal.jsonl}
+  # --- Local in-process specialist (optional; for --local-specialist-model) ---
+  VIBE_THINKER_LOCAL_MODEL: ${VIBE_THINKER_LOCAL_MODEL:-}
+  VIBE_THINKER_LOCAL_N_CTX: ${VIBE_THINKER_LOCAL_N_CTX:-4096}
+  VIBE_THINKER_LOCAL_N_THREADS: ${VIBE_THINKER_LOCAL_N_THREADS:-8}
+  VIBE_THINKER_LOCAL_POOL_SIZE: ${VIBE_THINKER_LOCAL_POOL_SIZE:-1}
+  # --- Sandbox image for code verification ---
+  RFSN_SANDBOX_IMAGE: ${RFSN_SANDBOX_IMAGE:-vibe-thinker-sandbox:latest}
+
+services:
+  # ---------------------------------------------------------------------------
+  # Redis — federation heartbeat/reaping + web UI Pub/Sub.
+  #   Default URL in code: redis://localhost:6379/0 (federation_server.py:384)
+  #   Port 6379 is the Redis default.
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    ports:
+      - "6379:6379"
+
+  # ---------------------------------------------------------------------------
+  # Envoy sidecar — SNI-aware egress proxy for the code sandbox.
+  #   Listener: 0.0.0.0:8888  (envoy_sidecar.py:63 listen_port default 8888)
+  #   Admin:    127.0.0.1:9901 (envoy_sidecar.py:65 admin_port default 9901)
+  #   The sandbox routes traffic through HTTP_PROXY=envoy:8888
+  #   (docker_executor.py:74 DEFAULT_PROXY_EGRESS = "127.0.0.1:8888").
+  #   Config is generated from a network allow-list; the static config below
+  #   is a minimal passthrough that you should tighten for production.
+  # ---------------------------------------------------------------------------
+  envoy:
+    image: envoyproxy/envoy:v1.30-latest
+    restart: unless-stopped
+    command: ["-c", "/etc/envoy/envoy.yaml", "--log-level", "info"]
+    volumes:
+      - ./docker/envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
+    ports:
+      - "8888:8888"
+      - "9901:9901"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:9901/server_info"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ---------------------------------------------------------------------------
+  # AgentDB — RuFlo/AgentDB vector store sidecar.
+  #   HTTP endpoint the orchestrator calls: POST /v1/vector/search
+  #   (vector_store.py:405; base_url example http://127.0.0.1:8088 at :299).
+  #   Port 8088 is the conventional AgentDB port referenced in the CLI help
+  #   (rfsn_cli.py:540) and the finalize-migration example (rfsn_cli.py:882).
+  #
+  #   IMPORTANT: There is NO published AgentDB Docker image on Docker Hub as of
+  #   writing. The build: context below points at docker/agentdb.Dockerfile,
+  #   which is a PLACEHOLDER. You MUST supply a real AgentDB binary/image from
+  #   the ruvnet/ruflo project (https://github.com/ruvnet/ruflo) before this
+  #   service will actually serve vector searches. Until then the orchestrator
+  #   fail-closes: AgentDBVectorStore returns [] when the sidecar is down
+  #   (vector_store.py:46-57) and reads fall back to local in-memory numpy.
+  # ---------------------------------------------------------------------------
+  agentdb:
+    build:
+      context: ./docker
+      dockerfile: agentdb.Dockerfile
+    restart: unless-stopped
+    volumes:
+      - agentdb-data:/data
+    ports:
+      - "8088:8088"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8088/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # vibe-thinker orchestrator (CPU profile).
+  #   Runs: python3 rfsn_cli.py
+  #   All CLI flags are read from VIBE_THINKER_* / RFSN_* env vars
+  #   (see x-orchestrator-env above). Point VIBE_THINKER_URL / GENERALIST_URL
+  #   at an external or host LLM server (e.g. a llama-server on the host).
+  # ---------------------------------------------------------------------------
+  orchestrator:
+    image: vibe-thinker:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    profiles: ["cpu"]
+    environment: *orchestrator-env
+    depends_on:
+      redis:
+        condition: service_healthy
+      envoy:
+        condition: service_healthy
+      agentdb:
+        condition: service_started
+    volumes:
+      - orchestrator-data:/data
+      # Mount the Docker socket so the code sandbox (WarmDockerPool) can spawn
+      # verification containers. Remove if you don't use code verification.
+      - /var/run/docker.sock:/var/run/docker.sock
+    stdin_open: true
+    tty: true
+
+  # ---------------------------------------------------------------------------
+  # GPU llama.cpp inference server (gpu profile).
+  #   Serves an OpenAI-compatible /completion endpoint for the specialist
+  #   (--vibe) AND the generalist on separate ports. The orchestrator points
+  #   VIBE_THINKER_URL at this server's :8080 and GENERALIST_URL at :8081.
+  #
+  #   IMPORTANT: You MUST supply a real .gguf model file. Mount it into the
+  #   container and set LLAMA_MODEL_PATH (default /models/model.gguf). The
+  #   public ghcr.io/llama.cpp/llama-server image is used; see
+  #   https://github.com/ggml-org/llama.cpp for builds and GPU support.
+  # ---------------------------------------------------------------------------
+  llama-server:
+    image: ghcr.io/llama.cpp/llama-server:latest
+    restart: unless-stopped
+    profiles: ["gpu"]
+    # GPU reservation — requires Docker with NVIDIA Container Toolkit
+    # (nvidia-container-toolkit) and `docker --gpus` / CDI support.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      # Path inside the container to the .gguf model (mount it via volumes).
+      LLAMA_MODEL_PATH: ${LLAMA_MODEL_PATH:-/models/model.gguf}
+      LLAMA_N_CTX: ${LLAMA_N_CTX:-4096}
+      LLAMA_N_GPU_LAYERS: ${LLAMA_N_GPU_LAYERS:-99}
+    volumes:
+      # Mount your model directory here, e.g. /host/models:/models
+      - ${LLAMA_MODEL_DIR:-./models}:/models:ro
+    ports:
+      # specialist endpoint (VIBE_THINKER_URL)
+      - "8080:8080"
+      # generalist endpoint (GENERALIST_URL)
+      - "8081:8081"
+    command:
+      - "--model"
+      - "${LLAMA_MODEL_PATH:-/models/model.gguf}"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8080"
+      - "--n-gpu-layers"
+      - "${LLAMA_N_GPU_LAYERS:-99}"
+      - "--ctx-size"
+      - "${LLAMA_N_CTX:-4096}"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 60s
+
+  orchestrator-gpu:
+    image: vibe-thinker:latest
+    restart: unless-stopped
+    profiles: ["gpu"]
+    environment:
+      <<: *orchestrator-env
+      # Override to point at the GPU llama-server in this stack.
+      VIBE_THINKER_URL: http://llama-server:8080
+      GENERALIST_URL: http://llama-server:8081
+    depends_on:
+      redis:
+        condition: service_healthy
+      envoy:
+        condition: service_healthy
+      agentdb:
+        condition: service_started
+      llama-server:
+        condition: service_healthy
+    volumes:
+      - orchestrator-data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    stdin_open: true
+    tty: true
+
+  # ---------------------------------------------------------------------------
+  # RuvLLM inference server (ruvllm profile).
+  #   RuvLLM is a Rust inference engine with TurboQuant KV cache compression
+  #   that exposes the same OpenAI-compatible /completion API as llama-server.
+  #   The orchestrator points RUVLLM_URL at it (rfsn_cli.py:476 -> --ruvllm-url,
+  #   which overrides --vibe at rfsn_cli.py:681).
+  #
+  #   IMPORTANT: There is NO published RuvLLM Docker image. The build: context
+  #   below points at ruvllm_py/ (the PyO3/maturin Rust crate). You MUST build
+  #   it yourself first:
+  #     cd ruvllm_py && cargo build --release --features candle   # CPU
+  #     # or: cargo build --release --features inference-metal      # Apple Silicon
+  #   then wrap it in an image (see docker/ruvllm.Dockerfile pattern), or set
+  #   RUVLLM_IMAGE to a pre-built image name. Until a real image is supplied,
+  #   this service will fail to start — the orchestrator fail-closes to the
+  #   HTTP path (ruvllm_adapter.py documents the same OpenAI API shape).
+  # ---------------------------------------------------------------------------
+  ruvllm:
+    # Env-var-driven image: set RUVLLM_IMAGE to your built image, e.g.
+    #   RUVLLM_IMAGE=ruvllm:latest docker compose --profile ruvllm up
+    # If unset, we try to build from ruvllm_py/ (placeholder — see comment
+    # above; a real Dockerfile for the Rust crate must be supplied).
+    image: ${RUVLLM_IMAGE:-ruvllm:latest}
+    build:
+      context: ./ruvllm_py
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    profiles: ["ruvllm"]
+    environment:
+      RUVLLM_MODEL_PATH: ${RUVLLM_MODEL_PATH:-/models/model.gguf}
+      RUVLLM_PORT: ${RUVLLM_PORT:-8080}
+    volumes:
+      - ${RUVLLM_MODEL_DIR:-./models}:/models:ro
+    ports:
+      - "8080:8080"
+    command:
+      - "--model"
+      - "${RUVLLM_MODEL_PATH:-/models/model.gguf}"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "${RUVLLM_PORT:-8080}"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 60s
+
+  orchestrator-ruvllm:
+    image: vibe-thinker:latest
+    restart: unless-stopped
+    profiles: ["ruvllm"]
+    environment:
+      <<: *orchestrator-env
+      # RUVLLM_URL overrides --vibe (rfsn_cli.py:681).
+      RUVLLM_URL: http://ruvllm:8080
+      VIBE_THINKER_URL: http://ruvllm:8080
+      GENERALIST_URL: ${GENERALIST_URL:-http://ruvllm:8080}
+    depends_on:
+      redis:
+        condition: service_healthy
+      envoy:
+        condition: service_healthy
+      agentdb:
+        condition: service_started
+      ruvllm:
+        condition: service_healthy
+    volumes:
+      - orchestrator-data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    stdin_open: true
+    tty: true
+
+volumes:
+  redis-data:
+  agentdb-data:
+  orchestrator-data:
