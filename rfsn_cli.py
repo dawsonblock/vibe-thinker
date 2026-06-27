@@ -541,6 +541,13 @@ def build_argparser() -> argparse.ArgumentParser:
                         "and trajectory store dual-write to both the local JSON file "
                         "and AgentDB (shadow mode). Reads fall back to local if AgentDB "
                         "is down. Empty = in-memory numpy (default, unchanged).")
+    p.add_argument("--agentdb-only", action="store_true",
+                   default=_env_bool("VIBE_THINKER_AGENTDB_ONLY", False),
+                   help="Use AgentDB as the SOLE vector store (no shadow mode, "
+                        "no local JSON fallback). Use this AFTER running "
+                        "'finalize-migration' to cut over to AgentDB-only. "
+                        "Requires --agentdb-url. Fail-closed: if AgentDB is "
+                        "down, searches return empty (no local fallback).")
     # --- Federated job queue (v0.3.9) ---
     # When set, jobs are published to a Python-native federation coordinator
     # over mTLS. Any idle node can claim pending jobs. Fail-closed-fallback
@@ -701,6 +708,16 @@ async def _amain() -> None:
         print("[CLI] Encoder NLI judge disabled (--no-encoder-nli). "
               "Using LLM judge for factual verification.")
 
+    # --- AgentDB vector store mode (Phase 4.3) ---
+    if args.agentdb_url and args.agentdb_only:
+        print(f"[CLI] AgentDB-only mode: vector store is AgentDB at "
+              f"{args.agentdb_url} (no local fallback). Fail-closed: "
+              f"searches return empty if AgentDB is down.")
+    elif args.agentdb_url:
+        print(f"[CLI] AgentDB shadow mode: dual-write to local + AgentDB "
+              f"at {args.agentdb_url}. Reads fall back to local if AgentDB "
+              f"is down. Use --agentdb-only after finalize-migration.")
+
     # --- Fast code-specialist preset (v0.3.9) ---
     # Bumps code_candidates to 15 for ultra-fast 0.5B code models.
     code_candidates = args.code_candidates
@@ -729,6 +746,7 @@ async def _amain() -> None:
         local_specialist_n_threads=args.local_specialist_n_threads,
         local_specialist_pool_size=args.local_specialist_pool_size,
         agentdb_url=args.agentdb_url or None,
+        agentdb_only=args.agentdb_only,
         retrieval_backend=_build_retrieval_backend(args),
         network_allowlist=_build_network_allowlist(args),
         dns_resolver=args.dns_resolver or None,
@@ -957,10 +975,12 @@ def _run_finalize_migration() -> int:
     else:
         print(f"\n[Finalize] Migration complete! {len(archived)} file(s) "
               f"archived. AgentDB is now the primary vector store.")
-        print("[Finalize] Restart the orchestrator WITHOUT --agentdb-url's "
-              "shadow primary to use AgentDB-only mode.")
+        print("[Finalize] Restart the orchestrator with --agentdb-only to "
+              "use AgentDB-only mode (no local fallback):")
+        print(f"  python3 rfsn_cli.py --agentdb-url {args.agentdb_url} "
+              f"--agentdb-only [other flags...]")
         print("[Finalize] To roll back, rename the .bak files back and "
-              "restart with --agentdb-url (shadow mode).")
+              "restart with --agentdb-url (shadow mode, no --agentdb-only).")
 
     return 0
 

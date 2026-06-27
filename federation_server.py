@@ -56,6 +56,11 @@ class FederatedJob:
     created_at: float = field(default_factory=time.time)
     claimed_at: Optional[float] = None
     completed_at: Optional[float] = None
+    # Phase 4.2: heartbeat-based zombie detection. Updated by the
+    # /heartbeat endpoint while a worker is actively processing a job.
+    # If heartbeat_at is older than claim_timeout, the reaper transitions
+    # the job back to pending (zombie re-queue).
+    heartbeat_at: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +92,10 @@ class FederationStateProtocol(Protocol):
 
     async def complete(self, job_id: str, result: Optional[Dict] = None,
                        error: Optional[str] = None) -> bool: ...
+
+    async def heartbeat(self, job_id: str, worker_id: str) -> bool: ...
+
+    async def reap_stale_claims(self, timeout: float = 300.0) -> List[str]: ...
 
     async def list_jobs(self) -> List[Dict[str, Any]]: ...
 
@@ -133,6 +142,7 @@ class InMemoryFederationState:
             job.status = "claimed"
             job.claimed_by = worker_id
             job.claimed_at = time.time()
+            job.heartbeat_at = time.time()  # Phase 4.2: initial heartbeat
             return job
 
     async def complete(self, job_id: str, result: Optional[Dict] = None,
@@ -146,6 +156,53 @@ class InMemoryFederationState:
             job.error = error
             job.completed_at = time.time()
             return True
+
+    async def heartbeat(self, job_id: str, worker_id: str) -> bool:
+        """Update the heartbeat timestamp for a claimed job (Phase 4.2).
+
+        Returns True if the job was found and is still claimed by the
+        given worker, False otherwise. This prevents a stale worker from
+        extending a claim that has already been re-queued to another
+        worker.
+        """
+        async with self._lock:
+            job = self._jobs.get(job_id)
+            if not job or job.status != "claimed":
+                return False
+            if job.claimed_by != worker_id:
+                return False
+            job.heartbeat_at = time.time()
+            return True
+
+    async def reap_stale_claims(self, timeout: float = 300.0) -> List[str]:
+        """Re-queue claimed jobs whose heartbeat is older than timeout (Phase 4.2).
+
+        Scans all claimed jobs; if heartbeat_at (or claimed_at when no
+        heartbeat was ever sent) is older than `timeout` seconds, the job
+        is transitioned back to pending and its claim fields are cleared.
+        This handles zombie workers that crashed after claiming but before
+        completing.
+
+        Returns a list of re-queued job IDs (for logging/metrics).
+        """
+        reaped: List[str] = []
+        now = time.time()
+        async with self._lock:
+            for job in self._jobs.values():
+                if job.status != "claimed":
+                    continue
+                # Use heartbeat_at if available, fall back to claimed_at.
+                last_contact = job.heartbeat_at or job.claimed_at
+                if last_contact is None:
+                    continue  # no timestamp — shouldn't happen for claimed
+                if (now - last_contact) > timeout:
+                    # Zombie — re-queue.
+                    job.status = "pending"
+                    job.claimed_by = None
+                    job.claimed_at = None
+                    job.heartbeat_at = None
+                    reaped.append(job.job_id)
+        return reaped
 
     async def list_jobs(self) -> List[Dict[str, Any]]:
         async with self._lock:
@@ -633,6 +690,48 @@ def create_federation_app(
         if not ok:
             return JSONResponse({"error": "job not found"}, status_code=404)
         return {"status": "ok"}
+
+    # Phase 4.2: Heartbeat endpoint — workers call this periodically
+    # while processing a claimed job to prove they're still alive. If
+    # the heartbeat stops (worker crashed), the reaper will re-queue
+    # the job for another worker to pick up.
+    @app.post("/heartbeat")
+    async def heartbeat_job(req: Request):
+        body = await req.json()
+        body = _decrypt(body)
+        job_id = body.get("job_id", "")
+        worker_id = body.get("worker_id", "unknown")
+        ok = await state.heartbeat(job_id, worker_id)
+        if not ok:
+            return JSONResponse(
+                {"error": "job not found or not claimed by this worker"},
+                status_code=404,
+            )
+        return {"status": "ok"}
+
+    # Phase 4.2: Background reaper task — periodically scans for stale
+    # claims and re-queues them. Runs every claim_timeout / 2 seconds
+    # (so a zombie is detected within ~1.5x the timeout).
+    _reaper_claim_timeout = 300.0  # 5 minutes (configurable below)
+
+    @app.on_event("startup")
+    async def _start_reaper():
+        async def _reaper_loop():
+            while True:
+                await asyncio.sleep(_reaper_claim_timeout / 2)
+                try:
+                    reaped = await state.reap_stale_claims(
+                        timeout=_reaper_claim_timeout
+                    )
+                    if reaped:
+                        print(
+                            f"[Federation] Reaped {len(reaped)} zombie "
+                            f"claim(s): {reaped} — re-queued as pending"
+                        )
+                except Exception as e:
+                    print(f"[Federation] Reaper error: {e}")
+
+        asyncio.create_task(_reaper_loop())
 
     @app.get("/jobs")
     async def list_jobs():

@@ -505,6 +505,7 @@ class HybridReasoningOrchestrator:
         local_specialist_n_threads: int = 8,
         local_specialist_pool_size: int = 1,
         agentdb_url: Optional[str] = None,
+        agentdb_only: bool = False,
         retrieval_backend: Optional["RetrievalBackend"] = _UNSET,
         network_allowlist: Optional["NetworkAllowList"] = None,
         dns_resolver: Optional[str] = None,
@@ -648,6 +649,7 @@ class HybridReasoningOrchestrator:
                     similarity_threshold=clr_cache_similarity,
                     min_score=clr_cache_min_score,
                     agentdb_url=agentdb_url,
+                    agentdb_only=agentdb_only,
                 )
             except Exception as e:
                 print(f"[Warning] Could not load CLR result cache: {e}")
@@ -670,6 +672,7 @@ class HybridReasoningOrchestrator:
                     retrieval_threshold=trajectory_retrieval_threshold,
                     max_few_shot=trajectory_max_few_shot,
                     agentdb_url=agentdb_url,
+                    agentdb_only=agentdb_only,
                 )
             except Exception as e:
                 print(f"[Warning] Could not load trajectory store: {e}")

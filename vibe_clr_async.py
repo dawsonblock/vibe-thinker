@@ -306,6 +306,24 @@ class VibeThinkerCLRAsync:
           - "repo_id/filename"            -> Llama.from_pretrained(...)
           - "repo_id" with filename in env -> Llama.from_pretrained(...)
         """
+        # --- Phase 4.1: Dynamic hardware guardrail ---
+        # Check model size vs available RAM before loading. When the
+        # estimated RAM exceeds available RAM, refuse to load and fall
+        # back to HTTP (instead of crashing with OOM). Non-local paths
+        # (HuggingFace repo_ids) skip the guardrail (can't estimate
+        # size without a network fetch).
+        from hardware_guardrail import check_model_fits_ram
+        guardrail = check_model_fits_ram(
+            local_model, n_ctx=n_ctx, pool_size=self._local_pool_size,
+        )
+        if not guardrail.ok:
+            print(f"[CLR] Hardware guardrail: refusing to load model — "
+                  f"{guardrail.error}")
+            print(f"[CLR] Falling back to HTTP at {self.server_url}.")
+            return
+        if guardrail.warning:
+            print(f"[CLR] Hardware guardrail: {guardrail.warning}")
+
         # --- RuvLLM in-process binding (v0.3.9, optional) ---
         # When ruvllm_py is installed (PyO3 wrapper around the Rust ruvllm
         # crate), prefer it over llama-cpp-python for TurboQuant KV cache

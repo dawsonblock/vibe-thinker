@@ -341,6 +341,7 @@ class CLRResultCache:
         vector_store: Optional[VectorStore] = None,
         agentdb_url: Optional[str] = None,
         agentdb_collection: str = "clr_results",
+        agentdb_only: bool = False,
     ):
         if not EMBEDDINGS_AVAILABLE:
             raise ImportError(
@@ -363,16 +364,23 @@ class CLRResultCache:
         # unchanged behavior). The agentdb_url convenience parameter
         # builds an AgentDBVectorStore (or ShadowVectorStore wrapping the
         # local matrix) automatically.
+        # Phase 4.3: when agentdb_only=True, skip the shadow primary and
+        # use AgentDB directly (post-cut-over mode, no local fallback).
         self._vector_store: Optional[VectorStore] = vector_store
         if self._vector_store is None and agentdb_url:
-            # Build a shadow store: local matrix as primary (source of
-            # truth), AgentDB as secondary (shadow writes). This is the
-            # integration plan's "Shadow Mode" migration step.
-            self._vector_store = make_vector_store(
-                agentdb_url=agentdb_url,
-                collection=agentdb_collection,
-                shadow_primary=LocalVectorStore(),
-            )
+            if agentdb_only:
+                # AgentDB-only mode (post-cut-over): no local shadow.
+                self._vector_store = make_vector_store(
+                    agentdb_url=agentdb_url,
+                    collection=agentdb_collection,
+                )
+            else:
+                # Shadow mode (migration): local primary + AgentDB secondary.
+                self._vector_store = make_vector_store(
+                    agentdb_url=agentdb_url,
+                    collection=agentdb_collection,
+                    shadow_primary=LocalVectorStore(),
+                )
 
         self._load()
 
@@ -598,6 +606,7 @@ class VerifiedTrajectoryStore:
         vector_store: Optional[VectorStore] = None,
         agentdb_url: Optional[str] = None,
         agentdb_collection: str = "trajectories",
+        agentdb_only: bool = False,
     ):
         if not EMBEDDINGS_AVAILABLE:
             raise ImportError(
@@ -619,13 +628,20 @@ class VerifiedTrajectoryStore:
         # the same pattern: when provided, similarity search is delegated
         # to the vector store (AgentDB sidecar) instead of the in-memory
         # numpy matrix. Default is None (in-memory, unchanged behavior).
+        # Phase 4.3: when agentdb_only=True, skip the shadow primary.
         self._vector_store: Optional[VectorStore] = vector_store
         if self._vector_store is None and agentdb_url:
-            self._vector_store = make_vector_store(
-                agentdb_url=agentdb_url,
-                collection=agentdb_collection,
-                shadow_primary=LocalVectorStore(),
-            )
+            if agentdb_only:
+                self._vector_store = make_vector_store(
+                    agentdb_url=agentdb_url,
+                    collection=agentdb_collection,
+                )
+            else:
+                self._vector_store = make_vector_store(
+                    agentdb_url=agentdb_url,
+                    collection=agentdb_collection,
+                    shadow_primary=LocalVectorStore(),
+                )
 
         self._load()
 

@@ -351,6 +351,42 @@ class TestCacheIntegration:
         store = VerifiedTrajectoryStore(cache_path)
         assert store._vector_store is None
 
+    # Phase 4.3: agentdb_only mode (post-cut-over, no local fallback)
+    def test_clr_cache_agentdb_only_creates_agentdb_directly(self, cache_path):
+        """Phase 4.3: agentdb_only=True creates an AgentDBVectorStore
+        directly, not wrapped in a ShadowVectorStore."""
+        from persistent_cache import CLRResultCache
+        cache = CLRResultCache(
+            cache_path,
+            agentdb_url="http://127.0.0.1:1",
+            agentdb_only=True,
+        )
+        assert cache._vector_store is not None
+        assert isinstance(cache._vector_store, AgentDBVectorStore)
+        assert not isinstance(cache._vector_store, ShadowVectorStore)
+
+    def test_clr_cache_agentdb_only_false_creates_shadow(self, cache_path):
+        """agentdb_only=False (default) still creates a ShadowVectorStore."""
+        from persistent_cache import CLRResultCache
+        cache = CLRResultCache(
+            cache_path,
+            agentdb_url="http://127.0.0.1:1",
+            agentdb_only=False,
+        )
+        assert isinstance(cache._vector_store, ShadowVectorStore)
+
+    def test_trajectory_store_agentdb_only_creates_agentdb_directly(self, cache_path):
+        """Phase 4.3: agentdb_only=True for trajectory store."""
+        from persistent_cache import VerifiedTrajectoryStore
+        store = VerifiedTrajectoryStore(
+            cache_path,
+            agentdb_url="http://127.0.0.1:1",
+            agentdb_only=True,
+        )
+        assert store._vector_store is not None
+        assert isinstance(store._vector_store, AgentDBVectorStore)
+        assert not isinstance(store._vector_store, ShadowVectorStore)
+
     def test_clr_cache_dual_writes_to_vector_store(self, cache_path):
         """Insert into CLRResultCache should also upsert to the vector store
         (shadow-mode dual-write)."""

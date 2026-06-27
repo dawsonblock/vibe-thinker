@@ -496,7 +496,7 @@ def create_app(
         job_id, job = pending[0]
         state.update_job(
             job_id, status="running", started_at=time.time(),
-            claimed_by=worker_id,
+            claimed_by=worker_id, heartbeat_at=time.time(),
         )
         await state.broadcast({"type": "job_update", "job": state.jobs[job_id]})
         return {
@@ -505,6 +505,27 @@ def create_app(
             "force_route": job.get("force_route"),
             "status": "claimed",
         }
+
+    @app.post("/api/jobs/heartbeat")
+    async def api_jobs_heartbeat(request: dict):
+        """Phase 4.2: A worker sends a heartbeat while processing a job.
+
+        Updates the heartbeat_at timestamp so the reaper doesn't re-queue
+        a job that's still being actively processed. Returns 404 if the
+        job doesn't exist or isn't claimed by the given worker.
+        """
+        job_id = request.get("job_id", "")
+        worker_id = request.get("worker_id", "unknown")
+        if job_id not in state.jobs:
+            return JSONResponse({"error": "job not found"}, status_code=404)
+        job = state.jobs[job_id]
+        if job["status"] != "running" or job.get("claimed_by") != worker_id:
+            return JSONResponse(
+                {"error": "job not claimed by this worker"},
+                status_code=404,
+            )
+        state.update_job(job_id, heartbeat_at=time.time())
+        return {"status": "ok"}
 
     @app.post("/api/jobs/complete")
     async def api_jobs_complete(request: dict):

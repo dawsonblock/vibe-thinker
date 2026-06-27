@@ -613,6 +613,11 @@ class FederatedJobQueue:
         session is closed by the time this background task runs, so we
         can't reuse it). Posts to ``origin_url`` (the coordinator that
         handed out the claim) first; on failure, tries the other HA URLs.
+
+        Phase 4.2: sends periodic heartbeats to the coordinator while the
+        job is running, so the coordinator knows this worker is still
+        alive. If the worker crashes, the coordinator's reaper will
+        re-queue the job for another worker.
         """
         import aiohttp
         # URL order: the originating coordinator first (it owns the job
@@ -622,6 +627,46 @@ class FederatedJobQueue:
             urls = [origin_url] + [u for u in urls if u != origin_url]
         elif origin_url:
             urls = [origin_url] + urls
+
+        # Phase 4.2: Start a heartbeat loop while the job runs. Send a
+        # heartbeat every 60s (the coordinator's default reaper timeout
+        # is 300s, so 60s gives a 5x safety margin). The loop stops when
+        # the job completes or the heartbeat POST fails 3 times in a row
+        # (the coordinator may have re-queued the job already).
+        heartbeat_interval = 60.0
+        heartbeat_failures = 0
+        heartbeat_stop = asyncio.Event()
+
+        async def _heartbeat_loop():
+            nonlocal heartbeat_failures
+            while not heartbeat_stop.is_set():
+                try:
+                    await asyncio.wait_for(
+                        heartbeat_stop.wait(), timeout=heartbeat_interval,
+                    )
+                    return  # stop signal received
+                except asyncio.TimeoutError:
+                    pass  # interval elapsed — send heartbeat
+                payload = self._encrypt_payload({
+                    "job_id": remote_job_id,
+                    "worker_id": self._node_id,
+                })
+                ok = await self._post_to_any_url(
+                    urls, "/heartbeat", payload, ssl_ctx,
+                    total_timeout=10.0,
+                )
+                if ok:
+                    heartbeat_failures = 0
+                else:
+                    heartbeat_failures += 1
+                    if heartbeat_failures >= 3:
+                        print(f"[FederatedQueue] Heartbeat failed 3x for "
+                              f"job {remote_job_id} — coordinator may have "
+                              f"re-queued it")
+                        return
+
+        heartbeat_task = asyncio.create_task(_heartbeat_loop())
+
         try:
             result = await self._local.wait_for(local_job_id, timeout=600.0)
             payload = self._encrypt_payload({
@@ -640,6 +685,14 @@ class FederatedJobQueue:
             await self._post_to_any_url(urls, "/complete",
                                         self._encrypt_payload({"job_id": remote_job_id, "error": str(e)}),
                                         ssl_ctx)
+        finally:
+            # Stop the heartbeat loop regardless of outcome.
+            heartbeat_stop.set()
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
 
     async def _post_to_any_url(
         self, urls: List[str], path: str, payload: dict, ssl_ctx,
