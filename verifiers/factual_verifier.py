@@ -40,16 +40,6 @@ from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 from verifiers.base import VerificationResult
 
 
-# Words that flip the polarity of a claim. If the answer contains one of
-# these but the source does not, the answer likely contradicts the source
-# even when the non-negated content overlaps.
-_NEGATION_WORDS = frozenset({
-    "not", "no", "never", "neither", "nor", "none", "cannot", "cant",
-    "isnt", "wasnt", "arent", "werent", "doesnt", "dont", "didnt",
-    "wouldnt", "couldnt", "shouldnt", "hasnt", "havent", "hadnt",
-})
-
-
 # v1.1: the judge must now output JSON with a verdict AND the exact
 # supporting quote from the source. The verifier checks that the quote
 # actually appears in the source (normalized) before trusting an
@@ -301,60 +291,3 @@ class FactualVerifier:
         if not n_quote:
             return False
         return n_quote in n_source
-
-    @staticmethod
-    def _verify_with_lexical(answer: str, sources: list) -> VerificationResult:
-        """Hardened lexical overlap with negation detection.
-
-        Checks if key fragments of the answer appear in a source. If the
-        answer contains negation words absent from the source, treats it
-        as a likely contradiction and rejects — this catches cases like
-        "Paris is NOT the capital" passing because "Paris" and "capital"
-        overlap with the source.
-        """
-        answer_lower = answer.lower().strip()
-        answer_tokens = set(re.split(r'\W+', answer_lower))
-        answer_negations = answer_tokens & _NEGATION_WORDS
-
-        supported_by = []
-        for src in sources:
-            src_lower = str(src).lower()
-            src_tokens = set(re.split(r'\W+', src_lower))
-            src_negations = src_tokens & _NEGATION_WORDS
-
-            words = [w for w in re.split(r'\W+', answer_lower) if len(w) > 3]
-            if not words:
-                continue
-            overlap_ratio = sum(1 for w in words if w in src_lower) / len(words)
-            if overlap_ratio < 0.4:
-                continue
-
-            # Negation polarity check: if the answer negates something the
-            # source affirms (or vice versa), the overlap is likely a
-            # contradiction, not support. Reject conservatively.
-            if answer_negations and not src_negations:
-                # Answer says "X is NOT Y", source says "X is Y" — contradiction.
-                continue
-            if src_negations and not answer_negations:
-                # Source says "X is NOT Y", answer says "X is Y" — contradiction.
-                continue
-
-            supported_by.append(src[:100])
-
-        if supported_by:
-            return VerificationResult(
-                verified=True,
-                score=0.7,  # weak — overlap is not entailment
-                method="retrieval_overlap",
-                evidence={"supported_by": supported_by,
-                          "source_count": len(sources)},
-            )
-
-        return VerificationResult(
-            verified=False,
-            score=0.0,
-            method="retrieval_overlap",
-            evidence={"source_count": len(sources)},
-            error="answer not supported by any provided source "
-                  "(overlap < 40% or negation mismatch)",
-        )

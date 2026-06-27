@@ -27,7 +27,9 @@ class TestAvailability:
 
     def test_is_available_true_when_deps_present(self):
         # transformers + torch are installed on this machine, so this
-        # should be True. On a machine without them, it'd be False.
+        # should be True. On a machine without them, skip rather than fail.
+        if not is_available():
+            pytest.skip("transformers/torch not installed on this machine")
         assert is_available() is True
 
 

@@ -239,8 +239,11 @@ def _process_pool_worker_call(
         if grammar_str == _CLAIMS_JSON_GRAMMAR and _PROCESS_POOL_GRAMMAR_CLAIMS is not None:
             grammar_obj = _PROCESS_POOL_GRAMMAR_CLAIMS
         elif isinstance(_PROCESS_POOL_GRAMMAR_CLAIMS, str):
-            # RuvLLM mode: grammar is a raw GBNF string.
-            grammar_obj = grammar_str if grammar_str != _CLAIMS_JSON_GRAMMAR else _PROCESS_POOL_GRAMMAR_CLAIMS
+            # RuvLLM mode: grammar is a raw GBNF string. We only reach
+            # this branch when grammar_str != _CLAIMS_JSON_GRAMMAR (the
+            # claims grammar was handled by the first branch above), so
+            # pass the requested grammar string directly.
+            grammar_obj = grammar_str
         else:
             try:
                 from llama_cpp import LlamaGrammar
@@ -780,10 +783,11 @@ class VibeThinkerCLRAsync:
             if grammar == _CLAIMS_JSON_GRAMMAR and self._local_grammar is not None:
                 grammar_obj = self._local_grammar
             elif isinstance(self._local_grammar, str):
-                # RuvLLM mode: grammar is a raw GBNF string. Use it directly
-                # for the claims grammar; for any other grammar, pass the
-                # requested string.
-                grammar_obj = grammar if grammar != _CLAIMS_JSON_GRAMMAR else self._local_grammar
+                # RuvLLM mode: grammar is a raw GBNF string. We only reach
+                # this branch when grammar != _CLAIMS_JSON_GRAMMAR (the
+                # claims grammar was handled by the first branch above), so
+                # pass the requested grammar string directly.
+                grammar_obj = grammar
             else:
                 try:
                     from llama_cpp import LlamaGrammar
