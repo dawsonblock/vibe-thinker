@@ -149,3 +149,60 @@ class TestSonaOrchestratorSync:
         orch._sona_recorder = None
         result = await orch.sona_sync_once()
         assert result["status"] == "disabled"
+
+
+class TestEncryptedClaimResponse:
+    """v3.0 fix: /claim endpoint encrypts the response when secret is set."""
+
+    def test_claim_response_encrypted_with_secret(self):
+        """When federation_secret is set, /claim response is encrypted."""
+        app = create_federation_app(federation_secret="test_secret")
+        from starlette.testclient import TestClient
+
+        with TestClient(app) as client:
+            # Submit a job first.
+            client.post("/submit", json={
+                "job_id": "j1", "query": "secret query",
+                "priority": 0, "submitted_by": "test",
+            })
+            # Claim it.
+            resp = client.post("/claim", json={"worker_id": "w1"})
+            assert resp.status_code == 200
+            data = resp.json()
+            # The response should be encrypted.
+            assert "__encrypted__" in data
+            # The plaintext query should NOT appear in the response.
+            assert "secret query" not in str(data)
+
+    def test_claim_response_plaintext_without_secret(self):
+        """Without federation_secret, /claim response is plaintext."""
+        app = create_federation_app()
+        from starlette.testclient import TestClient
+
+        with TestClient(app) as client:
+            client.post("/submit", json={
+                "job_id": "j1", "query": "hello",
+                "priority": 0, "submitted_by": "test",
+            })
+            resp = client.post("/claim", json={"worker_id": "w1"})
+            data = resp.json()
+            assert "query" in data
+            assert data["query"] == "hello"
+
+    def test_sona_get_response_encrypted_with_secret(self):
+        """GET /api/sona/sync response is encrypted when secret is set."""
+        app = create_federation_app(federation_secret="test_secret")
+        from starlette.testclient import TestClient
+
+        with TestClient(app) as client:
+            # Post a pattern.
+            client.post("/api/sona/sync", json={
+                "worker_id": "w1",
+                "patterns": [{"id": 1, "centroid": [1.0], "cluster_size": 3,
+                              "avg_quality": 0.8}],
+                "stats": {},
+            })
+            # GET the global patterns.
+            resp = client.get("/api/sona/sync")
+            data = resp.json()
+            assert "__encrypted__" in data

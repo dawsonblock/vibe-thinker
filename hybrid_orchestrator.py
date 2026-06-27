@@ -411,6 +411,7 @@ class HybridReasoningOrchestrator:
         prefer_encoder_nli: bool = False,
         sona_sync_url: Optional[str] = None,
         sona_sync_interval: int = 3600,
+        federation_secret: Optional[str] = None,
     ):
         self.vibe_endpoint = vibe_endpoint.rstrip("/")
         self.generalist_endpoint = generalist_endpoint.rstrip("/")
@@ -595,6 +596,22 @@ class HybridReasoningOrchestrator:
         self._sona_sync_url = sona_sync_url
         self._sona_sync_task = None
         self._sona_sync_count = 0
+        self._node_id = __import__("os").uname().nodename
+
+        # v3.0: Fernet instance for decrypting encrypted federation
+        # responses (claim responses, SONA sync GET responses).
+        self._fernet = None
+        if federation_secret:
+            try:
+                from cryptography.fernet import Fernet
+                import base64
+                import hashlib
+                key = base64.urlsafe_b64encode(
+                    hashlib.sha256(federation_secret.encode()).digest()
+                )
+                self._fernet = Fernet(key)
+            except ImportError:
+                pass
 
         # Keyword fallback
         self.verifiable_keywords = {
@@ -2061,21 +2078,47 @@ class HybridReasoningOrchestrator:
             except Exception as e:
                 print(f"[SONA] Warning: failed to record trajectory: {e}")
 
+    def _decrypt_federation_response(self, data: dict) -> dict:
+        """Decrypt a federation response payload if encrypted (v3.0)."""
+        if not isinstance(data, dict) or "__encrypted__" not in data:
+            return data
+        if self._fernet is None:
+            print("[SONA] Warning: received encrypted response but no "
+                  "federation_secret configured")
+            return data
+        try:
+            import json as _json
+            ciphertext = data["__encrypted__"].encode("ascii")
+            plaintext = self._fernet.decrypt(ciphertext).decode("utf-8")
+            return _json.loads(plaintext)
+        except Exception as e:
+            print(f"[SONA] Warning: failed to decrypt response: {e}")
+            return data
+
     def _sona_export_patterns(self) -> list:
         """Export learned SONA patterns for gossip protocol sync (v3.0).
 
         Returns a list of pattern dicts (id, centroid, cluster_size,
         avg_quality) that can be POSTed to the federation coordinator's
         /api/sona/sync endpoint.
+
+        Uses search_patterns with a high limit to retrieve all learned
+        patterns. The zero-vector query only affects sort order (nearest
+        to origin first), not which patterns are returned — HNSW returns
+        the top-k patterns regardless of query, so a high limit returns
+        all patterns.
         """
         if self._sona_recorder is None:
             return []
         try:
-            # Use search_patterns with a zero vector and high limit to
-            # retrieve all learned patterns.
+            # search_patterns returns the top-k nearest patterns to the
+            # query. With a very high limit, this returns ALL patterns
+            # (sorted by distance to the zero vector, which is arbitrary
+            # but doesn't filter any out). The zero vector is used because
+            # we don't have a meaningful query — we want all patterns.
             dim = 384  # default embedding dim
             zero_query = [0.0] * dim
-            patterns = self._sona_recorder.search_patterns(zero_query, 100)
+            patterns = self._sona_recorder.search_patterns(zero_query, 10000)
             return patterns
         except Exception as e:
             print(f"[SONA] Warning: failed to export patterns: {e}")
@@ -2128,7 +2171,7 @@ class HybridReasoningOrchestrator:
             local_stats = self._sona_recorder.stats()
 
             export_payload = {
-                "worker_id": getattr(self, "_node_id", "orchestrator"),
+                "worker_id": self._node_id,
                 "patterns": local_patterns,
                 "stats": dict(local_stats) if local_stats else {},
             }
@@ -2142,11 +2185,12 @@ class HybridReasoningOrchestrator:
                 ) as resp:
                     post_result = await resp.json()
 
-                # GET global patterns.
+                # GET global patterns (may be encrypted).
                 async with session.get(
                     f"{self._sona_sync_url}/api/sona/sync",
                 ) as resp:
                     global_data = await resp.json()
+                    global_data = self._decrypt_federation_response(global_data)
 
             # Import global patterns.
             global_patterns = global_data.get("patterns", [])

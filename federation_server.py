@@ -577,6 +577,19 @@ def create_federation_app(
         plaintext = _fernet.decrypt(ciphertext).decode("utf-8")
         return _json.loads(plaintext)
 
+    def _encrypt(data: dict) -> dict:
+        """Encrypt a response payload for zero-trust federation (v3.0).
+
+        If encryption is enabled, the payload is JSON-serialized and
+        encrypted. If not enabled, returns the payload unchanged.
+        """
+        if _fernet is None:
+            return data
+        import json as _json
+        plaintext = _json.dumps(data, default=str).encode("utf-8")
+        ciphertext = _fernet.encrypt(plaintext).decode("ascii")
+        return {"__encrypted__": ciphertext}
+
     @app.get("/health")
     async def health():
         return {"status": "ok", "jobs": await state.count()}
@@ -601,11 +614,13 @@ def create_federation_app(
         job = await state.claim(worker_id)
         if job is None:
             return {"job_id": None, "status": "no_jobs"}
-        return {
+        # v3.0: Encrypt the claim response — the query contains user
+        # data that must not leak in plaintext over the federation.
+        return _encrypt({
             "job_id": job.job_id, "query": job.query,
             "priority": job.priority, "force_route": job.force_route,
             "status": "claimed",
-        }
+        })
 
     @app.post("/complete")
     async def complete_job(req: Request):
@@ -684,12 +699,14 @@ def create_federation_app(
         Returns the merged pattern set from all worker nodes. Workers
         call this periodically to update their local SONA engine with
         patterns learned by other nodes in the swarm.
+
+        v3.0: Response is encrypted if federation_secret is configured.
         """
-        return {
+        return _encrypt({
             "patterns": list(_sona_global_patterns.values()),
             "worker_stats": _sona_worker_stats,
             "total_patterns": len(_sona_global_patterns),
-        }
+        })
 
     return app
 

@@ -568,6 +568,9 @@ class FederatedJobQueue:
                                 if resp.status >= 400:
                                     continue
                                 data = await resp.json()
+                                # v3.0: Decrypt the claim response if
+                                # the server encrypted it.
+                                data = self._decrypt_payload(data)
                                 if not data.get("job_id"):
                                     continue  # no pending jobs at this URL
                                 # We claimed a job — submit it locally.

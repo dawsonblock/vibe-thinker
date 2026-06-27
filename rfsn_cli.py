@@ -732,6 +732,7 @@ async def _amain() -> None:
         prefer_encoder_nli=args.prefer_encoder_nli,
         sona_sync_url=args.sona_sync_url or None,
         sona_sync_interval=args.sona_sync_interval,
+        federation_secret=args.federation_secret or None,
     )
 
     # --- Envoy sidecar egress (v1.2) ---
