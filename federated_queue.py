@@ -633,12 +633,12 @@ class FederatedJobQueue:
                                                     f"federation job {remote_job_id}")
         except asyncio.TimeoutError:
             await self._post_to_any_url(urls, "/complete",
-                                        {"job_id": remote_job_id,
-                                         "error": "execution timed out (600s)"},
+                                        self._encrypt_payload({"job_id": remote_job_id,
+                                         "error": "execution timed out (600s)"}),
                                         ssl_ctx)
         except Exception as e:
             await self._post_to_any_url(urls, "/complete",
-                                        {"job_id": remote_job_id, "error": str(e)},
+                                        self._encrypt_payload({"job_id": remote_job_id, "error": str(e)}),
                                         ssl_ctx)
 
     async def _post_to_any_url(

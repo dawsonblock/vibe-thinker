@@ -636,18 +636,18 @@ def create_federation_app(
 
     @app.get("/jobs")
     async def list_jobs():
-        return await state.list_jobs()
+        return _encrypt(await state.list_jobs())
 
     @app.get("/jobs/{job_id}")
     async def get_job(job_id: str):
         job = await state.get_job(job_id)
         if not job:
             return JSONResponse({"error": "not found"}, status_code=404)
-        return {
+        return _encrypt({
             "job_id": job.job_id, "query": job.query,
             "status": job.status, "result": job.result,
             "error": job.error,
-        }
+        })
 
     # v3.0: SONA gossip protocol — Distributed Brain endpoint.
     # Workers export their learned patterns (clustered trajectories,
@@ -676,7 +676,11 @@ def create_federation_app(
         body = _decrypt(body)
         worker_id = body.get("worker_id", "unknown")
         patterns = body.get("patterns", [])
+        if not isinstance(patterns, list):
+            patterns = []
         stats = body.get("stats", {})
+        if not isinstance(stats, dict):
+            stats = {}
 
         # Merge patterns into the global set (dedup by pattern ID).
         for p in patterns:

@@ -206,3 +206,76 @@ class TestEncryptedClaimResponse:
             resp = client.get("/api/sona/sync")
             data = resp.json()
             assert "__encrypted__" in data
+
+
+class TestEncryptedJobsEndpoints:
+    """v3.0 fix: /jobs endpoints encrypt responses when secret is set."""
+
+    def test_jobs_list_encrypted_with_secret(self):
+        """GET /jobs encrypts the response when federation_secret is set."""
+        app = create_federation_app(federation_secret="test_secret")
+        from starlette.testclient import TestClient
+
+        with TestClient(app) as client:
+            client.post("/submit", json={
+                "job_id": "j1", "query": "secret",
+                "priority": 0, "submitted_by": "test",
+            })
+            resp = client.get("/jobs")
+            data = resp.json()
+            assert "__encrypted__" in data
+
+    def test_job_detail_encrypted_with_secret(self):
+        """GET /jobs/{id} encrypts the response when secret is set."""
+        app = create_federation_app(federation_secret="test_secret")
+        from starlette.testclient import TestClient
+
+        with TestClient(app) as client:
+            client.post("/submit", json={
+                "job_id": "j1", "query": "secret",
+                "priority": 0, "submitted_by": "test",
+            })
+            resp = client.get("/jobs/j1")
+            data = resp.json()
+            assert "__encrypted__" in data
+
+    def test_jobs_list_plaintext_without_secret(self):
+        """GET /jobs returns plaintext without secret."""
+        app = create_federation_app()
+        from starlette.testclient import TestClient
+
+        with TestClient(app) as client:
+            resp = client.get("/jobs")
+            data = resp.json()
+            assert "__encrypted__" not in data
+
+
+class TestSonaSyncValidation:
+    """v3.0 fix: /api/sona/sync POST validates input types."""
+
+    def test_post_with_non_list_patterns_doesnt_crash(self):
+        """POSTing non-list patterns doesn't crash (handled gracefully)."""
+        app = create_federation_app()
+        from starlette.testclient import TestClient
+
+        with TestClient(app) as client:
+            resp = client.post("/api/sona/sync", json={
+                "worker_id": "w1",
+                "patterns": "not a list",
+                "stats": {},
+            })
+            assert resp.status_code == 200
+            assert resp.json()["global_pattern_count"] == 0
+
+    def test_post_with_non_dict_stats_doesnt_crash(self):
+        """POSTing non-dict stats doesn't crash (handled gracefully)."""
+        app = create_federation_app()
+        from starlette.testclient import TestClient
+
+        with TestClient(app) as client:
+            resp = client.post("/api/sona/sync", json={
+                "worker_id": "w1",
+                "patterns": [],
+                "stats": "not a dict",
+            })
+            assert resp.status_code == 200

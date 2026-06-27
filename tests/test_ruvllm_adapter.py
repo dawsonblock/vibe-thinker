@@ -156,6 +156,14 @@ class TestRuvLLMBindingEmbeddings:
         emb = binding.get_embeddings("test", dim=768)
         assert len(emb) == 768
 
+    def test_get_embeddings_unicode_normalized(self):
+        """Unicode NFKC normalization: different representations produce same hash."""
+        binding = object.__new__(RuvLLMBinding)
+        # NFKC normalizes these to the same form.
+        emb1 = binding.get_embeddings("café")
+        emb2 = binding.get_embeddings("cafe\u0301")  # decomposed form
+        assert emb1 == emb2
+
 
 class TestCLIFlags:
     """Tests that the CLI flags are wired correctly."""

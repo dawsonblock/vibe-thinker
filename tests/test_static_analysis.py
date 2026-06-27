@@ -174,3 +174,25 @@ class TestStaticAnalysisEvasionVectors:
         # Restricted import (os) is found first, so it's reported.
         # The evasion (__import__) is also detected.
         assert any("os" in i for i in issues)
+
+    def test_getattr_builtins_evasion_gets_zero(self):
+        """getattr(__builtins__, 'eval') is flagged as evasion."""
+        code = "f = getattr(__builtins__, 'eval')\nf('1+1')\n"
+        score, issues = _static_analysis_fallback(code)
+        assert score == 0.0
+        assert any("getattr" in i or "__builtins__" in i for i in issues)
+
+    def test_builtins_dunder_import_evasion_gets_zero(self):
+        """builtins.__import__('os') is flagged as evasion."""
+        code = "import builtins\nmod = builtins.__import__('os')\n"
+        score, issues = _static_analysis_fallback(code)
+        assert score == 0.0
+        # builtins is both a restricted import AND an evasion vector
+        assert any("builtins" in i for i in issues)
+
+    def test_builtins_reference_gets_zero(self):
+        """Referencing the builtins module is flagged."""
+        code = "x = builtins.eval('1+1')\n"
+        score, issues = _static_analysis_fallback(code)
+        assert score == 0.0
+        assert any("builtins" in i for i in issues)

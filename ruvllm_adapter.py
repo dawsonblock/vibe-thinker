@@ -343,11 +343,14 @@ class RuvLLMBinding:
         """
         import hashlib
         import struct
+        import unicodedata
 
         # Character n-gram hashing embedding.
         # For each n-gram (n=3), hash it and accumulate into the vector.
         vector = [0.0] * dim
-        text_lower = text.lower().strip()
+        # NFKC normalization ensures different unicode representations of
+        # the same character produce the same hash.
+        text_lower = unicodedata.normalize("NFKC", text.lower().strip())
         if not text_lower:
             return vector
 
@@ -357,7 +360,7 @@ class RuvLLMBinding:
                 ngrams.add(text_lower[i:i + n])
 
         for ngram in ngrams:
-            h = hashlib.md5(ngram.encode()).digest()
+            h = hashlib.md5(ngram.encode("utf-8")).digest()
             idx = struct.unpack("<I", h[:4])[0] % dim
             sign = 1.0 if (h[4] & 1) == 0 else -1.0
             vector[idx] += sign

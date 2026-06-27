@@ -28,6 +28,7 @@ Bug fixes vs. the original walkthrough version:
 
 import asyncio
 import json
+import os
 import re
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -348,12 +349,28 @@ def _static_analysis_fallback(code: str) -> tuple:
             # exec()/eval() — dynamic code execution.
             elif isinstance(func, _ast.Name) and func.id in ("exec", "eval"):
                 evasion_found.append(f"{func.id}() call")
-        # Any Name node referencing importlib or __builtins__.
+            # getattr(__builtins__, 'eval') — reflection-based access.
+            elif isinstance(func, _ast.Name) and func.id == "getattr":
+                # Check if any argument references __builtins__.
+                for arg in node.args:
+                    if isinstance(arg, _ast.Name) and arg.id == "__builtins__":
+                        evasion_found.append("getattr(__builtins__, ...) call")
+                    elif isinstance(arg, _ast.Constant) and isinstance(arg.value, str):
+                        if arg.value in ("__import__", "eval", "exec", "compile"):
+                            # getattr(x, 'eval') — flag if the target is dangerous.
+                            pass  # Caught by the __builtins__ check above.
+            # builtins.__import__('os') — attribute access on builtins module.
+            elif isinstance(func, _ast.Attribute) and func.attr == "__import__":
+                if isinstance(func.value, _ast.Name) and func.value.id == "builtins":
+                    evasion_found.append("builtins.__import__() call")
+        # Any Name node referencing importlib, __builtins__, or builtins.
         elif isinstance(node, _ast.Name):
             if node.id == "importlib":
                 evasion_found.append("importlib reference")
             elif node.id == "__builtins__":
                 evasion_found.append("__builtins__ reference")
+            elif node.id == "builtins":
+                evasion_found.append("builtins reference")
 
     if restricted_found:
         issues.append(f"restricted imports: {', '.join(restricted_found)}")
@@ -596,7 +613,7 @@ class HybridReasoningOrchestrator:
         self._sona_sync_url = sona_sync_url
         self._sona_sync_task = None
         self._sona_sync_count = 0
-        self._node_id = __import__("os").uname().nodename
+        self._node_id = os.uname().nodename
 
         # v3.0: Fernet instance for decrypting encrypted federation
         # responses (claim responses, SONA sync GET responses).
@@ -2059,12 +2076,12 @@ class HybridReasoningOrchestrator:
                     q_emb = local_llm.get_embeddings(query)
                     a_emb = local_llm.get_embeddings(result.final_answer)
 
-                # 2. Fall back to sentence-transformers via the trajectory store.
-                if q_emb is None and a_emb is None:
-                    model = getattr(self.trajectory_store, "model", None)
-                    if model is not None:
-                        q_emb = model.encode([query])[0].tolist()
-                        a_emb = model.encode([result.final_answer])[0].tolist()
+                # 2. Fall back to sentence-transformers for any missing embeddings.
+                model = getattr(self.trajectory_store, "model", None)
+                if q_emb is None and model is not None:
+                    q_emb = model.encode([query])[0].tolist()
+                if a_emb is None and model is not None:
+                    a_emb = model.encode([result.final_answer])[0].tolist()
 
                 # 3. Record into SONA if we have embeddings.
                 if q_emb and a_emb:
@@ -2090,7 +2107,11 @@ class HybridReasoningOrchestrator:
             import json as _json
             ciphertext = data["__encrypted__"].encode("ascii")
             plaintext = self._fernet.decrypt(ciphertext).decode("utf-8")
-            return _json.loads(plaintext)
+            result = _json.loads(plaintext)
+            if not isinstance(result, dict):
+                print("[SONA] Warning: decrypted response is not a dict")
+                return data
+            return result
         except Exception as e:
             print(f"[SONA] Warning: failed to decrypt response: {e}")
             return data
@@ -2118,7 +2139,12 @@ class HybridReasoningOrchestrator:
             # we don't have a meaningful query — we want all patterns.
             dim = 384  # default embedding dim
             zero_query = [0.0] * dim
-            patterns = self._sona_recorder.search_patterns(zero_query, 10000)
+            _EXPORT_LIMIT = 100000
+            patterns = self._sona_recorder.search_patterns(zero_query, _EXPORT_LIMIT)
+            if len(patterns) >= _EXPORT_LIMIT:
+                print(f"[SONA] Warning: export hit limit ({_EXPORT_LIMIT}), "
+                      f"some patterns may be truncated")
+            return patterns
             return patterns
         except Exception as e:
             print(f"[SONA] Warning: failed to export patterns: {e}")
@@ -2141,7 +2167,7 @@ class HybridReasoningOrchestrator:
                 import uuid as _uuid
                 centroid = p.get("centroid", [])
                 quality = p.get("avg_quality", 0.5)
-                if centroid and quality > 0:
+                if isinstance(centroid, list) and centroid and isinstance(quality, (int, float)) and quality > 0:
                     self._sona_recorder.record(
                         request_id=str(_uuid.uuid4()),
                         session_id="global_sync",
@@ -2169,11 +2195,13 @@ class HybridReasoningOrchestrator:
             # Export local patterns.
             local_patterns = self._sona_export_patterns()
             local_stats = self._sona_recorder.stats()
+            if not isinstance(local_stats, dict):
+                local_stats = {}
 
             export_payload = {
                 "worker_id": self._node_id,
                 "patterns": local_patterns,
-                "stats": dict(local_stats) if local_stats else {},
+                "stats": local_stats,
             }
 
             timeout = aiohttp.ClientTimeout(total=10.0)
