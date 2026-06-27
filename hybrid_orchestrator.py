@@ -273,6 +273,70 @@ class EmbeddingRouter:
 
 
 # ====================================================================== #
+# Static analysis fallback (v2.0)
+# ====================================================================== #
+# Restricted imports that disqualify code from the static analysis
+# heuristic score. These modules can access the filesystem, network,
+# subprocess, or eval — making them dangerous in unverified code.
+_RESTRICTED_IMPORTS = frozenset({
+    "os", "sys", "subprocess", "shutil", "pathlib",
+    "socket", "http", "urllib", "requests", "ctypes",
+    "multiprocessing", "threading", "signal",
+    "pickle", "marshal", "shelve",
+    "builtins", "importlib",
+    "ftplib", "smtplib", "telnetlib", "paramiko",
+    "tempfile", "glob",
+})
+
+
+def _static_analysis_fallback(code: str) -> tuple:
+    """Static analysis fallback for code verification (v2.0).
+
+    When the Generalist fails to generate unit tests, this function
+    performs a lightweight static analysis pass on the candidate code:
+
+    1. Parses the code with ``ast.parse`` — if it doesn't parse, score 0.0.
+    2. Checks for restricted imports (os, subprocess, socket, etc.) —
+       if any are found, score 0.0.
+    3. If the code parses cleanly and has no restricted imports, assign
+       a partial heuristic score of 0.4 (capped — this is NOT full
+       verification, just a "syntactically valid and not obviously
+       dangerous" signal).
+
+    Returns (score, issues) where issues is a list of strings describing
+    any problems found (empty list if score > 0.0).
+    """
+    import ast as _ast
+    issues = []
+
+    # 1. Parse check.
+    try:
+        tree = _ast.parse(code)
+    except SyntaxError as e:
+        return (0.0, [f"syntax error: {e}"])
+
+    # 2. Restricted import check.
+    restricted_found = []
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".")[0]
+                if top in _RESTRICTED_IMPORTS:
+                    restricted_found.append(alias.name)
+        elif isinstance(node, _ast.ImportFrom):
+            if node.module:
+                top = node.module.split(".")[0]
+                if top in _RESTRICTED_IMPORTS:
+                    restricted_found.append(node.module)
+    if restricted_found:
+        issues.append(f"restricted imports: {', '.join(restricted_found)}")
+        return (0.0, issues)
+
+    # 3. Clean parse, no restricted imports — partial heuristic score.
+    return (0.4, [])
+
+
+# ====================================================================== #
 # Orchestrator
 # ====================================================================== #
 class HybridReasoningOrchestrator:
@@ -303,14 +367,12 @@ class HybridReasoningOrchestrator:
         local_specialist_n_ctx: int = 4096,
         local_specialist_n_threads: int = 8,
         local_specialist_pool_size: int = 1,
-        local_pool_kind: str = "thread",
         agentdb_url: Optional[str] = None,
         retrieval_backend: Optional["RetrievalBackend"] = _UNSET,
         network_allowlist: Optional["NetworkAllowList"] = None,
         dns_resolver: Optional[str] = None,
         sandbox_image: Optional[str] = None,
         proxy_egress: Optional[str] = None,
-        legacy_iptables_egress: bool = False,
         use_structured_output: bool = False,
         specialist_transport: str = "completion",
         specialist_api_key: Optional[str] = None,
@@ -373,24 +435,17 @@ class HybridReasoningOrchestrator:
         # Apply SNI proxy egress mode (v0.4.1). When set, the sandbox
         # routes traffic through the proxy instead of using iptables.
         # This solves CDN IP rotation — the proxy checks the domain (SNI),
-        # not the IP. The proxy must be running separately (sandbox.sni_proxy).
-        # v1.2: SNI-proxy is now the DEFAULT egress mode when an allow-list
-        # is present. The legacy iptables path is opt-in via
-        # --legacy-iptables-egress (deprecated).
+        # not the IP. The proxy must be running separately (sandbox.sni_proxy
+        # or the --envoy-sidecar flag).
+        # v2.0: SNI-proxy is the ONLY egress mode when an allow-list is
+        # present. The v0.4.0 iptables path was removed.
         if self.code_verifier is not None:
             executor = getattr(self.code_verifier, "executor", None)
             if executor is not None:
-                if hasattr(executor, "set_legacy_iptables_egress"):
-                    executor.set_legacy_iptables_egress(legacy_iptables_egress)
                 if proxy_egress and hasattr(executor, "set_proxy_egress"):
                     executor.set_proxy_egress(proxy_egress)
                     print(f"[Orchestrator] SNI proxy egress enabled: {proxy_egress}"
-                          + (f" (replaces iptables filtering)" if network_allowlist else ""))
-                elif network_allowlist and not legacy_iptables_egress:
-                    # v1.2 default: SNI-proxy egress with the default address.
-                    print(f"[Orchestrator] SNI proxy egress is the default "
-                          f"(v1.2). Use --legacy-iptables-egress to restore "
-                          f"the v0.4.0 iptables path.")
+                          + (f" (domain-level filtering)" if network_allowlist else ""))
         # If the verifier's executor is a WarmDockerPool, start it eagerly so
         # the first code task doesn't pay the cold-start cost.
         if self.code_verifier is not None and hasattr(self.code_verifier, "executor"):
@@ -425,7 +480,6 @@ class HybridReasoningOrchestrator:
             local_n_ctx=local_specialist_n_ctx,
             local_n_threads=local_specialist_n_threads,
             local_pool_size=local_specialist_pool_size,
-            local_pool_kind=local_pool_kind,
             use_structured_output=use_structured_output,
             specialist_transport=specialist_transport,
             specialist_api_key=specialist_api_key,
@@ -483,6 +537,23 @@ class HybridReasoningOrchestrator:
                 self.trajectory_store = None
         else:
             self.trajectory_store = None
+
+        # v2.0: SONA trajectory recorder (optional, in-process PyO3).
+        # When the ruvllm_py binding is installed, verified trajectories
+        # are also recorded into the SONA learning engine for continuous
+        # model improvement (LoRA adaptation, pattern learning).
+        self._sona_recorder = None
+        try:
+            from ruvllm_adapter import is_ruvllm_binding_available
+            if is_ruvllm_binding_available():
+                from ruvllm_py import SonaRecorder
+                self._sona_recorder = SonaRecorder(
+                    hidden_dim=256, embedding_dim=384, quality_threshold=0.7,
+                )
+                print("[Orchestrator] SONA trajectory recorder initialized "
+                      "(ruvllm_py binding)")
+        except Exception:
+            pass  # Fail silently — SONA is optional
 
         # Keyword fallback
         self.verifiable_keywords = {
@@ -1251,6 +1322,31 @@ class HybridReasoningOrchestrator:
         if tests is None:
             print("[CodeLoop] No test spec — single-candidate unverified generation")
             answer = await self._call_code_specialist(query)
+            # v2.0: Static analysis fallback. If the Generalist fails to
+            # generate unit tests, do a static analysis pass on the candidate
+            # code. If the code parses cleanly and contains no restricted
+            # imports, assign a partial heuristic score (capped at 0.4).
+            # This is NOT full verification — it's a "better than nothing"
+            # signal that the code is at least syntactically valid and
+            # doesn't import obviously dangerous modules.
+            static_score, static_issues = _static_analysis_fallback(answer)
+            if static_score > 0.0:
+                print(f"[CodeLoop] Static analysis fallback: score={static_score} "
+                      f"(parses OK, no restricted imports)")
+                return OrchestratorResult(
+                    final_answer=answer,
+                    route_taken="code_specialist_static_analysis",
+                    specialist_used="Code Specialist (ruvltra-claude-code)",
+                    clr_score=static_score,
+                    routing_confidence=0.3,
+                    raw_traces={
+                        "verified": False,
+                        "reason": "no test spec generated — static analysis fallback",
+                        "static_analysis": True,
+                        "static_score": static_score,
+                        "static_issues": static_issues,
+                    },
+                )
             return OrchestratorResult(
                 final_answer=answer,
                 route_taken="code_specialist_unverified",
@@ -1882,6 +1978,29 @@ class HybridReasoningOrchestrator:
         print(f"[TrajectoryStore] Stored verified result (method={method}, "
               f"score={score:.3f}, task_type={task_type}) — "
               f"store now has {len(self.trajectory_store)} entries")
+
+        # v2.0: Also record into the SONA learning engine if available.
+        # The SONA recorder uses the query + response embeddings for
+        # continuous model improvement (LoRA adaptation, pattern learning).
+        if self._sona_recorder is not None:
+            try:
+                import uuid as _uuid
+                req_id = str(_uuid.uuid4())
+                # Get query embedding from the trajectory store's model.
+                q_emb = self.trajectory_store._embed(query) if hasattr(
+                    self.trajectory_store, "_embed") else []
+                a_emb = self.trajectory_store._embed(result.final_answer) if hasattr(
+                    self.trajectory_store, "_embed") else []
+                if q_emb and a_emb:
+                    self._sona_recorder.record(
+                        request_id=req_id,
+                        session_id="default",
+                        query_embedding=q_emb,
+                        response_embedding=a_emb,
+                        quality_score=score,
+                    )
+            except Exception as e:
+                print(f"[SONA] Warning: failed to record trajectory: {e}")
 
     def _get_few_shot_context(self, query: str, task_type: Optional[str] = None) -> str:
         """Retrieve verified trajectories as few-shot context for the query.

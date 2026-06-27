@@ -48,7 +48,7 @@ In-Process Backend". The plan's action items:
 v1.1 direction decision — sync ``__call__``-compatible, NOT async batched:
   The original integration plan conflated two directions:
     (a) A sync ``__call__``-compatible binding that drops into the
-        existing ``_init_local_backend`` pool (thread or process) as a
+        existing ``_init_local_backend`` pool (thread) as a
         Llama replacement. The orchestrator's ``_call_model_inprocess``
         already runs sync calls in a thread/process executor, so a sync
         binding gets parallelism for free — no new async surface needed.
@@ -86,7 +86,7 @@ v1.1 direction decision — sync ``__call__``-compatible, NOT async batched:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Optional
 
 
 @dataclass

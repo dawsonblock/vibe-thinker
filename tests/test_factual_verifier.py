@@ -355,3 +355,71 @@ class TestNormalization:
         assert not FactualVerifier._verify_quote_in_source(
             "Berlin is the capital", "Paris is the capital of France."
         )
+
+
+class TestOfflineRAGFallback:
+    """v2.0: Offline RAG fallback for factual verification.
+
+    When no online retrieval sources are available (Serper/SearchApi keys
+    missing), the verifier falls back to local documents (offline_sources).
+    Only returns unsupported_factual if BOTH online and offline are empty.
+    """
+
+    @pytest.mark.asyncio
+    async def test_offline_sources_used_when_no_online_sources(self):
+        """When no online sources but offline_sources exist + judge available,
+        the verifier uses the NLI judge against the offline documents."""
+        judge = AsyncMock()
+        judge.return_value = json.dumps({
+            "verdict": "ENTAILMENT",
+            "supporting_quote": "Paris is the capital of France.",
+        })
+        v = FactualVerifier(
+            llm_judge=judge,
+            offline_sources=["Paris is the capital of France. It is a major city."],
+        )
+        result = await v.verify("What is the capital of France?", "Paris", {})
+        assert result.verified is True
+        assert result.method == "nli_citation_backed"
+        assert result.score == 0.8
+
+    @pytest.mark.asyncio
+    async def test_unsupported_factual_when_both_empty(self):
+        """When both online and offline sources are empty, return
+        unsupported_factual (the original fail-closed behavior)."""
+        v = FactualVerifier(llm_judge=AsyncMock(), offline_sources=[])
+        result = await v.verify("query", "answer", {})
+        assert result.verified is False
+        assert result.method == "unsupported_factual"
+
+    @pytest.mark.asyncio
+    async def test_offline_sources_not_used_without_judge(self):
+        """Without an LLM judge, offline sources are not used — NLI
+        requires a judge. Returns unsupported_factual."""
+        v = FactualVerifier(llm_judge=None, offline_sources=["some doc"])
+        result = await v.verify("query", "answer", {})
+        assert result.verified is False
+        assert result.method == "unsupported_factual"
+
+    @pytest.mark.asyncio
+    async def test_offline_sources_not_used_when_online_available(self):
+        """When online sources ARE available, offline sources are not used
+        (online sources take precedence)."""
+        judge = AsyncMock()
+        judge.return_value = json.dumps({
+            "verdict": "ENTAILMENT",
+            "supporting_quote": "Online source says Paris.",
+        })
+        v = FactualVerifier(
+            llm_judge=judge,
+            offline_sources=["Offline source about something else."],
+        )
+        result = await v.verify(
+            "query", "Paris",
+            {"sources": ["Online source says Paris."]},
+        )
+        assert result.verified is True
+        # The judge was called with the online source, not the offline one.
+        judge.assert_called_once()
+        call_prompt = judge.call_args[0][0]
+        assert "Online source says Paris" in call_prompt

@@ -2334,6 +2334,7 @@ dependencies = [
 name = "ruvllm_py"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "pyo3",
  "ruvllm",
 ]

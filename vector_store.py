@@ -475,6 +475,111 @@ class AgentDBVectorStore:
         return result
 
 
+class RuvLLMVectorStore:
+    """In-process HNSW vector store backed by the ruvllm_py PyO3 binding.
+
+    Uses the Rust ``ruvllm::ruvector_integration::UnifiedIndex`` (HNSW +
+    metadata) exposed via the ``ruvllm_py.HnswIndex`` Python class. This
+    provides in-process HNSW search without an HTTP sidecar — zero
+    network overhead, zero RAM bloat on the Python side (the index lives
+    in Rust memory).
+
+    When the ruvllm_py binding is not installed, construction raises
+    ImportError. Use ``is_ruvllm_vector_store_available()`` to check.
+
+    Args:
+        dim: Vector dimension (e.g. 384 for all-MiniLM-L6-v2).
+        m: HNSW graph connectivity parameter (default 16).
+        ef_construction: HNSW build-time search depth (default 200).
+        ef_search: HNSW query-time search depth (default 64).
+
+    v2.0: This store does NOT support ``delete`` or ``cluster`` (the HNSW
+    binding doesn't expose those operations). ``delete`` returns False,
+    ``cluster`` returns [].
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        m: int = 16,
+        ef_construction: int = 200,
+        ef_search: int = 64,
+    ):
+        try:
+            from ruvllm_py import HnswIndex
+        except ImportError as e:
+            raise ImportError(
+                "ruvllm_py is not installed. Build with: "
+                "cd ruvllm_py && maturin develop --release --features candle"
+            ) from e
+        self._index = HnswIndex(
+            dim=dim, m=m, ef_construction=ef_construction, ef_search=ef_search,
+        )
+        self._dim = dim
+        self._metadata: Dict[str, Dict[str, Any]] = {}
+
+    def upsert(
+        self,
+        vector_id: str,
+        embedding: List[float],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Insert or replace a vector with associated metadata."""
+        source = (metadata or {}).get("source", "unknown")
+        quality = (metadata or {}).get("score", 0.0)
+        self._index.add(vector_id, embedding, source=source, quality_score=quality)
+        self._metadata[vector_id] = metadata or {}
+
+    def search(
+        self,
+        query_embedding: List[float],
+        top_k: int = 10,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> List[Tuple[str, float, Dict[str, Any]]]:
+        """Return the top_k most similar entries as
+        ``(vector_id, similarity_score, metadata)`` tuples.
+        """
+        results = self._index.search(query_embedding, top_k)
+        out = []
+        for r in results:
+            vid = r.get("id", "")
+            score = r.get("score", 0.0)
+            meta = self._metadata.get(vid, {})
+            # Apply filters if provided.
+            if filters:
+                if not all(meta.get(k) == v for k, v in filters.items()):
+                    continue
+            out.append((vid, score, meta))
+        return out
+
+    def delete(self, vector_id: str) -> bool:
+        """Remove a vector. HNSW doesn't support deletion — returns False."""
+        return False
+
+    def count(self) -> int:
+        """Number of stored vectors."""
+        stats = self._index.stats()
+        return int(stats.get("total_vectors", 0))
+
+    def cluster(
+        self,
+        similarity_threshold: float = 0.85,
+        min_cluster_size: int = 3,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> List[List[str]]:
+        """HNSW doesn't expose clustering — returns []."""
+        return []
+
+
+def is_ruvllm_vector_store_available() -> bool:
+    """Check if the ruvllm_py HNSW binding is installed."""
+    try:
+        import ruvllm_py
+        return hasattr(ruvllm_py, "HnswIndex")
+    except ImportError:
+        return False
+
+
 class ShadowVectorStore:
     """Dual-write vector store for zero-downtime migration.
 

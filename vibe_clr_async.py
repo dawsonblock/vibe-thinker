@@ -156,116 +156,15 @@ class CLRResult:
 
 
 # --------------------------------------------------------------------------- #
-# Process-pool worker functions (v1.1).
+# Process-pool worker functions (v1.1) — REMOVED in v2.0
 #
-# These MUST be at module level so they are picklable by
-# ProcessPoolExecutor. Each worker process loads one Llama instance into
-# a worker-local global on init, then serves inference calls via
-# _process_pool_worker_call. Llama objects are not picklable, so the
-# model is loaded INSIDE the worker (not passed in). LlamaGrammar is also
-# compiled inside the worker.
+# Process-pool mode (ProcessPoolExecutor) was removed in v2.0. It
+# duplicated RAM (400MB+ per worker) and is superseded by the ruvllm_py
+# PyO3 binding, which releases the GIL natively during generation and
+# shares one set of weights across concurrent requests. The thread-pool
+# mode (queue.Queue of Llama instances + ThreadPoolExecutor) remains as
+# the in-process backend.
 # --------------------------------------------------------------------------- #
-
-# Worker-local state (one Llama + one grammar per worker process).
-_PROCESS_POOL_LLM = None
-_PROCESS_POOL_GRAMMAR_CLAIMS = None  # pre-compiled _CLAIMS_JSON_GRAMMAR
-
-
-def _process_pool_worker_init(
-    model_path: str,
-    n_ctx: int,
-    n_threads: int,
-    use_ruvllm: bool,
-) -> None:
-    """Process-pool worker initializer: load one Llama instance.
-
-    Runs once per worker process at pool startup. Loads the model into a
-    worker-local global so subsequent _process_pool_worker_call invocations
-    can use it without re-loading. Also pre-compiles the claims grammar
-    (LlamaGrammar is not picklable, so it must be compiled inside the
-    worker).
-    """
-    global _PROCESS_POOL_LLM, _PROCESS_POOL_GRAMMAR_CLAIMS
-    if use_ruvllm:
-        from ruvllm_adapter import RuvLLMBinding
-        _PROCESS_POOL_LLM = RuvLLMBinding(
-            model_path=model_path, n_ctx=n_ctx, n_threads=n_threads,
-        )
-        _PROCESS_POOL_GRAMMAR_CLAIMS = _CLAIMS_JSON_GRAMMAR  # raw string
-    else:
-        from llama_cpp import Llama, LlamaGrammar
-        if os.path.exists(model_path):
-            _PROCESS_POOL_LLM = Llama(
-                model_path=model_path, n_ctx=n_ctx, n_threads=n_threads,
-                verbose=False,
-            )
-        elif "/" in model_path and model_path.endswith(".gguf"):
-            repo_id, filename = model_path.split("/", 1)
-            _PROCESS_POOL_LLM = Llama.from_pretrained(
-                repo_id=repo_id, filename=filename,
-                n_ctx=n_ctx, n_threads=n_threads, verbose=False,
-            )
-        else:
-            _PROCESS_POOL_LLM = Llama.from_pretrained(
-                repo_id=model_path, n_ctx=n_ctx, n_threads=n_threads,
-                verbose=False,
-            )
-        _PROCESS_POOL_GRAMMAR_CLAIMS = LlamaGrammar.from_string(
-            _CLAIMS_JSON_GRAMMAR
-        )
-
-
-def _process_pool_worker_call(
-    prompt: str,
-    max_tokens: int,
-    temperature: float,
-    stop_tokens: list,
-    grammar_str: Optional[str],
-) -> str:
-    """Process-pool worker call: run inference on the worker-local Llama.
-
-    Returns the generated text. Raises RuntimeError on any failure (the
-    parent process catches it). The grammar is resolved inside the worker
-    (the pre-compiled claims grammar for _CLAIMS_JSON_GRAMMAR, or compiled
-    on demand for any other grammar).
-    """
-    global _PROCESS_POOL_LLM, _PROCESS_POOL_GRAMMAR_CLAIMS
-    if _PROCESS_POOL_LLM is None:
-        raise RuntimeError("process-pool worker LLM not initialized")
-
-    # Resolve the grammar object inside the worker.
-    grammar_obj = None
-    if grammar_str is not None:
-        if grammar_str == _CLAIMS_JSON_GRAMMAR and _PROCESS_POOL_GRAMMAR_CLAIMS is not None:
-            grammar_obj = _PROCESS_POOL_GRAMMAR_CLAIMS
-        elif isinstance(_PROCESS_POOL_GRAMMAR_CLAIMS, str):
-            # RuvLLM mode: grammar is a raw GBNF string. We only reach
-            # this branch when grammar_str != _CLAIMS_JSON_GRAMMAR (the
-            # claims grammar was handled by the first branch above), so
-            # pass the requested grammar string directly.
-            grammar_obj = grammar_str
-        else:
-            try:
-                from llama_cpp import LlamaGrammar
-                grammar_obj = LlamaGrammar.from_string(grammar_str)
-            except Exception as e:
-                print(f"[CLR] Warning: process-pool grammar compile failed: {e}")
-
-    resp = _PROCESS_POOL_LLM(
-        prompt,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        stop=stop_tokens,
-        grammar=grammar_obj,
-    )
-    # Parse the response (same logic as _parse_inprocess_response).
-    choices = (resp or {}).get("choices") or []
-    if not choices:
-        raise RuntimeError("In-process specialist returned empty content")
-    text = choices[0].get("text", "") if isinstance(choices[0], dict) else ""
-    if not text:
-        raise RuntimeError("In-process specialist returned empty content")
-    return text
 
 
 def _estimate_model_ram_mb(model_path: str) -> Optional[int]:
@@ -314,7 +213,6 @@ class VibeThinkerCLRAsync:
         specialist_api_key: Optional[str] = None,
         specialist_model_name: Optional[str] = None,
         max_parse_repairs: int = 2,
-        local_pool_kind: str = "thread",
     ):
         self.server_url = server_url.rstrip("/")
         self.k = k
@@ -361,20 +259,6 @@ class VibeThinkerCLRAsync:
         self._local_pool_size = max(1, local_pool_size)
         self._local_grammar = None
         self._local_lock = threading.Lock()  # used only in single-instance mode
-        # Pool kind (v1.1): "thread" (default) uses a queue.Queue of Llama
-        # instances + ThreadPoolExecutor — the historical path. "process"
-        # uses a ProcessPoolExecutor where each worker loads its own Llama
-        # instance (worker-local global), giving each worker its own GIL.
-        # This eliminates Python-side lock contention under extreme
-        # concurrency, BUT: (1) Llama objects are not picklable, so each
-        # worker must load its own instance — RAM multiplies by pool_size;
-        # (2) LlamaGrammar must be compiled inside each worker; (3) for a
-        # 3B model on 16GB RAM, pool_size=4 likely OOMs. The guardrail in
-        # _init_local_backend refuses process mode when the estimated RAM
-        # cost exceeds available memory, falling back to thread mode.
-        # Default "thread" — process mode is opt-in.
-        self._local_pool_kind = local_pool_kind
-        self._local_process_pool = None  # ProcessPoolExecutor (process mode)
         # Structured output mode (v0.4.1): when enabled, trajectory
         # generation uses _STRUCTURED_OUTPUT_GRAMMAR to force JSON output
         # with reasoning_steps, boxed_answer, and code_solution keys.
@@ -480,98 +364,11 @@ class VibeThinkerCLRAsync:
             )
 
         try:
-            # --- Process-pool mode (v1.1, opt-in) ---
-            # Each worker loads its own Llama instance (worker-local
-            # global), giving each worker its own GIL. This eliminates
-            # Python-side lock contention under extreme concurrency.
-            # BUT: RAM multiplies by pool_size (each worker loads a full
-            # model copy). The guardrail below refuses process mode when
-            # the estimated RAM cost exceeds available memory, falling
-            # back to thread mode. Default is "thread" — process mode is
-            # opt-in via --local-specialist-pool-kind process.
-            if (self._local_pool_size > 1
-                    and self._local_pool_kind == "process"):
-                # RAM guardrail: estimate the model size and refuse if
-                # pool_size * model_size would exceed available RAM. This
-                # prevents the OOM that the original plan flagged.
-                model_mb = _estimate_model_ram_mb(local_model)
-                avail_mb = _available_ram_mb()
-                if model_mb is not None and avail_mb is not None:
-                    # Conservative: model file size * pool_size * 1.5x
-                    # (KV cache + runtime overhead). If this exceeds
-                    # available RAM, fall back to thread mode.
-                    est_total = int(model_mb * self._local_pool_size * 1.5)
-                    if est_total > avail_mb:
-                        print(
-                            f"[CLR] Warning: process-pool mode refused — "
-                            f"estimated RAM {est_total}MB (model {model_mb}MB "
-                            f"x {self._local_pool_size} workers x 1.5 overhead) "
-                            f"exceeds available {avail_mb}MB. Falling back to "
-                            f"thread pool mode. Install psutil for accurate "
-                            f"measurement, or reduce --local-specialist-pool-size."
-                        )
-                        self._local_pool_kind = "thread"
-                    else:
-                        print(
-                            f"[CLR] Process-pool RAM check OK: estimated "
-                            f"{est_total}MB <= {avail_mb}MB available."
-                        )
-                elif model_mb is None:
-                    # Can't estimate (HuggingFace repo_id, not a local
-                    # file). Proceed but warn — the user is responsible.
-                    print(
-                        f"[CLR] Warning: process-pool RAM guardrail skipped "
-                        f"(model '{local_model}' is not a local file — "
-                        f"can't estimate size). Monitor RAM manually."
-                    )
-
-            if (self._local_pool_size > 1
-                    and self._local_pool_kind == "process"):
-                # Process-pool mode: ProcessPoolExecutor with worker init.
-                # DEPRECATED (v1.2): superseded by the ruvllm_py PyO3 binding,
-                # which releases the GIL natively and shares one weight set
-                # across concurrent requests (no RAM duplication). Process
-                # mode will be removed in a future release.
-                import warnings
-                warnings.warn(
-                    "process-pool mode is deprecated (v1.2) and will be "
-                    "removed in a future release. The ruvllm_py PyO3 binding "
-                    "releases the GIL natively during generation and shares "
-                    "one set of weights across concurrent requests, "
-                    "eliminating the RAM duplication that process mode "
-                    "requires. Prefer --local-specialist-model with the "
-                    "ruvllm_py binding installed (build ruvllm_py with "
-                    "--features inference-metal on Apple Silicon).",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
-                from concurrent.futures import ProcessPoolExecutor
-                per_inst_threads = max(1, n_threads // self._local_pool_size)
-                print(
-                    f"[CLR] Starting process pool with {self._local_pool_size} "
-                    f"workers (process mode, {n_threads} threads -> "
-                    f"{per_inst_threads}/worker) from {local_model}..."
-                    f" [DEPRECATED — see ruvllm_py binding]"
-                )
-                self._local_process_pool = ProcessPoolExecutor(
-                    max_workers=self._local_pool_size,
-                    initializer=_process_pool_worker_init,
-                    initargs=(
-                        local_model, n_ctx, per_inst_threads, use_ruvllm,
-                    ),
-                )
-                self._local_llm = None
-                self._local_llm_pool = None
-                self.backend = "in-process-process-pool"
-                print(
-                    f"[CLR] Process pool ready (backend={self.backend}, "
-                    f"{self._local_pool_size} workers, n_ctx={n_ctx}). "
-                    f"HTTP at {self.server_url} is bypassed."
-                )
-                # Grammar is compiled inside each worker — no shared
-                # grammar object in process mode.
-                self._local_grammar = None
-            elif self._local_pool_size > 1:
+            # --- Thread-pool mode (default) ---
+            # Pool mode: load N instances into a thread-safe queue.
+            # Divide threads across instances so they don't oversubscribe
+            # the CPU when all N run concurrently.
+            if self._local_pool_size > 1:
                 # Pool mode: load N instances into a thread-safe queue.
                 # Divide threads across instances so they don't oversubscribe
                 # the CPU when all N run concurrently.
@@ -581,8 +378,8 @@ class VibeThinkerCLRAsync:
                     f"instances (pool mode, {n_threads} threads -> "
                     f"{per_inst_threads}/instance) from {local_model}..."
                 )
-                # Temporarily override n_threads for the per-instance loads
-                original_n_threads = n_threads
+                # Per-instance thread allocation: each instance gets
+                # n_threads // pool_size threads.
                 pool: queue.Queue = queue.Queue()
                 loaded = 0
                 for i in range(self._local_pool_size):
@@ -634,15 +431,7 @@ class VibeThinkerCLRAsync:
             # string directly (no LlamaGrammar object). When use_ruvllm is
             # True, we store the raw grammar string instead of a compiled
             # LlamaGrammar. _call_model_inprocess handles both cases.
-            #
-            # Process-pool mode (v1.1): grammar is compiled inside each
-            # worker process (LlamaGrammar is not picklable). Skip the
-            # shared compilation — _local_grammar stays None, and
-            # _call_model_inprocess dispatches to the worker function
-            # which compiles its own grammar.
-            if self._local_process_pool is not None:
-                pass  # grammar handled per-worker
-            elif use_ruvllm:
+            if use_ruvllm:
                 # RuvLLM takes the raw GBNF string; no pre-compilation needed.
                 self._local_grammar = _CLAIMS_JSON_GRAMMAR  # type: ignore
             else:
@@ -656,12 +445,6 @@ class VibeThinkerCLRAsync:
             self._local_llm = None
             self._local_llm_pool = None
             self._local_grammar = None
-            if self._local_process_pool is not None:
-                try:
-                    self._local_process_pool.shutdown(wait=False, cancel_futures=True)
-                except Exception:
-                    pass
-                self._local_process_pool = None
             self.backend = "http"
 
     def adjust_max_k_for_queue_load(self, queue_load: float) -> None:
@@ -725,8 +508,7 @@ class VibeThinkerCLRAsync:
                 see _call_model_chat.
         """
         if (self._local_llm is not None
-                or self._local_llm_pool is not None
-                or self._local_process_pool is not None):
+                or self._local_llm_pool is not None):
             return await self._call_model_inprocess(
                 prompt, max_tokens, temperature, stop, grammar
             )
@@ -768,25 +550,6 @@ class VibeThinkerCLRAsync:
         """
         loop = asyncio.get_running_loop()
         stop_tokens = stop if stop is not None else ["<|im_end|>"]
-
-        # --- Process-pool mode (v1.1) ---
-        # Dispatch to the ProcessPoolExecutor. The grammar is resolved
-        # INSIDE the worker (LlamaGrammar is not picklable, so we pass
-        # the raw grammar string and let the worker compile it). The
-        # worker function handles the full inference + response parsing.
-        if self._local_process_pool is not None:
-            future = self._local_process_pool.submit(
-                _process_pool_worker_call,
-                prompt, max_tokens, temperature, stop_tokens, grammar,
-            )
-            try:
-                return await loop.run_in_executor(None, future.result)
-            except RuntimeError:
-                raise
-            except Exception as e:
-                raise RuntimeError(
-                    f"In-process process-pool call failed: {e}"
-                ) from e
 
         # --- Thread-pool and single-instance modes ---
         # Resolve the grammar object: reuse the pre-compiled claims grammar when

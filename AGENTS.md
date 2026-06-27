@@ -1,7 +1,7 @@
 # vibe-thinker — project notes for agents
 
 ## Verify / test
-- Full suite: `python3 -m pytest -q` (958 tests, ~120s, no live servers needed)
+- Full suite: `python3 -m pytest -q` (970 tests, ~130s, no live servers needed)
 - Routing + REPL only: `python3 -m pytest tests/test_routing.py tests/test_repl.py -q`
 - Format enforcer + chat transports + repair loop: `python3 -m pytest tests/test_format_enforcer.py -q`
 - Citation-backed NLI factual verifier: `python3 -m pytest tests/test_factual_verifier.py -q`
@@ -19,13 +19,15 @@
 - Trajectory synthesis: `python3 -m pytest tests/test_trajectory_synthesis.py -q`
 - AgentDB migration: `python3 -m pytest tests/test_migration.py -q`
 - Network allow-listing: `python3 -m pytest tests/test_network_allowlist.py -q`
+- Static analysis fallback (v2.0): `python3 -m pytest tests/test_static_analysis.py -q`
+- Envoy sidecar + DNS pinning (v2.0): `python3 -m pytest tests/test_envoy_sidecar.py -q`
 - Sandbox nonce anti-spoofing: `python3 -m pytest tests/test_code_verifier.py::TestNonceAntiSpoofing -q`
 - Bi-temporal log HMAC signatures: `python3 -m pytest tests/test_bitemporal_log.py::TestHmacSignatures -q`
 - Ed25519 + signer abstraction: `python3 -m pytest tests/test_signers.py -q`
 - Vector store + AgentDB abstraction: `python3 -m pytest tests/test_vector_store.py -q`
 - RuvLLM adapter + CLI flags: `python3 -m pytest tests/test_ruvllm_adapter.py -q`
 - Federated job queue: `python3 -m pytest tests/test_federated_queue.py -q`
-- Factual verifier NLI + negation: `python3 -m pytest tests/test_factual_verifier.py -q`
+- Factual verifier NLI + negation + offline RAG: `python3 -m pytest tests/test_factual_verifier.py -q`
 - Job queue disk persistence: `python3 -m pytest tests/test_job_queue.py::TestDiskPersistence -q`
 - Full-stack integration (needs live model servers): `python test_full_stack.py`
 - A benign `ResourceTracker.__del__` AttributeError prints after pytest exits on
@@ -1073,3 +1075,67 @@ new flags are used.
   (`test_network_integration.py`) use `legacy_iptables_egress=True`
   to keep testing the iptables path. Run:
   `python3 -m pytest tests/test_envoy_sidecar.py tests/test_network_allowlist.py -q`
+
+## v2.0 remediation (deprecated code removal + PyO3 HNSW/SONA + verification hardening)
+
+### Phase 2: Deprecated code removal
+- **Process-pool mode removed** from `vibe_clr_async.py` and `rfsn_cli.py`.
+  The `--local-specialist-pool-kind process` flag and `LocalPoolKind.PROCESS`
+  enum value were removed. The ruvllm_py binding (Phase 3) releases the GIL
+  natively, making process-pool mode unnecessary. Thread mode is the only
+  pool kind now.
+- **iptables egress path removed** from `sandbox/docker_executor.py`. The
+  `--legacy-iptables-egress` flag, `set_legacy_iptables_egress()`,
+  `_build_firewall_env()`, and `_compute_rules_hash()` methods were removed.
+  SNI-proxy is now the ONLY egress mode when an allow-list is present.
+  The `execute()` method uses `--entrypoint python3` to bypass the sandbox
+  image's iptables entrypoint (no SETGID/SETUID caps needed). Both proxy
+  and non-proxy paths use `--cap-drop ALL` + `--security-opt
+  no-new-privileges` for hardening.
+- `hybrid_orchestrator.py`: `legacy_iptables_egress` and `local_pool_kind`
+  constructor params removed. The orchestrator no longer prints the
+  "use --legacy-iptables-egress" deprecation message.
+
+### Phase 4: HNSW + SONA PyO3 bindings (ruvllm_py/)
+- **`HnswIndex`** class: wraps `ruvllm::ruvector_integration::UnifiedIndex`.
+  Constructor: `HnswIndex(dim, m=16, ef_construction=200, ef_search=64)`.
+  Methods: `add(id, vector, source, quality_score)`, `search(query, k)`,
+  `stats()`. Enables in-process HNSW vector search without an HTTP sidecar.
+- **`SonaRecorder`** class: wraps `ruvllm::sona::SonaIntegration`.
+  Constructor: `SonaRecorder(hidden_dim=256, embedding_dim=384,
+  quality_threshold=0.7)`. Methods: `record(request_id, session_id,
+  query_embedding, response_embedding, quality_score, model_index)`,
+  `search_patterns(query, limit)`, `trigger_background_loop()`,
+  `trigger_deep_loop()`, `stats()`. Enables in-process SONA trajectory
+  recording for the data flywheel.
+- Both classes have stub implementations (no-op) when built without
+  `--features candle`, and real implementations when built with it.
+- `chrono` added to `ruvllm_py/Cargo.toml` dependencies (used by
+  `Trajectory.timestamp`).
+
+### Phase 5: Verification hardening
+- **5.1: Wildcard DNS egress loophole fix** (`sandbox/envoy_sidecar.py`):
+  `generate_envoy_config()` now accepts a `dns_resolver` parameter. When
+  set, the `dynamic_upstream` cluster uses `STRICT_DNS` with the trusted
+  resolver instead of `ORIGINAL_DST` (which connects to the client's
+  resolved IP). This closes the wildcard DNS loophole: the proxy resolves
+  the SNI hostname via the trusted resolver and connects to that IP —
+  not the IP the client resolved. Access logging (JSON format with
+  `upstream_host`, `server_name`) added to the tcp_proxy filter for DNS
+  resolution auditing.
+- **5.2: Code verification static analysis fallback**
+  (`hybrid_orchestrator.py`): When the Generalist fails to generate unit
+  tests, the code loop now runs a static analysis pass on the candidate
+  code. `_static_analysis_fallback()` uses Python's `ast` module to check:
+  (1) the code parses cleanly, (2) no restricted imports (os, subprocess,
+  socket, etc.). If both pass, assigns a partial heuristic score of 0.4
+  (capped — NOT full verification). Route: `code_specialist_static_analysis`.
+  If the code has syntax errors or restricted imports, falls back to
+  `code_specialist_unverified` with score 0.0.
+- **5.3: Factual verification offline RAG fallback**
+  (`verifiers/factual_verifier.py`): `FactualVerifier` now accepts an
+  `offline_sources` parameter (list of local document strings). When no
+  online retrieval sources are available (Serper/SearchApi keys missing)
+  AND offline_sources exist AND an LLM judge is configured, the verifier
+  uses the NLI judge against the offline documents. Only returns
+  `unsupported_factual` if BOTH online and offline sources are empty.

@@ -73,6 +73,12 @@ class FactualVerifier:
             returns the LLM's text response. When provided, the verifier
             uses it as an NLI judge (entailment/contradiction/neutral) with
             citation-backed verification (v1.1). When None, fail-closed.
+        offline_sources: optional list of strings (local documents) used
+            as a fallback when no online retrieval sources are available
+            (v2.0). When the API/search keys are missing and no sources
+            are in the context, the verifier checks these local documents
+            with the NLI judge. Only returns ``unsupported_factual`` if
+            both the online sources AND offline_sources are empty.
     """
 
     name = "factual_verifier"
@@ -80,14 +86,23 @@ class FactualVerifier:
     def __init__(
         self,
         llm_judge: Optional[Callable[[str], Awaitable[str]]] = None,
+        offline_sources: Optional[list] = None,
     ):
         self._llm_judge = llm_judge
+        self._offline_sources = offline_sources or []
 
     async def verify(
         self, query: str, answer: str, context: Dict[str, Any]
     ) -> VerificationResult:
         sources = context.get("sources")
         if not sources:
+            # v2.0: Offline RAG fallback. If no online retrieval sources
+            # are available (Serper/SearchApi keys missing), try local
+            # documents. If local documents exist AND an LLM judge is
+            # configured, use the NLI judge against them. Only return
+            # unsupported_factual if BOTH online and offline are empty.
+            if self._offline_sources and self._llm_judge is not None:
+                return await self._verify_with_nli(answer, self._offline_sources)
             return VerificationResult(
                 verified=False,
                 score=0.0,

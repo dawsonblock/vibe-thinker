@@ -459,29 +459,6 @@ def build_argparser() -> argparse.ArgumentParser:
                         "For a 0.5B model (~398MB each), 4 instances cost ~1.6GB "
                         "and enable 4 concurrent trajectories. Each instance gets "
                         "n_threads/pool_size CPU threads.")
-    p.add_argument("--local-specialist-pool-kind",
-                   dest="local_pool_kind",
-                   choices=["thread", "process"],
-                   default=os.environ.get("VIBE_THINKER_LOCAL_POOL_KIND", "thread"),
-                   help="Pool kind for multi-instance in-process inference "
-                        "(default 'thread'). 'thread' = queue.Queue of Llama "
-                        "instances + ThreadPoolExecutor (the historical path, "
-                        "shared GIL). 'process' = ProcessPoolExecutor where each "
-                        "worker loads its own Llama (separate GIL per worker, "
-                        "eliminates Python-side lock contention). WARNING: "
-                        "process mode multiplies RAM by pool_size (each worker "
-                        "loads a full model copy). A RAM guardrail refuses "
-                        "process mode when estimated RAM exceeds available "
-                        "memory, falling back to thread mode. Opt-in — use only "
-                        "when you have spare RAM and need to bypass GIL "
-                        "contention under extreme concurrency. "
-                        "DEPRECATED (v1.2): process mode is superseded by the "
-                        "RuvLLM PyO3 binding (ruvllm_py), which releases the "
-                        "GIL natively during generation and shares one set of "
-                        "weights across concurrent requests — no RAM "
-                        "duplication. Process mode will be removed in a future "
-                        "release; prefer --local-specialist-model with the "
-                        "ruvllm_py binding installed.")
     # --- RuvLLM integration (v0.3.9) ---
     # RuvLLM is a Rust inference engine with TurboQuant KV cache compression.
     # It exposes the same OpenAI-compatible HTTP API as llama-server, so the
@@ -640,15 +617,6 @@ def build_argparser() -> argparse.ArgumentParser:
                         "this flag overrides the default address. Run the "
                         "proxy with: python3 -m sandbox.sni_proxy "
                         "--allowlist '...'")
-    p.add_argument("--legacy-iptables-egress",
-                   action="store_true",
-                   default=os.environ.get("RFSN_LEGACY_IPTABLES_EGRESS", "") != "",
-                   help="Opt in to the v0.4.0 iptables egress path "
-                        "(in-container firewall rules, requires NET_ADMIN "
-                        "cap). DEPRECATED (v1.2): SNI-proxy is now the "
-                        "default. Use this only in environments without a "
-                        "proxy sidecar. Will be removed in a future release "
-                        "in favor of the Envoy sidecar.")
     p.add_argument("--envoy-sidecar",
                    action="store_true",
                    default=os.environ.get("RFSN_ENVOY_SIDECAR", "") != "",
@@ -731,14 +699,12 @@ async def _amain() -> None:
         local_specialist_n_ctx=args.local_specialist_n_ctx,
         local_specialist_n_threads=args.local_specialist_n_threads,
         local_specialist_pool_size=args.local_specialist_pool_size,
-        local_pool_kind=args.local_pool_kind,
         agentdb_url=args.agentdb_url or None,
         retrieval_backend=_build_retrieval_backend(args),
         network_allowlist=_build_network_allowlist(args),
         dns_resolver=args.dns_resolver or None,
         sandbox_image=args.sandbox_image or None,
         proxy_egress=args.proxy_egress or None,
-        legacy_iptables_egress=args.legacy_iptables_egress,
         use_structured_output=args.use_structured_output,
         specialist_transport=args.specialist_transport,
         specialist_api_key=args.specialist_api_key or None,

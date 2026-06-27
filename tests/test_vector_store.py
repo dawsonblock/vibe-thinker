@@ -414,3 +414,57 @@ class TestCacheIntegration:
         )
         # The local cache should still have the entry
         assert len(cache) == 1
+
+
+class TestRuvLLMVectorStore:
+    """Tests for the in-process HNSW vector store (v2.0).
+
+    These tests only run when the ruvllm_py binding is installed.
+    """
+
+    @pytest.fixture
+    def store(self):
+        """Create a RuvLLMVectorStore with dim=4."""
+        from vector_store import RuvLLMVectorStore, is_ruvllm_vector_store_available
+        if not is_ruvllm_vector_store_available():
+            pytest.skip("ruvllm_py HNSW binding not installed")
+        return RuvLLMVectorStore(dim=4, m=8, ef_construction=50, ef_search=16)
+
+    def test_upsert_and_search(self, store):
+        """Upserting vectors and searching returns the closest match."""
+        store.upsert("v1", [1.0, 0.0, 0.0, 0.0], {"source": "test"})
+        store.upsert("v2", [0.0, 1.0, 0.0, 0.0], {"source": "test"})
+        results = store.search([1.0, 0.1, 0.0, 0.0], top_k=2)
+        # HNSW may return fewer than top_k results for very small indexes.
+        assert len(results) >= 1
+        # v1 should be closer to the query than v2 (if both returned).
+        assert results[0][0] == "v1"
+
+    def test_count(self, store):
+        """Count returns the number of stored vectors."""
+        store.upsert("a", [1.0, 0.0, 0.0, 0.0])
+        store.upsert("b", [0.0, 1.0, 0.0, 0.0])
+        assert store.count() == 2
+
+    def test_delete_returns_false(self, store):
+        """HNSW doesn't support deletion — returns False."""
+        store.upsert("x", [1.0, 0.0, 0.0, 0.0])
+        assert store.delete("x") is False
+
+    def test_cluster_returns_empty(self, store):
+        """HNSW doesn't expose clustering — returns []."""
+        store.upsert("x", [1.0, 0.0, 0.0, 0.0])
+        assert store.cluster() == []
+
+    def test_search_with_filters(self, store):
+        """Filters exclude entries whose metadata doesn't match."""
+        store.upsert("v1", [1.0, 0.0, 0.0, 0.0], {"type": "math"})
+        store.upsert("v2", [0.0, 1.0, 0.0, 0.0], {"type": "code"})
+        results = store.search([0.5, 0.5, 0.0, 0.0], top_k=10, filters={"type": "math"})
+        assert len(results) == 1
+        assert results[0][0] == "v1"
+
+    def test_is_ruvllm_vector_store_available(self):
+        """The availability check should return a bool."""
+        from vector_store import is_ruvllm_vector_store_available
+        assert isinstance(is_ruvllm_vector_store_available(), bool)

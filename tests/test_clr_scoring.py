@@ -8,8 +8,6 @@ import pytest
 from vibe_clr_async import (
     CLRResult,
     VibeThinkerCLRAsync,
-    _process_pool_worker_call,
-    _process_pool_worker_init,
 )
 
 
@@ -678,7 +676,9 @@ class TestInProcessBackend:
         """A .gguf path that exists on disk loads via Llama(model_path=...)."""
         gguf = tmp_path / "tiny.gguf"
         gguf.write_bytes(b"fake")
-        with patch.dict("sys.modules", {
+        # v2.0: mock ruvllm binding as unavailable so the test uses llama-cpp
+        with patch("ruvllm_adapter.is_ruvllm_binding_available", return_value=False), \
+             patch.dict("sys.modules", {
             "llama_cpp": MagicMock(),
             "llama_cpp.llama_grammar": MagicMock(),
         }):
@@ -807,7 +807,9 @@ class TestInProcessPool:
         import queue as queue_mod
         gguf = tmp_path / "tiny.gguf"
         gguf.write_bytes(b"fake")
-        with patch.dict("sys.modules", {
+        # v2.0: mock ruvllm binding as unavailable so the test uses llama-cpp
+        with patch("ruvllm_adapter.is_ruvllm_binding_available", return_value=False), \
+             patch.dict("sys.modules", {
             "llama_cpp": MagicMock(),
             "llama_cpp.llama_grammar": MagicMock(),
         }):
@@ -836,7 +838,9 @@ class TestInProcessPool:
         """If some instances fail to load, the pool keeps the ones that worked."""
         gguf = tmp_path / "tiny.gguf"
         gguf.write_bytes(b"fake")
-        with patch.dict("sys.modules", {
+        # v2.0: mock ruvllm binding as unavailable so the test uses llama-cpp
+        with patch("ruvllm_adapter.is_ruvllm_binding_available", return_value=False), \
+             patch.dict("sys.modules", {
             "llama_cpp": MagicMock(),
             "llama_cpp.llama_grammar": MagicMock(),
         }):
@@ -935,165 +939,6 @@ class TestInProcessPool:
         clr.backend = "in-process-pool"
         with pytest.raises(RuntimeError, match="empty content"):
             await clr._call_model(MagicMock(), "prompt", max_tokens=10)
-
-
-class TestProcessPool:
-    """Tests for the process-pool mode (v1.1, opt-in).
-
-    Process mode uses a ProcessPoolExecutor where each worker loads its
-    own Llama instance (worker-local global). These tests mock the
-    ProcessPoolExecutor — no real model is loaded and no worker processes
-    are spawned (the worker init function would try to load a real Llama).
-    """
-
-    def test_pool_kind_defaults_to_thread(self, clr):
-        """Default pool kind is 'thread' (the historical path)."""
-        assert clr._local_pool_kind == "thread"
-        assert clr._local_process_pool is None
-
-    def test_process_pool_kind_stored(self):
-        """The pool kind param is stored on the instance."""
-        clr = VibeThinkerCLRAsync(
-            server_url="http://localhost:0", k=1,
-            local_pool_kind="process",
-        )
-        assert clr._local_pool_kind == "process"
-
-    def test_process_pool_ram_guardrail_falls_back_to_thread(self, tmp_path):
-        """When estimated RAM exceeds available, process mode falls back
-        to thread mode — the guardrail prevents OOM."""
-        gguf = tmp_path / "big.gguf"
-        # Write a large fake file so the guardrail triggers.
-        gguf.write_bytes(b"\0" * (500 * 1024 * 1024))  # 500MB
-        with patch.dict("sys.modules", {
-            "llama_cpp": MagicMock(),
-            "llama_cpp.llama_grammar": MagicMock(),
-        }):
-            import sys
-            llama_mod = sys.modules["llama_cpp"]
-            llama_mod.Llama = MagicMock(return_value=MagicMock())
-            llama_mod.LlamaGrammar = MagicMock()
-
-            with patch("vibe_clr_async._available_ram_mb", return_value=100):
-                clr = VibeThinkerCLRAsync(
-                    server_url="http://localhost:0", k=8,
-                    local_model=str(gguf),
-                    local_pool_size=4,
-                    local_pool_kind="process",
-                    local_n_threads=8,
-                )
-        # Guardrail should have fallen back to thread mode.
-        assert clr._local_pool_kind == "thread"
-        assert clr._local_process_pool is None
-        assert clr.backend == "in-process-pool"
-
-    def test_process_pool_ram_guardrail_allows_when_safe(self, tmp_path):
-        """When estimated RAM fits, process mode proceeds."""
-        gguf = tmp_path / "small.gguf"
-        gguf.write_bytes(b"\0" * (10 * 1024 * 1024))  # 10MB
-        fake_pool = MagicMock(name="process_pool")
-        with patch.dict("sys.modules", {
-            "llama_cpp": MagicMock(),
-            "llama_cpp.llama_grammar": MagicMock(),
-        }):
-            import sys
-            llama_mod = sys.modules["llama_cpp"]
-            llama_mod.Llama = MagicMock()
-            llama_mod.LlamaGrammar = MagicMock()
-
-            with patch("vibe_clr_async._available_ram_mb", return_value=4096), \
-                 patch("concurrent.futures.ProcessPoolExecutor",
-                       return_value=fake_pool) as mock_ppe:
-                clr = VibeThinkerCLRAsync(
-                    server_url="http://localhost:0", k=8,
-                    local_model=str(gguf),
-                    local_pool_size=2,
-                    local_pool_kind="process",
-                    local_n_threads=4,
-                )
-        assert clr._local_pool_kind == "process"
-        assert clr.backend == "in-process-process-pool"
-        assert clr._local_process_pool is fake_pool
-        assert clr._local_llm is None
-        assert clr._local_llm_pool is None
-        # ProcessPoolExecutor was called with the worker initializer.
-        _, kwargs = mock_ppe.call_args
-        assert kwargs["max_workers"] == 2
-        assert kwargs["initializer"] is _process_pool_worker_init
-
-    def test_process_pool_ram_guardrail_skipped_for_repo_id(self):
-        """When the model is a HuggingFace repo_id (not a local file),
-        the guardrail is skipped — can't estimate size without a fetch."""
-        fake_pool = MagicMock(name="process_pool")
-        with patch.dict("sys.modules", {
-            "llama_cpp": MagicMock(),
-            "llama_cpp.llama_grammar": MagicMock(),
-        }):
-            import sys
-            llama_mod = sys.modules["llama_cpp"]
-            llama_mod.Llama = MagicMock()
-            llama_mod.LlamaGrammar = MagicMock()
-
-            with patch("concurrent.futures.ProcessPoolExecutor",
-                       return_value=fake_pool):
-                clr = VibeThinkerCLRAsync(
-                    server_url="http://localhost:0", k=8,
-                    local_model="some-repo/model",
-                    local_pool_size=2,
-                    local_pool_kind="process",
-                )
-        assert clr._local_pool_kind == "process"
-        assert clr.backend == "in-process-process-pool"
-
-    @pytest.mark.asyncio
-    async def test_process_pool_call_dispatches_to_executor(self, clr):
-        """In process mode, _call_model submits to the ProcessPoolExecutor."""
-        from concurrent.futures import Future
-        fake_future = Future()
-        fake_future.set_result("process reply")
-        fake_pool = MagicMock(name="pool")
-        fake_pool.submit.return_value = fake_future
-        clr._local_process_pool = fake_pool
-        clr._local_llm = None
-        clr._local_llm_pool = None
-        clr.backend = "in-process-process-pool"
-
-        result = await clr._call_model(
-            MagicMock(), "test prompt", max_tokens=50,
-        )
-        assert result == "process reply"
-        fake_pool.submit.assert_called_once()
-        # The submit call passes the module-level worker function.
-        args, _ = fake_pool.submit.call_args
-        assert args[0] is _process_pool_worker_call
-
-    @pytest.mark.asyncio
-    async def test_process_pool_call_error_raises_runtime_error(self, clr):
-        """Process-pool worker errors raise RuntimeError (fail-closed)."""
-        from concurrent.futures import Future
-        fake_future = Future()
-        fake_future.set_exception(RuntimeError("worker crashed"))
-        fake_pool = MagicMock(name="pool")
-        fake_pool.submit.return_value = fake_future
-        clr._local_process_pool = fake_pool
-        clr._local_llm = None
-        clr._local_llm_pool = None
-        clr.backend = "in-process-process-pool"
-
-        with pytest.raises(RuntimeError, match="worker crashed"):
-            await clr._call_model(MagicMock(), "prompt", max_tokens=10)
-
-    @pytest.mark.asyncio
-    async def test_call_model_routes_to_inprocess_when_process_pool_active(self, clr):
-        """The _call_model dispatch checks _local_process_pool too."""
-        clr._local_process_pool = MagicMock(name="pool")
-        clr._local_llm = None
-        clr._local_llm_pool = None
-        clr.backend = "in-process-process-pool"
-        with patch.object(clr, "_call_model_inprocess",
-                          new_callable=AsyncMock) as mock_inproc:
-            await clr._call_model(MagicMock(), "p", max_tokens=10)
-        mock_inproc.assert_called_once()
 
 
 class TestParallelVerifyClaims:

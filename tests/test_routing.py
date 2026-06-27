@@ -281,7 +281,35 @@ class TestCodeSpecialistRouting:
 
     @pytest.mark.asyncio
     async def test_code_task_no_test_spec_falls_back_unverified(self):
-        """Generalist can't produce tests -> single-candidate unverified, score 0.0."""
+        """Generalist can't produce tests -> single-candidate unverified, score 0.0.
+
+        v2.0: When the candidate code has restricted imports (e.g. os),
+        the static analysis fallback also fails, so the route is
+        code_specialist_unverified with score 0.0.
+        """
+        o = HybridReasoningOrchestrator(
+            vibe_endpoint="http://localhost:0",
+            generalist_endpoint="http://localhost:0",
+            code_specialist_endpoint="http://127.0.0.1:8082",
+            use_clr=True,
+            use_embedding_router=False,
+            use_clr_cache=False,
+            use_trajectory_store=False,
+        )
+        o._generate_test_spec = AsyncMock(return_value=None)
+        # Code with a restricted import -> static analysis fails -> unverified.
+        o._call_code_specialist = AsyncMock(return_value="import os\nprint(os.getcwd())")
+
+        result = await o.run("Write a Python function to square a number")
+        assert result.route_taken == "code_specialist_unverified"
+        assert result.clr_score == 0.0
+        o._call_code_specialist.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_code_task_no_test_spec_static_analysis_fallback(self):
+        """v2.0: When no test spec but candidate code parses cleanly with
+        no restricted imports, the static analysis fallback assigns a
+        partial heuristic score (0.4)."""
         o = HybridReasoningOrchestrator(
             vibe_endpoint="http://localhost:0",
             generalist_endpoint="http://localhost:0",
@@ -295,8 +323,8 @@ class TestCodeSpecialistRouting:
         o._call_code_specialist = AsyncMock(return_value="def square(n): return n*n")
 
         result = await o.run("Write a Python function to square a number")
-        assert result.route_taken == "code_specialist_unverified"
-        assert result.clr_score == 0.0
+        assert result.route_taken == "code_specialist_static_analysis"
+        assert result.clr_score == 0.4
         o._call_code_specialist.assert_awaited_once()
 
     @pytest.mark.asyncio

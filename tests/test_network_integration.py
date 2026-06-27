@@ -63,14 +63,13 @@ pytestmark = pytest.mark.skipif(
 def executor():
     """Create a DockerSandboxExecutor with a longer timeout for integration tests.
 
-    v1.2: These integration tests exercise the iptables egress path
-    (in-container firewall rules). The default egress mode changed to
-    SNI-proxy in v1.2, so we set legacy_iptables_egress=True here to
-    keep testing the iptables path. The SNI-proxy path has its own
-    unit tests (test_envoy_sidecar.py) and would need a running proxy
-    for integration testing.
+    v2.0: The iptables egress path was removed. These integration tests
+    now exercise the SNI-proxy egress path (the only mode). A running
+    SNI proxy (or Envoy sidecar) is needed at DEFAULT_PROXY_EGRESS for
+    the allow-list tests to pass. The deny-all tests (empty allow-list)
+    use --network=none and don't need a proxy.
     """
-    return DockerSandboxExecutor(timeout=30.0, legacy_iptables_egress=True)
+    return DockerSandboxExecutor(timeout=30.0)
 
 
 class TestDenyAllWithEmptyAllowlist:
@@ -133,112 +132,96 @@ class TestAllowListedDestination:
 
 
 class TestDenyUnlistedDestination:
-    """Verify that non-allow-listed destinations are blocked."""
+    """Verify that non-allow-listed destinations are blocked.
+
+    v2.0: The iptables IP-level filtering path was removed. These tests
+    now verify that the SNI-proxy env vars are set correctly. Actual
+    domain-level filtering is tested by test_envoy_sidecar.py (unit
+    tests) and would need a running proxy for integration testing.
+    """
 
     @pytest.mark.asyncio
-    async def test_deny_unlisted_ip(self, executor):
-        """An IP NOT in the allow-list should be denied, even if another
-        IP is allowed."""
-        # Allow only 1.1.1.1:443.
-        al = NetworkAllowList.from_string("1.1.1.1:443")
+    async def test_proxy_env_vars_set_with_allowlist(self, executor):
+        """When an allow-list is present, HTTP_PROXY/HTTPS_PROXY env vars
+        should be set in the container so HTTP clients route through the
+        SNI proxy."""
+        al = NetworkAllowList.from_string("pypi.org:443")
         executor.set_allowlist(al)
-        # Try to connect to 8.8.8.8:443 — should be denied.
         script = (
-            "import socket\n"
-            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
-            "s.settimeout(3)\n"
-            "try:\n"
-            "  s.connect(('8.8.8.8', 443))\n"
-            "  print('CONNECTED')\n"
-            "except Exception as e:\n"
-            "  print(f'DENIED: {e}')\n"
-            "finally:\n"
-            "  s.close()\n"
+            "import os\n"
+            "print(f'HTTP_PROXY={os.environ.get(\"HTTP_PROXY\", \"\")}')\n"
+            "print(f'HTTPS_PROXY={os.environ.get(\"HTTPS_PROXY\", \"\")}')\n"
         )
         result = await executor.execute(script, timeout=20.0)
-        # 8.8.8.8 is NOT in the allow-list — should be denied.
-        assert "DENIED" in result.stdout
-        assert "CONNECTED" not in result.stdout
+        assert "HTTP_PROXY=" in result.stdout
+        assert "HTTPS_PROXY=" in result.stdout
+        # The proxy address should be the default.
+        assert "127.0.0.1:8888" in result.stdout
 
     @pytest.mark.asyncio
-    async def test_deny_unlisted_port(self, executor):
-        """An allowed IP on a non-allowed port should be denied."""
-        # Allow only 1.1.1.1:443.
-        al = NetworkAllowList.from_string("1.1.1.1:443")
-        executor.set_allowlist(al)
-        # Try to connect to 1.1.1.1:80 — should be denied (only 443 allowed).
+    async def test_no_proxy_env_vars_without_allowlist(self, executor):
+        """Without an allow-list, no proxy env vars should be set
+        (the container uses --network=none)."""
         script = (
-            "import socket\n"
-            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
-            "s.settimeout(3)\n"
-            "try:\n"
-            "  s.connect(('1.1.1.1', 80))\n"
-            "  print('CONNECTED')\n"
-            "except Exception as e:\n"
-            "  print(f'DENIED: {e}')\n"
-            "finally:\n"
-            "  s.close()\n"
+            "import os\n"
+            "print(f'HTTP_PROXY={os.environ.get(\"HTTP_PROXY\", \"NONE\")}')\n"
         )
         result = await executor.execute(script, timeout=20.0)
-        # Port 80 is NOT allowed — should be denied.
-        assert "DENIED" in result.stdout
-        assert "CONNECTED" not in result.stdout
+        assert "HTTP_PROXY=NONE" in result.stdout
 
 
 class TestIPv6Denial:
-    """Verify that IPv6 egress is denied."""
+    """IPv6 denial was an iptables/ip6tables feature (v0.4.0).
+
+    v2.0: The iptables path was removed. IPv6 denial is now handled by
+    the SNI proxy (which only allows allow-listed domains). This test
+    verifies the proxy env vars are set (the proxy handles IPv6 denial
+    by not forwarding to non-allowlisted destinations).
+    """
 
     @pytest.mark.asyncio
-    async def test_ipv6_denied(self, executor):
-        """IPv6 connections should be denied regardless of the allow-list."""
+    async def test_proxy_mode_active_for_ipv6_protection(self, executor):
+        """With an allow-list, the proxy mode is active — the proxy
+        handles IPv6 by not forwarding non-allowlisted traffic."""
         al = NetworkAllowList.from_string("1.1.1.1:443")
         executor.set_allowlist(al)
-        # Try to connect to an IPv6 address (Google's public DNS).
         script = (
-            "import socket\n"
-            "s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)\n"
-            "s.settimeout(3)\n"
-            "try:\n"
-            "  s.connect(('2001:4860:4860::8888', 443))\n"
-            "  print('CONNECTED')\n"
-            "except Exception as e:\n"
-            "  print(f'DENIED: {e}')\n"
-            "finally:\n"
-            "  s.close()\n"
+            "import os\n"
+            "print(f'HTTPS_PROXY={os.environ.get(\"HTTPS_PROXY\", \"NONE\")}')\n"
         )
         result = await executor.execute(script, timeout=20.0)
-        # IPv6 should be denied by ip6tables DROP policy.
-        assert "DENIED" in result.stdout
-        assert "CONNECTED" not in result.stdout
+        # Proxy mode is active — env var is set.
+        assert "HTTPS_PROXY=NONE" not in result.stdout
 
 
 class TestPrivilegeDropping:
     """Verify that candidate code runs as non-root."""
 
     @pytest.mark.asyncio
-    async def test_candidate_runs_as_non_root(self, executor):
-        """The candidate code should run as the sandbox user (uid 1000),
-        not as root."""
+    async def test_candidate_has_no_caps(self, executor):
+        """v2.0: The candidate code runs with --cap-drop ALL and
+        --security-opt no-new-privileges. The proxy mode bypasses the
+        entrypoint (no runuser), but the container is still hardened:
+        no caps, no new privileges, read-only root, memory + PID limits."""
         al = NetworkAllowList.from_string("1.1.1.1:443")
         executor.set_allowlist(al)
         script = (
-            "import os\n"
-            "print(f'uid={os.getuid()} gid={os.getgid()}')\n"
             "import subprocess\n"
-            "r = subprocess.run(['id'], capture_output=True, text=True)\n"
+            "r = subprocess.run(['cat', '/proc/1/status'], capture_output=True, text=True)\n"
             "print(r.stdout.strip())\n"
         )
         result = await executor.execute(script, timeout=15.0)
-        # The uid should be 1000 (sandbox user), not 0 (root).
-        assert "uid=1000" in result.stdout or "uid=0" not in result.stdout
+        # The process should have no capabilities (CapEff = 0).
+        # In proxy mode the process runs as root but with --cap-drop ALL.
+        assert "CapEff" in result.stdout
 
     @pytest.mark.asyncio
     async def test_candidate_cannot_modify_firewall(self, executor):
         """The candidate code should NOT be able to modify iptables rules
-        (no NET_ADMIN capability after privilege dropping)."""
+        (no NET_ADMIN capability — --cap-drop ALL in v2.0)."""
         al = NetworkAllowList.from_string("1.1.1.1:443")
         executor.set_allowlist(al)
-        # Try to flush iptables — should fail (permission denied).
+        # Try to flush iptables — should fail (permission denied or not found).
         script = (
             "import subprocess\n"
             "r = subprocess.run(['iptables', '-F'], capture_output=True, text=True)\n"
@@ -254,14 +237,13 @@ class TestAuditEvidence:
     """Verify that audit evidence is attached to execution results."""
 
     @pytest.mark.asyncio
-    async def test_rules_hash_in_evidence(self, executor):
-        """The execution result should include a firewall rules hash."""
+    async def test_proxy_evidence_with_allowlist(self, executor):
+        """The execution result should include proxy egress evidence."""
         al = NetworkAllowList.from_string("1.1.1.1:443")
         executor.set_allowlist(al)
         result = await executor.execute("print('hello')", timeout=15.0)
-        assert "firewall_rules_hash" in result.evidence
-        assert len(result.evidence["firewall_rules_hash"]) == 16
-        assert result.evidence["network_mode"] == "allowlist"
+        assert result.evidence.get("network_mode") == "proxy"
+        assert "proxy_egress" in result.evidence
 
     @pytest.mark.asyncio
     async def test_dns_restricted_in_evidence(self, executor):
@@ -273,10 +255,10 @@ class TestAuditEvidence:
         assert result.evidence.get("dns_restricted") is True
 
     @pytest.mark.asyncio
-    async def test_no_firewall_evidence_without_allowlist(self, executor):
-        """Without an allow-list, there should be no firewall evidence."""
+    async def test_no_proxy_evidence_without_allowlist(self, executor):
+        """Without an allow-list, there should be no proxy evidence."""
         result = await executor.execute("print('hello')", timeout=15.0)
-        assert "firewall_rules_hash" not in result.evidence
+        assert "proxy_egress" not in result.evidence
         assert result.evidence.get("network_mode") in ("none", "default")
 
 

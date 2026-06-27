@@ -64,6 +64,7 @@ def generate_envoy_config(
     listen_addr: str = "0.0.0.0",
     admin_port: int = 9901,
     log_level: str = "info",
+    dns_resolver: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Generate an Envoy config dict from a NetworkAllowList.
 
@@ -77,6 +78,13 @@ def generate_envoy_config(
     Wildcard domains (e.g. ``*.pypi.org``) are matched via Envoy's
     matcher string suffix semantics. IP/CIDR entries are matched at the
     network filter level (tcp_proxy cluster resolution).
+
+    v2.0 wildcard DNS loophole fix: When ``dns_resolver`` is set, the
+    config pins DNS resolution to the trusted resolver. The
+    ``dynamic_upstream`` cluster uses ``STRICT_DNS`` with the resolver
+    instead of ``ORIGINAL_DST`` (which connects to whatever IP the
+    client resolved). This prevents DNS rebinding attacks where a
+    wildcard-matched domain resolves to an attacker-controlled IP.
 
     Returns a dict that can be serialized to JSON or YAML for Envoy's
     --config-yaml / -c flag.
@@ -180,6 +188,32 @@ def generate_envoy_config(
                                         # (plain HTTP CONNECT), the Host
                                         # header is checked by the
                                         # http_connect filter below.
+                                        # v2.0: Access log for DNS
+                                        # resolution auditing — records
+                                        # the SNI/Host, upstream IP, and
+                                        # allow/deny decision for every
+                                        # connection. This closes the
+                                        # wildcard DNS loophole by making
+                                        # every resolution observable.
+                                        "access_log": [
+                                            {
+                                                "name": "envoy.access_loggers.file",
+                                                "typed_config": {
+                                                    "@type": "type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog",
+                                                    "path": "/dev/stdout",
+                                                    "log_format": {
+                                                        "json_format": {
+                                                            "timestamp": "%START_TIME%",
+                                                            "upstream_host": "%UPSTREAM_HOST%",
+                                                            "server_name": "%REQUESTED_SERVER_NAME%",
+                                                            "bytes_sent": "%BYTES_SENT%",
+                                                            "bytes_received": "%BYTES_RECEIVED%",
+                                                            "duration": "%DURATION%",
+                                                        }
+                                                    },
+                                                },
+                                            }
+                                        ],
                                     },
                                 }
                             ],
@@ -190,9 +224,57 @@ def generate_envoy_config(
             "clusters": [
                 {
                     "name": "dynamic_upstream",
-                    "type": "ORIGINAL_DST",
+                    # v2.0: When dns_resolver is set, use STRICT_DNS to
+                    # pin DNS resolution to the trusted resolver. This
+                    # closes the wildcard DNS loophole: the proxy
+                    # resolves the SNI hostname via the trusted resolver
+                    # and connects to that IP — not the IP the client
+                    # resolved. Without this, an attacker could set up a
+                    # wildcard-matched domain that resolves to an
+                    # arbitrary IP, bypassing the domain filter.
+                    "type": "STRICT_DNS" if dns_resolver else "ORIGINAL_DST",
                     "lb_policy": "CLUSTER_PROVIDED",
                     "connect_timeout": "5s",
+                    # When using STRICT_DNS, configure the resolver.
+                    **(
+                        {
+                            "typed_dns_resolver_config": {
+                                "name": "envoy.network.dns_resolver.default",
+                                "typed_config": {
+                                    "@type": "type.googleapis.com/envoy.extensions.network.dns_resolver.udp.v3.UdpDnsResolverConfig",
+                                    "server_config": {
+                                        "address": {
+                                            "socket_address": {
+                                                "address": dns_resolver,
+                                                "port_value": 53,
+                                            }
+                                        }
+                                    },
+                                },
+                            },
+                            "load_assignment": {
+                                "cluster_name": "dynamic_upstream",
+                                "endpoints": [
+                                    {
+                                        "lb_endpoints": [
+                                            {
+                                                "endpoint": {
+                                                    "hostname": "placeholder",
+                                                    "address": {
+                                                        "socket_address": {
+                                                            "address": "placeholder",
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        ]
+                                    }
+                                ],
+                            },
+                        }
+                        if dns_resolver
+                        else {}
+                    ),
                 },
                 {
                     # Sinkhole cluster for denied connections: connects

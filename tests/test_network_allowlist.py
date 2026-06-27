@@ -424,58 +424,15 @@ class TestPrivilegeDropping:
         executor.set_dns_resolver("1.1.1.1")
         assert executor._dns_resolver == "1.1.1.1"
 
-    def test_firewall_env_includes_rules(self):
-        """The firewall env should include base64-encoded iptables rules."""
-        import base64
-        from sandbox.docker_executor import DockerSandboxExecutor
-        al = NetworkAllowList.from_string("10.0.0.1")
-        executor = DockerSandboxExecutor(allowlist=al)
-        env = executor._build_firewall_env()
-        assert "VT_IPTABLES_RULES" in env
-        # Decode and verify it contains iptables commands.
-        decoded = base64.b64decode(env["VT_IPTABLES_RULES"]).decode()
-        assert "iptables" in decoded
-        assert "10.0.0.1" in decoded
-
-    def test_firewall_env_includes_dns_resolver(self):
-        """When a DNS resolver is set, it should be in the firewall env."""
-        from sandbox.docker_executor import DockerSandboxExecutor
-        al = NetworkAllowList.from_string("10.0.0.1")
-        executor = DockerSandboxExecutor(allowlist=al, dns_resolver="8.8.8.8")
-        env = executor._build_firewall_env()
-        assert env.get("VT_DNS_RESOLVER") == "8.8.8.8"
-
-    def test_firewall_env_empty_without_allowlist(self):
-        """Without an allow-list, the firewall env should be empty."""
+    def test_proxy_egress_is_default_with_allowlist(self):
+        """v2.0: SNI-proxy is the only egress mode. The executor should
+        have proxy egress support, not iptables methods."""
         from sandbox.docker_executor import DockerSandboxExecutor
         executor = DockerSandboxExecutor()
-        env = executor._build_firewall_env()
-        assert env == {}
-
-    def test_firewall_env_empty_with_empty_allowlist(self):
-        """With an empty allow-list, the firewall env should be empty
-        (the executor uses --network=none in that case)."""
-        from sandbox.docker_executor import DockerSandboxExecutor
-        al = NetworkAllowList.from_string("")
-        executor = DockerSandboxExecutor(allowlist=al)
-        env = executor._build_firewall_env()
-        assert env == {}
-
-    def test_rules_hash_computed(self):
-        """The rules hash should be a non-empty hex string when rules exist."""
-        from sandbox.docker_executor import DockerSandboxExecutor
-        al = NetworkAllowList.from_string("10.0.0.1")
-        executor = DockerSandboxExecutor(allowlist=al)
-        env = executor._build_firewall_env()
-        h = executor._compute_rules_hash(env)
-        assert len(h) == 16  # truncated SHA-256
-        assert all(c in "0123456789abcdef" for c in h)
-
-    def test_rules_hash_empty_without_rules(self):
-        from sandbox.docker_executor import DockerSandboxExecutor
-        executor = DockerSandboxExecutor()
-        h = executor._compute_rules_hash({})
-        assert h == ""
+        assert hasattr(executor, "set_proxy_egress")
+        assert not hasattr(executor, "_build_firewall_env")
+        assert not hasattr(executor, "_compute_rules_hash")
+        assert not hasattr(executor, "set_legacy_iptables_egress")
 
 
 # ---------------------------------------------------------------------- #

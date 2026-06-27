@@ -172,3 +172,44 @@ class TestCLISmoke:
         except ImportError:
             parsed = json.loads(result.stdout)
         assert "static_resources" in parsed
+
+
+class TestDNSResolverPinning:
+    """v2.0: Wildcard DNS loophole fix — DNS resolver pinning."""
+
+    def test_dns_resolver_changes_cluster_type(self, allowlist):
+        """When dns_resolver is set, the upstream cluster uses STRICT_DNS
+        instead of ORIGINAL_DST (which connects to the client's resolved IP)."""
+        config = generate_envoy_config(allowlist, dns_resolver="8.8.8.8")
+        clusters = config["static_resources"]["clusters"]
+        upstream = next(c for c in clusters if c["name"] == "dynamic_upstream")
+        assert upstream["type"] == "STRICT_DNS"
+        assert "typed_dns_resolver_config" in upstream
+        # The resolver address should be the trusted DNS server.
+        resolver_addr = (
+            upstream["typed_dns_resolver_config"]["typed_config"]
+            ["server_config"]["address"]["socket_address"]["address"]
+        )
+        assert resolver_addr == "8.8.8.8"
+
+    def test_no_dns_resolver_uses_original_dst(self, allowlist):
+        """Without dns_resolver, the cluster uses ORIGINAL_DST (the default
+        — connects to the IP the client resolved via CONNECT)."""
+        config = generate_envoy_config(allowlist)
+        clusters = config["static_resources"]["clusters"]
+        upstream = next(c for c in clusters if c["name"] == "dynamic_upstream")
+        assert upstream["type"] == "ORIGINAL_DST"
+        assert "typed_dns_resolver_config" not in upstream
+
+    def test_access_log_includes_upstream_host(self, allowlist):
+        """v2.0: The tcp_proxy has access logging that records the upstream
+        host and SNI for DNS resolution auditing."""
+        config = generate_envoy_config(allowlist, dns_resolver="1.1.1.1")
+        listener = config["static_resources"]["listeners"][0]
+        tcp_proxy = listener["filter_chains"][0]["filters"][0]["typed_config"]
+        assert "access_log" in tcp_proxy
+        log_config = tcp_proxy["access_log"][0]
+        assert log_config["name"] == "envoy.access_loggers.file"
+        json_format = log_config["typed_config"]["log_format"]["json_format"]
+        assert "upstream_host" in json_format
+        assert "server_name" in json_format

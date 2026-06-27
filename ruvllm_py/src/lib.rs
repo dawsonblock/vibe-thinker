@@ -326,14 +326,361 @@ impl Engine {
     }
 }
 
+// ========================================================================== //
+// HNSW Vector Index (v2.0 — Phase 4.2)
+// ========================================================================== //
+// Exposes ruvllm::ruvector_integration::{UnifiedIndex, IntegrationConfig}
+// as a Python class for HNSW-based semantic similarity search. This lets
+// the vector_store.py AgentDBVectorStore use the in-process Rust HNSW
+// index instead of an HTTP sidecar.
+
+#[cfg(feature = "candle")]
+mod hnsw_backend {
+    use ruvllm::ruvector_integration::{
+        IntegrationConfig, UnifiedIndex, VectorMetadata,
+    };
+    use pyo3::prelude::*;
+    use pyo3::types::PyDict;
+
+    /// HNSW vector index for semantic similarity search.
+    ///
+    /// Wraps the ruvllm crate's UnifiedIndex (HNSW + metadata + reasoning
+    /// bank). Vectors are added with a string ID and optional metadata,
+    /// and searched by query embedding with a k-NN query.
+    #[pyclass]
+    pub struct HnswIndex {
+        inner: UnifiedIndex,
+    }
+
+    #[pymethods]
+    impl HnswIndex {
+        /// Create a new HNSW index.
+        ///
+        /// Args:
+        ///     dim: Vector dimension (e.g. 384 for all-MiniLM-L6-v2).
+        ///     m: HNSW graph connectivity parameter (default 16).
+        ///     ef_construction: HNSW build-time search depth (default 200).
+        ///     ef_search: HNSW query-time search depth (default 64).
+        #[new]
+        #[pyo3(signature = (dim, m = 16, ef_construction = 200, ef_search = 64))]
+        fn new(
+            dim: usize,
+            m: usize,
+            ef_construction: usize,
+            ef_search: usize,
+        ) -> PyResult<Self> {
+            let mut config = IntegrationConfig::default();
+            // Override HNSW params and embedding dimension.
+            config.embedding_dim = dim;
+            config.hnsw_config.m = m;
+            config.hnsw_config.ef_construction = ef_construction;
+            config.hnsw_config.ef_search = ef_search;
+            let index = UnifiedIndex::new(config)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            Ok(HnswIndex { inner: index })
+        }
+
+        /// Add a vector to the index.
+        ///
+        /// Args:
+        ///     id: Unique string identifier for the vector.
+        ///     vector: Embedding values (list of floats).
+        ///     source: Source label (e.g. "task", "pattern").
+        ///     quality_score: Quality score [0.0, 1.0].
+        #[pyo3(signature = (id, vector, source = "unknown", quality_score = 0.0))]
+        fn add(
+            &self,
+            id: String,
+            vector: Vec<f32>,
+            source: &str,
+            quality_score: f32,
+        ) -> PyResult<()> {
+            let metadata = VectorMetadata {
+                source: source.to_string(),
+                quality_score,
+                ..Default::default()
+            };
+            self.inner
+                .add(id, vector, metadata)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        }
+
+        /// Search for the k nearest neighbors of a query vector.
+        ///
+        /// Returns a list of dicts: [{"id": str, "score": float, "source": str}, ...]
+        fn search<'a>(
+            &self,
+            py: Python<'a>,
+            query: Vec<f32>,
+            k: usize,
+        ) -> PyResult<Vec<pyo3::Bound<'a, PyDict>>> {
+            let results = py.allow_threads(|| {
+                self.inner
+                    .search(&query, k)
+                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+            })?;
+            let mut out = Vec::with_capacity(results.len());
+            for r in results {
+                let dict = PyDict::new_bound(py);
+                dict.set_item("id", &r.id)?;
+                dict.set_item("score", r.score)?;
+                if let Some(meta) = &r.metadata {
+                    dict.set_item("source", &meta.source)?;
+                    dict.set_item("quality_score", meta.quality_score)?;
+                }
+                out.push(dict);
+            }
+            Ok(out)
+        }
+
+        /// Get index statistics.
+        fn stats<'a>(&self, py: Python<'a>) -> PyResult<pyo3::Bound<'a, PyDict>> {
+            let s = self.inner.stats();
+            let dict = PyDict::new_bound(py);
+            dict.set_item("total_vectors", s.total_vectors)?;
+            dict.set_item("total_searches", s.total_searches)?;
+            Ok(dict)
+        }
+    }
+}
+
+#[cfg(not(feature = "candle"))]
+mod hnsw_backend {
+    use pyo3::prelude::*;
+    use pyo3::types::PyDict;
+
+    /// HNSW vector index (STUB — build with --features candle).
+    #[pyclass]
+    pub struct HnswIndex;
+
+    #[pymethods]
+    impl HnswIndex {
+        #[new]
+        #[pyo3(signature = (dim, m = 16, ef_construction = 200, ef_search = 64))]
+        fn new(dim: usize, m: usize, ef_construction: usize, ef_search: usize) -> PyResult<Self> {
+            let _ = (dim, m, ef_construction, ef_search);
+            eprintln!("[ruvllm_py] HnswIndex stub — build with --features candle");
+            Ok(HnswIndex)
+        }
+
+        #[pyo3(signature = (id, vector, source = "unknown", quality_score = 0.0))]
+        fn add(&self, id: String, vector: Vec<f32>, source: &str, quality_score: f32) -> PyResult<()> {
+            let _ = (id, vector, source, quality_score);
+            Ok(())
+        }
+
+        fn search<'a>(
+            &self,
+            _py: Python<'a>,
+            query: Vec<f32>,
+            k: usize,
+        ) -> PyResult<Vec<pyo3::Bound<'a, PyDict>>> {
+            let _ = (query, k);
+            Ok(Vec::new())
+        }
+
+        fn stats<'a>(&self, _py: Python<'a>) -> PyResult<pyo3::Bound<'a, PyDict>> {
+            Ok(PyDict::new_bound(_py))
+        }
+    }
+}
+
+// ========================================================================== //
+// SONA Trajectory Recorder (v2.0 — Phase 4.3)
+// ========================================================================== //
+// Exposes ruvllm::sona::{SonaIntegration, SonaConfig, Trajectory} as a
+// Python class for recording learning trajectories. This lets the
+// orchestrator's data flywheel feed verified trajectories directly into
+// the Rust SONA engine without HTTP overhead.
+
+#[cfg(feature = "candle")]
+mod sona_backend {
+    use ruvllm::sona::{SonaConfig, SonaIntegration, Trajectory};
+    use pyo3::prelude::*;
+    use pyo3::types::PyDict;
+
+    /// SONA learning trajectory recorder.
+    ///
+    /// Wraps the ruvllm crate's SonaIntegration. Records verified
+    /// trajectories (query embedding, response embedding, quality score)
+    /// into the SONA learning engine for continuous improvement.
+    #[pyclass]
+    pub struct SonaRecorder {
+        inner: SonaIntegration,
+    }
+
+    #[pymethods]
+    impl SonaRecorder {
+        /// Create a new SONA recorder.
+        ///
+        /// Args:
+        ///     hidden_dim: LoRA hidden dimension (default 256).
+        ///     embedding_dim: Embedding dimension (default 384).
+        ///     quality_threshold: Minimum quality for learning (default 0.7).
+        #[new]
+        #[pyo3(signature = (hidden_dim = 256, embedding_dim = 384, quality_threshold = 0.7))]
+        fn new(hidden_dim: usize, embedding_dim: usize, quality_threshold: f32) -> Self {
+            let config = SonaConfig {
+                hidden_dim,
+                embedding_dim,
+                quality_threshold,
+                ..Default::default()
+            };
+            SonaRecorder {
+                inner: SonaIntegration::new(config),
+            }
+        }
+
+        /// Record a learning trajectory.
+        ///
+        /// Args:
+        ///     request_id: Unique request identifier.
+        ///     session_id: Session identifier.
+        ///     query_embedding: Query embedding vector.
+        ///     response_embedding: Response embedding vector.
+        ///     quality_score: Quality score [0.0, 1.0].
+        ///     model_index: Model index used (default 0).
+        #[pyo3(signature = (request_id, session_id, query_embedding, response_embedding, quality_score, model_index = 0))]
+        fn record(
+            &self,
+            request_id: String,
+            session_id: String,
+            query_embedding: Vec<f32>,
+            response_embedding: Vec<f32>,
+            quality_score: f32,
+            model_index: usize,
+        ) -> PyResult<()> {
+            let trajectory = Trajectory {
+                request_id,
+                session_id,
+                query_embedding,
+                response_embedding,
+                quality_score,
+                routing_features: Vec::new(),
+                model_index,
+                timestamp: chrono::Utc::now(),
+            };
+            self.inner
+                .record_trajectory(trajectory)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        }
+
+        /// Search for learned patterns similar to the query embedding.
+        ///
+        /// Returns a list of dicts: [{"id": int, "centroid": list, "cluster_size": int, "avg_quality": float}, ...]
+        fn search_patterns<'a>(
+            &self,
+            py: Python<'a>,
+            query: Vec<f32>,
+            limit: usize,
+        ) -> PyResult<Vec<pyo3::Bound<'a, PyDict>>> {
+            let patterns = py.allow_threads(|| self.inner.search_patterns(&query, limit));
+            let mut out = Vec::with_capacity(patterns.len());
+            for p in patterns {
+                let dict = PyDict::new_bound(py);
+                dict.set_item("id", p.id)?;
+                dict.set_item("centroid", p.centroid.clone())?;
+                dict.set_item("cluster_size", p.cluster_size)?;
+                dict.set_item("avg_quality", p.avg_quality)?;
+                out.push(dict);
+            }
+            Ok(out)
+        }
+
+        /// Trigger the background learning loop.
+        fn trigger_background_loop(&self) -> PyResult<()> {
+            self.inner
+                .trigger_background_loop()
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        }
+
+        /// Trigger the deep learning loop.
+        fn trigger_deep_loop(&self) -> PyResult<()> {
+            self.inner
+                .trigger_deep_loop()
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        }
+
+        /// Get SONA statistics.
+        fn stats<'a>(&self, py: Python<'a>) -> PyResult<pyo3::Bound<'a, PyDict>> {
+            let s = self.inner.stats();
+            let dict = PyDict::new_bound(py);
+            dict.set_item("total_trajectories", s.total_trajectories)?;
+            dict.set_item("instant_updates", s.instant_updates)?;
+            dict.set_item("background_updates", s.background_updates)?;
+            dict.set_item("deep_updates", s.deep_updates)?;
+            Ok(dict)
+        }
+    }
+}
+
+#[cfg(not(feature = "candle"))]
+mod sona_backend {
+    use pyo3::prelude::*;
+    use pyo3::types::PyDict;
+
+    /// SONA trajectory recorder (STUB — build with --features candle).
+    #[pyclass]
+    pub struct SonaRecorder;
+
+    #[pymethods]
+    impl SonaRecorder {
+        #[new]
+        #[pyo3(signature = (hidden_dim = 256, embedding_dim = 384, quality_threshold = 0.7))]
+        fn new(hidden_dim: usize, embedding_dim: usize, quality_threshold: f32) -> Self {
+            let _ = (hidden_dim, embedding_dim, quality_threshold);
+            eprintln!("[ruvllm_py] SonaRecorder stub — build with --features candle");
+            SonaRecorder
+        }
+
+        #[pyo3(signature = (request_id, session_id, query_embedding, response_embedding, quality_score, model_index = 0))]
+        fn record(
+            &self,
+            request_id: String,
+            session_id: String,
+            query_embedding: Vec<f32>,
+            response_embedding: Vec<f32>,
+            quality_score: f32,
+            model_index: usize,
+        ) -> PyResult<()> {
+            let _ = (request_id, session_id, query_embedding, response_embedding, quality_score, model_index);
+            Ok(())
+        }
+
+        fn search_patterns<'a>(
+            &self,
+            _py: Python<'a>,
+            query: Vec<f32>,
+            limit: usize,
+        ) -> PyResult<Vec<pyo3::Bound<'a, PyDict>>> {
+            let _ = (query, limit);
+            Ok(Vec::new())
+        }
+
+        fn trigger_background_loop(&self) -> PyResult<()> {
+            Ok(())
+        }
+
+        fn trigger_deep_loop(&self) -> PyResult<()> {
+            Ok(())
+        }
+
+        fn stats<'a>(&self, _py: Python<'a>) -> PyResult<pyo3::Bound<'a, PyDict>> {
+            Ok(PyDict::new_bound(_py))
+        }
+    }
+}
+
 /// Python module initialization.
 #[pymodule]
 fn ruvllm_py(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<EngineConfig>()?;
     m.add_class::<Engine>()?;
+    m.add_class::<hnsw_backend::HnswIndex>()?;
+    m.add_class::<sona_backend::SonaRecorder>()?;
     // Use add() instead of setattr() for __version__ — setattr on
     // module dunder attributes can fail silently in some PyO3 configs.
-    m.add("__version__", "0.1.0")?;
+    m.add("__version__", "0.2.0")?;
     let doc = if cfg!(feature = "candle") {
         "Python bindings for the RuvLLM Rust inference engine (candle backend)."
     } else {
