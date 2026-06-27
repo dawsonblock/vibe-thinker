@@ -13,6 +13,7 @@ from sandbox.sni_proxy import (
     domain_matches,
     is_domain_allowed,
     SNIEgressProxy,
+    DnsAuditor,
 )
 
 
@@ -162,6 +163,116 @@ class TestIsDomainAllowed:
         assert is_domain_allowed(
             "evil.com", {"pypi.org", "github.com"}, {"*.pypi.org"}
         ) is False
+
+
+# ---------------------------------------------------------------------- #
+# DnsAuditor — audit logging + per-domain rate limiting (Phase 1.2)
+# ---------------------------------------------------------------------- #
+class TestDnsAuditor:
+    """Tests for the host-side DNS audit log + rate limiter."""
+
+    def test_rate_limit_disabled_allows_all(self):
+        """With rate_limit=None, every query is allowed."""
+        a = DnsAuditor(rate_limit=None)
+        for _ in range(100):
+            assert a.allow_query("pypi.org") is True
+
+    def test_rate_limit_enforced(self):
+        """Queries beyond the limit are denied (fail-closed)."""
+        a = DnsAuditor(rate_limit=3, window=60.0)
+        # allow_query does NOT record; record() does. Simulate 3 allowed
+        # resolutions then a 4th check must still pass until recorded.
+        assert a.allow_query("pypi.org") is True
+        a.record("pypi.org", ["1.2.3.4"], "allowed")
+        assert a.allow_query("pypi.org") is True
+        a.record("pypi.org", ["1.2.3.4"], "allowed")
+        assert a.allow_query("pypi.org") is True
+        a.record("pypi.org", ["1.2.3.4"], "allowed")
+        # Now 3 recorded queries in the window — 4th check is denied.
+        assert a.allow_query("pypi.org") is False
+
+    def test_rate_limit_per_domain_independent(self):
+        """The rate limit is tracked per-domain, not globally."""
+        a = DnsAuditor(rate_limit=2, window=60.0)
+        a.record("a.com", ["1.1.1.1"], "allowed")
+        a.record("a.com", ["1.1.1.1"], "allowed")
+        # a.com is at limit; b.com is unaffected.
+        assert a.allow_query("a.com") is False
+        assert a.allow_query("b.com") is True
+
+    def test_rate_limit_window_eviction(self):
+        """Entries older than the window are evicted (sliding window)."""
+        a = DnsAuditor(rate_limit=2, window=0.05)  # 50ms window
+        a.record("a.com", ["1.1.1.1"], "allowed")
+        a.record("a.com", ["1.1.1.1"], "allowed")
+        assert a.allow_query("a.com") is False
+        import time as _time
+        _time.sleep(0.06)  # window expires
+        assert a.allow_query("a.com") is True
+
+    def test_denied_verdict_does_not_consume_quota(self):
+        """A denied/rate-limited resolution does not add to the bucket."""
+        a = DnsAuditor(rate_limit=2, window=60.0)
+        a.record("a.com", [], "denied", "rate_limited")
+        a.record("a.com", [], "error", "getaddrinfo failed")
+        # No allowed records -> still within limit.
+        assert a.allow_query("a.com") is True
+
+    def test_counters_tracked(self):
+        a = DnsAuditor(rate_limit=10)
+        a.record("a.com", ["1.1.1.1"], "allowed")
+        a.record("a.com", ["1.1.1.1"], "allowed")
+        a.record("b.com", [], "denied", "rate_limited")
+        a.record("c.com", [], "error", "no results")
+        assert a._allowed_count == 2
+        assert a._denied_count == 2
+
+    def test_record_emits_json_log(self, capsys):
+        a = DnsAuditor(rate_limit=10, log=True)
+        a.record("pypi.org", ["151.101.0.1"], "allowed")
+        captured = capsys.readouterr()
+        import json
+        line = captured.err.strip()
+        assert line  # non-empty
+        entry = json.loads(line)
+        assert entry["domain"] == "pypi.org"
+        assert entry["verdict"] == "allowed"
+        assert "151.101.0.1" in entry["ips"]
+        assert "ts" in entry
+
+    def test_record_log_disabled_no_output(self, capsys):
+        a = DnsAuditor(rate_limit=10, log=False)
+        a.record("pypi.org", ["1.2.3.4"], "allowed")
+        captured = capsys.readouterr()
+        assert captured.err == ""
+
+    @pytest.mark.asyncio
+    async def test_resolve_host_rate_limited_returns_none(self):
+        """_resolve_host returns None (fail-closed) when over the rate limit."""
+        proxy = SNIEgressProxy(
+            allowed_domains={"pypi.org"},
+            allowed_wildcards=set(),
+            port=0,
+            dns_rate_limit=1,
+            dns_rate_window=60.0,
+        )
+        # Prime the auditor with one allowed record -> at limit.
+        proxy._dns_auditor.record("pypi.org", ["1.2.3.4"], "allowed")
+        # Next resolution attempt must be denied without hitting getaddrinfo.
+        result = await proxy._resolve_host("pypi.org")
+        assert result is None
+        assert proxy._dns_auditor._denied_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_resolve_host_unresolvable_returns_none(self):
+        """_resolve_host returns None for a domain that won't resolve."""
+        proxy = SNIEgressProxy(
+            allowed_domains={"nonexistent.invalid"},
+            allowed_wildcards=set(),
+            port=0,
+        )
+        result = await proxy._resolve_host("nonexistent.invalid")
+        assert result is None
 
 
 # ---------------------------------------------------------------------- #

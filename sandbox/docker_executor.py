@@ -19,11 +19,15 @@ domain — solving CDN IP rotation. No NET_ADMIN cap needed.
 
 ## Security architecture (v3.1)
 
-The container runs with --cap-drop ALL and --security-opt
-no-new-privileges. The --entrypoint python3 flag bypasses the sandbox
-image's legacy iptables entrypoint (which required SETGID/SETUID caps
-for runuser). In proxy mode, the container has no special capabilities
-at all — the proxy handles all filtering externally.
+The container runs with --cap-drop ALL, --security-opt
+no-new-privileges, and --user 1000:1000 (the sandbox user). The
+--entrypoint python3 flag bypasses the sandbox image's legacy iptables
+entrypoint (which required SETGID/SETUID caps for runuser). In proxy
+mode, the container has no special capabilities at all and runs as a
+non-root user — the proxy handles all filtering externally. Running as
+uid 1000 (not root-with-no-caps) is strict defense-in-depth: even a
+kernel cap-bypass or a misconfigured cap grant leaves the process
+non-root.
 
 v3.1 DNS exfiltration fix: When an allow-list is present, the executor
 resolves allow-listed domains on the HOST at startup and injects them
@@ -170,6 +174,7 @@ class DockerSandboxExecutor:
                 "--read-only",
                 "--security-opt", "no-new-privileges",
                 "--cap-drop", "ALL",
+                "--user", "1000:1000",
                 "--pids-limit", "64",
                 "--tmpfs", "/tmp:rw,size=10m",
                 "--workdir", "/tmp",
@@ -212,6 +217,7 @@ class DockerSandboxExecutor:
                 "--read-only",
                 "--security-opt", "no-new-privileges",
                 "--cap-drop", "ALL",
+                "--user", "1000:1000",
                 "--pids-limit", "64",
                 "--tmpfs", "/tmp:rw,size=10m",
                 "--workdir", "/tmp",

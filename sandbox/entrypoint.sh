@@ -1,9 +1,17 @@
 #!/bin/bash
 # vibe-thinker sandbox entrypoint
 #
-# This script runs as root (the container starts as root via Docker).
-# It applies firewall rules from an environment variable, then drops
-# privileges to the 'sandbox' user and execs the candidate command.
+# v1.0 (Phase 1.3): root-aware entrypoint. The container defaults to the
+# non-root 'sandbox' user (uid 1000) via the Dockerfile USER directive.
+# This script is now root-aware:
+#   - If invoked AS ROOT (opt-in via `docker run --user root`): apply the
+#     legacy in-container iptables firewall rules, then drop privileges
+#     to the 'sandbox' user and exec the candidate command. This is the
+#     DEPRECATED path — kept for defense-in-depth fallback.
+#   - If invoked AS NON-ROOT (the default): skip iptables entirely (the
+#     non-root user cannot run iptables anyway) and exec the candidate
+#     command directly. Network egress filtering is handled at the HOST
+#     level by the SNI proxy / Envoy sidecar (Phase 1.2).
 #
 # The firewall rules are passed via the VT_IPTABLES_RULES environment
 # variable as a base64-encoded, newline-separated list of iptables
@@ -19,14 +27,25 @@
 #
 # Security properties:
 #   1. Firewall rules are applied BEFORE candidate code runs (no TOCTOU)
+#      [legacy root path only]
 #   2. Candidate code runs as uid 1000 (sandbox user), NOT root
 #   3. Candidate code has no NET_ADMIN capability (dropped by Docker)
 #   4. IPv6 is disabled via ip6tables DROP policy (prevents IPv6 bypass)
+#      [legacy root path only]
 #   5. DNS is restricted to the resolver in /etc/resolv.conf (if specified)
+#      [legacy root path only]
 #
 set -euo pipefail
 
-# --- Phase 1: Apply firewall rules (as root) ---
+# --- Detect whether we are root ---
+if [ "$(id -u)" -ne 0 ]; then
+    # Non-root (the v1.0 default). No iptables possible — host-level
+    # egress filtering (SNI proxy / Envoy) is the production path.
+    # Just exec the candidate command as the current user.
+    exec "$@"
+fi
+
+# --- Phase 1: Apply firewall rules (as root — legacy/deprecated path) ---
 
 IPTABLES_RULES_B64="${VT_IPTABLES_RULES:-}"
 DNS_RESOLVER="${VT_DNS_RESOLVER:-}"

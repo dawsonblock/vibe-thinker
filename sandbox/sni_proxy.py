@@ -34,10 +34,13 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import json
 import re
 import socket
 import sys
-from typing import Any, Dict, List, Optional, Set, Tuple
+import time
+from collections import defaultdict, deque
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass, field
 
 
@@ -151,6 +154,94 @@ def is_domain_allowed(
 
 
 # ---------------------------------------------------------------------------
+# DNS audit logging + rate limiting (Phase 1.2)
+# ---------------------------------------------------------------------------
+#
+# The v3.1 `--add-host` injection eliminates DNS access *inside* the
+# sandbox container (no resolver in /etc/resolv.conf, only injected
+# /etc/hosts entries). This closes in-container DNS-tunnel exfiltration.
+#
+# This class adds the second layer the production plan calls for: a host-
+# side DNS audit log + per-domain rate limiter on the proxy's OWN
+# resolution path. The SNI proxy resolves allow-listed hostnames on the
+# host before tunneling; logging and rate-limiting those resolutions gives
+# auditability and bounds the blast radius of a compromised allow-list
+# entry (e.g., a wildcard that an attacker floods with subdomain lookups).
+#
+# Fail-closed: when over the rate limit, the resolution is denied and the
+# connection is rejected (the caller returns 403 / closes).
+
+class DnsAuditor:
+    """Per-domain DNS query audit log + sliding-window rate limiter.
+
+    Args:
+        rate_limit: max queries per domain per window. None disables
+            rate limiting (logging still occurs if `log` is True).
+        window: sliding window length in seconds.
+        log: if True, emit one JSON line per resolution attempt to stderr
+            (structured audit trail: ts, domain, ips, verdict, reason).
+    """
+
+    def __init__(
+        self,
+        rate_limit: Optional[int] = None,
+        window: float = 60.0,
+        log: bool = False,
+    ):
+        self.rate_limit = rate_limit
+        self.window = window
+        self.log = log
+        self._queries: Dict[str, Deque[float]] = defaultdict(deque)
+        self._denied_count = 0
+        self._allowed_count = 0
+
+    def allow_query(self, domain: str) -> bool:
+        """Check the per-domain rate limit. Does NOT record a query.
+
+        Returns True if a query for `domain` is within the rate limit
+        (or if rate limiting is disabled). Returns False if the domain
+        is over the limit — the caller must deny the connection.
+        """
+        if self.rate_limit is None:
+            return True
+        domain = domain.lower().strip()
+        now = time.monotonic()
+        bucket = self._queries[domain]
+        # Evict entries outside the sliding window.
+        cutoff = now - self.window
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+        return len(bucket) < self.rate_limit
+
+    def record(self, domain: str, ips: List[str], verdict: str, reason: str = "") -> None:
+        """Record a resolution attempt.
+
+        Args:
+            domain: the hostname being resolved.
+            ips: resolved IP addresses (empty on failure/denial).
+            verdict: "allowed" | "denied" | "error".
+            reason: human-readable detail (e.g. "rate_limited",
+                "getaddrinfo failed: ...").
+        """
+        domain = domain.lower().strip()
+        if verdict == "allowed":
+            self._allowed_count += 1
+            if self.rate_limit is not None:
+                self._queries[domain].append(time.monotonic())
+        else:
+            self._denied_count += 1
+        if self.log:
+            entry = {
+                "ts": time.time(),
+                "domain": domain,
+                "ips": ips,
+                "verdict": verdict,
+                "reason": reason,
+            }
+            print(json.dumps(entry), file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------------------
 # SNI proxy server
 # ---------------------------------------------------------------------------
 
@@ -173,6 +264,9 @@ class SNIEgressProxy:
         port: int = 8888,
         host: str = "127.0.0.1",
         dns_resolver: Optional[str] = None,
+        dns_audit: bool = False,
+        dns_rate_limit: Optional[int] = None,
+        dns_rate_window: float = 60.0,
     ):
         self.allowed_domains = allowed_domains
         self.allowed_wildcards = allowed_wildcards
@@ -183,6 +277,37 @@ class SNIEgressProxy:
         self._server: Optional[asyncio.AbstractServer] = None
         self._denied_count = 0
         self._allowed_count = 0
+        # Phase 1.2: host-side DNS audit log + per-domain rate limiter.
+        self._dns_auditor = DnsAuditor(
+            rate_limit=dns_rate_limit,
+            window=dns_rate_window,
+            log=dns_audit,
+        )
+
+    async def _resolve_host(self, host: str) -> Optional[str]:
+        """Resolve a hostname with audit logging + rate limiting.
+
+        Returns the first resolved IP string, or None if the resolution
+        was denied (rate limited) or failed. The caller must deny the
+        connection when None is returned (fail-closed).
+        """
+        # Rate-limit check BEFORE resolution (don't burn a lookup on a
+        # domain that's already over the limit).
+        if not self._dns_auditor.allow_query(host):
+            self._dns_auditor.record(host, [], "denied", "rate_limited")
+            return None
+        try:
+            loop = asyncio.get_event_loop()
+            infos = await loop.getaddrinfo(host, None, family=socket.AF_INET)
+            ips = list({info[4][0] for info in infos})
+            if not ips:
+                self._dns_auditor.record(host, [], "error", "no AF_INET results")
+                return None
+            self._dns_auditor.record(host, ips, "allowed")
+            return ips[0]
+        except socket.gaierror as e:
+            self._dns_auditor.record(host, [], "error", f"getaddrinfo failed: {e}")
+            return None
 
     async def start(self):
         self._server = await asyncio.start_server(
@@ -276,7 +401,15 @@ class SNIEgressProxy:
 
         sni = extract_sni(client_hello)
         if sni and is_domain_allowed(sni, self.allowed_domains, self.allowed_wildcards):
-            # Allowed — tunnel the connection.
+            # Allowed by the allow-list — now resolve with audit + rate
+            # limiting before tunneling (Phase 1.2).
+            resolved_ip = await self._resolve_host(host)
+            if resolved_ip is None:
+                # Resolution denied/failed — fail-closed.
+                self._denied_count += 1
+                client_writer.write(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+                await client_writer.drain()
+                return
             self._allowed_count += 1
             try:
                 # Send 200 Connection Established to the client.
@@ -285,9 +418,9 @@ class SNIEgressProxy:
                 # Forward the ClientHello we already read.
                 client_writer.write(client_hello)
                 await client_writer.drain()
-                # Connect to the real destination.
+                # Connect to the real destination (resolved IP).
                 remote_reader, remote_writer = await asyncio.open_connection(
-                    host, int(port)
+                    resolved_ip, int(port)
                 )
                 remote_writer.write(client_hello)
                 await remote_writer.drain()
@@ -329,7 +462,6 @@ class SNIEgressProxy:
                 host = host.split(":")[0]
 
         if host and is_domain_allowed(host, self.allowed_domains, self.allowed_wildcards):
-            self._allowed_count += 1
             # Forward the request to the destination.
             # Parse the URL from the request line.
             parts = first_line.split()
@@ -346,9 +478,18 @@ class SNIEgressProxy:
             if not host_part:
                 host_part = target_host
                 port_part = "80"
+            # Resolve with audit + rate limiting before connecting (Phase 1.2).
+            resolved_ip = await self._resolve_host(host_part)
+            if resolved_ip is None:
+                # Resolution denied/failed — fail-closed.
+                self._denied_count += 1
+                client_writer.write(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+                await client_writer.drain()
+                return
+            self._allowed_count += 1
             try:
                 remote_reader, remote_writer = await asyncio.open_connection(
-                    host_part, int(port_part)
+                    resolved_ip, int(port_part)
                 )
                 # Forward the request.
                 remote_writer.write(f"{parts[0]} {path} HTTP/1.1\r\n".encode())
@@ -409,6 +550,12 @@ def main():
                         help="Comma-separated allow-list (same format as --network-allowlist)")
     parser.add_argument("--allowlist-file", help="File with allow-list entries")
     parser.add_argument("--dns-resolver", default="", help="Restrict DNS to this resolver IP")
+    parser.add_argument("--dns-audit", action="store_true",
+                        help="Log every DNS resolution as a JSON line to stderr (audit trail)")
+    parser.add_argument("--dns-rate-limit", type=int, default=None,
+                        help="Max DNS queries per domain per window (default: unlimited)")
+    parser.add_argument("--dns-rate-window", type=float, default=60.0,
+                        help="Sliding window (seconds) for the per-domain DNS rate limit")
     args = parser.parse_args()
 
     # Parse the allow-list.
@@ -437,6 +584,9 @@ def main():
         port=args.port,
         host=args.host,
         dns_resolver=args.dns_resolver or None,
+        dns_audit=args.dns_audit,
+        dns_rate_limit=args.dns_rate_limit,
+        dns_rate_window=args.dns_rate_window,
     )
 
     loop = asyncio.new_event_loop()

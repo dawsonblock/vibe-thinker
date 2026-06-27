@@ -202,7 +202,9 @@ class TestPrivilegeDropping:
         """v2.0: The candidate code runs with --cap-drop ALL and
         --security-opt no-new-privileges. The proxy mode bypasses the
         entrypoint (no runuser), but the container is still hardened:
-        no caps, no new privileges, read-only root, memory + PID limits."""
+        no caps, no new privileges, read-only root, memory + PID limits.
+        v1.0 (Phase 1.3): the process also runs as uid 1000 (--user
+        1000:1000), not root-with-no-caps — strict defense-in-depth."""
         al = NetworkAllowList.from_string("1.1.1.1:443")
         executor.set_allowlist(al)
         script = (
@@ -212,8 +214,23 @@ class TestPrivilegeDropping:
         )
         result = await executor.execute(script, timeout=15.0)
         # The process should have no capabilities (CapEff = 0).
-        # In proxy mode the process runs as root but with --cap-drop ALL.
+        # v1.0: runs as uid 1000 with --cap-drop ALL (non-root).
         assert "CapEff" in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_candidate_runs_as_non_root(self, executor):
+        """v1.0 (Phase 1.3): the candidate process runs as uid 1000
+        (the sandbox user), NOT root. The executor passes --user
+        1000:1000 and the image defaults to USER sandbox."""
+        al = NetworkAllowList.from_string("1.1.1.1:443")
+        executor.set_allowlist(al)
+        script = (
+            "import os\n"
+            "print(f'uid={os.getuid()} gid={os.getgid()}')\n"
+        )
+        result = await executor.execute(script, timeout=15.0)
+        assert "uid=0" not in result.stdout
+        assert "uid=1000" in result.stdout
 
     @pytest.mark.asyncio
     async def test_candidate_cannot_modify_firewall(self, executor):

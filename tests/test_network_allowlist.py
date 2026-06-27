@@ -553,6 +553,32 @@ class TestSandboxImage:
         assert "ENTRYPOINT" in content
         assert "vt-entrypoint.sh" in content
 
+    def test_dockerfile_defaults_to_non_root_user(self):
+        """v1.0 (Phase 1.3): the Dockerfile must set USER sandbox so the
+        container starts as uid 1000 by default, not root."""
+        with open(os.path.join(os.path.dirname(__file__), "..", "sandbox", "Dockerfile")) as f:
+            content = f.read()
+        assert "USER sandbox" in content
+
+    def test_executor_passes_user_flag(self):
+        """v1.0 (Phase 1.3): the DockerSandboxExecutor must pass
+        --user 1000:1000 so the candidate process runs as the sandbox
+        user regardless of the image default."""
+        with open(os.path.join(os.path.dirname(__file__), "..", "sandbox", "docker_executor.py")) as f:
+            content = f.read()
+        assert '"--user", "1000:1000"' in content
+
+    def test_entrypoint_is_root_aware(self):
+        """v1.0 (Phase 1.3): the entrypoint must detect whether it is
+        running as root and skip iptables when non-root (the default),
+        exec'ing the candidate command directly instead."""
+        with open(os.path.join(os.path.dirname(__file__), "..", "sandbox", "entrypoint.sh")) as f:
+            content = f.read()
+        assert "id -u" in content
+        # The non-root branch must exec directly without iptables.
+        nonroot_marker = "exec \"$@\""
+        assert nonroot_marker in content
+
     def test_entrypoint_exists(self):
         import os
         path = os.path.join(os.path.dirname(__file__), "..", "sandbox", "entrypoint.sh")
