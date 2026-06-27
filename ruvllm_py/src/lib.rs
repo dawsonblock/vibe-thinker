@@ -331,13 +331,15 @@ impl Engine {
 fn ruvllm_py(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<EngineConfig>()?;
     m.add_class::<Engine>()?;
-    m.setattr("__version__", "0.1.0")?;
+    // Use add() instead of setattr() for __version__ — setattr on
+    // module dunder attributes can fail silently in some PyO3 configs.
+    m.add("__version__", "0.1.0")?;
     let doc = if cfg!(feature = "candle") {
         "Python bindings for the RuvLLM Rust inference engine (candle backend)."
     } else {
         "Python bindings for the RuvLLM Rust inference engine (STUB — build \
          with --features candle for real inference)."
     };
-    m.setattr("__doc__", doc)?;
+    m.add("__doc__", doc)?;
     Ok(())
 }
