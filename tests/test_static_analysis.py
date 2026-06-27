@@ -1,13 +1,15 @@
-"""Tests for the static analysis fallback (v2.0, hardened v3.0).
+"""Tests for the static analysis fallback (v2.0, hardened v3.0) and
+the v3.1 wasmtime sandbox fallback.
 
 When the Generalist fails to generate unit tests, the code verification
-loop falls back to a static analysis pass. This tests the
-_static_analysis_fallback function directly.
+loop falls back to a sandboxed execution pass (v3.1) or, if no sandbox
+is available, the deprecated AST static analysis pass (v2.0).
 """
 
 import pytest
+from unittest.mock import AsyncMock, MagicMock
 
-from hybrid_orchestrator import _static_analysis_fallback
+from hybrid_orchestrator import _static_analysis_fallback, _wasmtime_sandbox_fallback
 
 
 class TestStaticAnalysisFallback:
@@ -196,3 +198,98 @@ class TestStaticAnalysisEvasionVectors:
         score, issues = _static_analysis_fallback(code)
         assert score == 0.0
         assert any("builtins" in i for i in issues)
+
+
+# ---------------------------------------------------------------------- #
+# Wasmtime sandbox fallback (v3.1)
+# ---------------------------------------------------------------------- #
+class TestWasmtimeSandboxFallback:
+    """v3.1: Tests for the sandboxed execution fallback."""
+
+    @pytest.mark.asyncio
+    async def test_no_sandbox_returns_none(self):
+        """When no sandbox is available (no wasmtime, no Docker), returns
+        (None, []) so the caller falls back to AST."""
+        score, issues = await _wasmtime_sandbox_fallback(
+            "print('hello')", code_verifier=None,
+        )
+        assert score is None
+        assert issues == []
+
+    @pytest.mark.asyncio
+    async def test_docker_sandbox_success(self):
+        """When the Docker sandbox executes the code successfully (exit 0),
+        returns (0.65, [])."""
+        mock_executor = MagicMock()
+        mock_result = MagicMock()
+        mock_result.exit_code = 0
+        mock_result.stderr = ""
+        mock_executor.execute = AsyncMock(return_value=mock_result)
+        mock_verifier = MagicMock()
+        mock_verifier.executor = mock_executor
+
+        score, issues = await _wasmtime_sandbox_fallback(
+            "print('hello')", code_verifier=mock_verifier,
+        )
+        assert score == 0.65
+        assert issues == []
+
+    @pytest.mark.asyncio
+    async def test_docker_sandbox_failure(self):
+        """When the code errors in the sandbox (non-zero exit), returns
+        (0.0, [error])."""
+        mock_executor = MagicMock()
+        mock_result = MagicMock()
+        mock_result.exit_code = 1
+        mock_result.stderr = "NameError: name 'x' is not defined"
+        mock_executor.execute = AsyncMock(return_value=mock_result)
+        mock_verifier = MagicMock()
+        mock_verifier.executor = mock_executor
+
+        score, issues = await _wasmtime_sandbox_fallback(
+            "print(x)", code_verifier=mock_verifier,
+        )
+        assert score == 0.0
+        assert len(issues) == 1
+        assert "exit code 1" in issues[0]
+
+    @pytest.mark.asyncio
+    async def test_docker_sandbox_execution_exception(self):
+        """When the sandbox execution itself raises, returns (0.0, [error])."""
+        mock_executor = MagicMock()
+        mock_executor.execute = AsyncMock(side_effect=RuntimeError("sandbox down"))
+        mock_verifier = MagicMock()
+        mock_verifier.executor = mock_executor
+
+        score, issues = await _wasmtime_sandbox_fallback(
+            "print('hello')", code_verifier=mock_verifier,
+        )
+        assert score == 0.0
+        assert len(issues) == 1
+        assert "sandbox down" in issues[0]
+
+    @pytest.mark.asyncio
+    async def test_verifier_with_no_executor_returns_none(self):
+        """When the code_verifier has no executor, returns (None, [])."""
+        mock_verifier = MagicMock()
+        mock_verifier.executor = None
+        score, issues = await _wasmtime_sandbox_fallback(
+            "print('hello')", code_verifier=mock_verifier,
+        )
+        assert score is None
+
+    @pytest.mark.asyncio
+    async def test_score_capped_at_065(self):
+        """The sandbox score is always 0.65 — never 1.0."""
+        mock_executor = MagicMock()
+        mock_result = MagicMock()
+        mock_result.exit_code = 0
+        mock_executor.execute = AsyncMock(return_value=mock_result)
+        mock_verifier = MagicMock()
+        mock_verifier.executor = mock_executor
+
+        score, _ = await _wasmtime_sandbox_fallback(
+            "def perfect(): return 42", code_verifier=mock_verifier,
+        )
+        assert score == 0.65
+        assert score < 0.7  # Below the cache trust threshold

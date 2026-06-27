@@ -38,3 +38,30 @@ llama-cpp-python>=0.2.70,<1
 # Install with: pip install cryptography
 cryptography>=42,<46
 
+# Optional: free factual retrieval backends (v3.1).
+# When paid Serper/SearchApi keys are absent, the FactualVerifier falls back
+# to these free backends so it can still fetch real source text. Without them,
+# the factory returns None and the verifier fail-closes to unsupported_factual.
+# Install with: pip install duckduckgo_search wikipedia
+duckduckgo_search>=4.0,<5
+wikipedia>=1.4,<2
+
+# Optional: ONNX embedding fallback (v3.1).
+# When sentence-transformers is absent, RuvLLMBinding.get_embeddings() falls
+# back to the quantized all-MiniLM-L6-v2 ONNX model via onnxruntime. Without
+# it (and without sentence-transformers), get_embeddings fail-closes to [].
+# Install with: pip install onnxruntime huggingface_hub tokenizers
+onnxruntime>=1.17,<2
+huggingface_hub>=0.20,<1
+tokenizers>=0.15,<1
+
+# Optional: Wasmtime sandbox fallback (v3.1).
+# When the Generalist fails to generate unit tests, the code verification
+# loop falls back to sandboxed execution. wasmtime provides a strict Wasm
+# sandbox where file system and network handles do not exist. Without it,
+# the fallback uses the Docker sandbox (if available) or the deprecated
+# AST static analysis. Requires a pre-compiled Python-to-Wasm module
+# (configured via VIBE_WASM_PYTHON_MODULE env var).
+# Install with: pip install wasmtime
+wasmtime>=10.0,<20
+

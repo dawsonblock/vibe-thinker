@@ -1,7 +1,7 @@
 """Pytest tests for structured routing output."""
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from hybrid_orchestrator import HybridReasoningOrchestrator
 from vibe_clr_async import CLRResult
@@ -283,9 +283,12 @@ class TestCodeSpecialistRouting:
     async def test_code_task_no_test_spec_falls_back_unverified(self):
         """Generalist can't produce tests -> single-candidate unverified, score 0.0.
 
-        v2.0: When the candidate code has restricted imports (e.g. os),
-        the static analysis fallback also fails, so the route is
-        code_specialist_unverified with score 0.0.
+        v3.1: When no test spec is generated, the sandbox fallback tries
+        to execute the code in a Docker sandbox. If the code has
+        restricted imports (e.g. os) but still runs in the sandbox (the
+        sandbox has --network=none and --read-only, so os.getcwd() works
+        but os.socket() doesn't), the sandbox fallback assigns 0.65.
+        To test the truly-unverified path, we mock the sandbox to fail.
         """
         o = HybridReasoningOrchestrator(
             vibe_endpoint="http://localhost:0",
@@ -297,19 +300,26 @@ class TestCodeSpecialistRouting:
             use_trajectory_store=False,
         )
         o._generate_test_spec = AsyncMock(return_value=None)
-        # Code with a restricted import -> static analysis fails -> unverified.
+        # Code with a restricted import -> static analysis fails.
         o._call_code_specialist = AsyncMock(return_value="import os\nprint(os.getcwd())")
-
-        result = await o.run("Write a Python function to square a number")
+        # Mock the sandbox fallback to return (None, []) — no sandbox
+        # available — so the code falls through to AST static analysis,
+        # which also fails on "import os", resulting in unverified.
+        from hybrid_orchestrator import _wasmtime_sandbox_fallback
+        import hybrid_orchestrator as _ho
+        async def _mock_sandbox(code, code_verifier=None):
+            return (None, [])
+        with patch("hybrid_orchestrator._wasmtime_sandbox_fallback", _mock_sandbox):
+            result = await o.run("Write a Python function to square a number")
         assert result.route_taken == "code_specialist_unverified"
         assert result.clr_score == 0.0
         o._call_code_specialist.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_code_task_no_test_spec_static_analysis_fallback(self):
-        """v2.0: When no test spec but candidate code parses cleanly with
-        no restricted imports, the static analysis fallback assigns a
-        partial heuristic score (0.4)."""
+        """v3.1: When no test spec but no sandbox is available, the AST
+        static analysis fallback assigns a partial heuristic score (0.4)
+        if the code parses cleanly with no restricted imports."""
         o = HybridReasoningOrchestrator(
             vibe_endpoint="http://localhost:0",
             generalist_endpoint="http://localhost:0",
@@ -321,10 +331,40 @@ class TestCodeSpecialistRouting:
         )
         o._generate_test_spec = AsyncMock(return_value=None)
         o._call_code_specialist = AsyncMock(return_value="def square(n): return n*n")
-
-        result = await o.run("Write a Python function to square a number")
+        # Mock the sandbox fallback to return (None, []) — no sandbox
+        # available — so the code falls through to AST static analysis.
+        async def _mock_sandbox(code, code_verifier=None):
+            return (None, [])
+        with patch("hybrid_orchestrator._wasmtime_sandbox_fallback", _mock_sandbox):
+            result = await o.run("Write a Python function to square a number")
         assert result.route_taken == "code_specialist_static_analysis"
         assert result.clr_score == 0.4
+        o._call_code_specialist.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_code_task_no_test_spec_sandbox_fallback(self):
+        """v3.1: When no test spec but the code runs successfully in the
+        sandbox, the sandbox fallback assigns 0.65 (the highest self-claim
+        cap — NOT full verification, but a real security boundary)."""
+        o = HybridReasoningOrchestrator(
+            vibe_endpoint="http://localhost:0",
+            generalist_endpoint="http://localhost:0",
+            code_specialist_endpoint="http://127.0.0.1:8082",
+            use_clr=True,
+            use_embedding_router=False,
+            use_clr_cache=False,
+            use_trajectory_store=False,
+        )
+        o._generate_test_spec = AsyncMock(return_value=None)
+        o._call_code_specialist = AsyncMock(return_value="def square(n): return n*n")
+        # Mock the sandbox fallback to return (0.65, []) — code ran
+        # successfully in the sandbox without trapping.
+        async def _mock_sandbox(code, code_verifier=None):
+            return (0.65, [])
+        with patch("hybrid_orchestrator._wasmtime_sandbox_fallback", _mock_sandbox):
+            result = await o.run("Write a Python function to square a number")
+        assert result.route_taken == "code_specialist_sandbox"
+        assert result.clr_score == 0.65
         o._call_code_specialist.assert_awaited_once()
 
     @pytest.mark.asyncio

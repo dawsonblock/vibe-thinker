@@ -230,6 +230,75 @@ class TestStoreSynthesized:
 
 
 # ---------------------------------------------------------------------- #
+# VerifiedTrajectoryStore.store_synthesized_verified (v3.1)
+# ---------------------------------------------------------------------- #
+class TestStoreSynthesizedVerified:
+    def test_reverified_entry_stored_with_correct_metadata(self, tmp_path):
+        """v3.1: A re-verified synthesized master is stored with
+        verified=True and verification_method='synthesized_and_proven'."""
+        path = str(tmp_path / "trajectories.json")
+        with open(path, "w") as f:
+            json.dump({"model_name": "test", "schema_version": 3, "entries": []}, f)
+        mock_model = MagicMock()
+        mock_model.encode = _mock_encode([0.1, 0.2, 0.3, 0.4])
+        with patch("persistent_cache.SentenceTransformer", return_value=mock_model):
+            store = VerifiedTrajectoryStore(path=path, autosave=True)
+        store.store_synthesized_verified(
+            query="general math pattern",
+            answer="To solve recurrence relations, use characteristic equations.",
+            task_type="math",
+            source_count=5,
+            source_queries=["q1", "q2", "q3", "q4", "q5"],
+        )
+        assert len(store) == 1
+        entry = store.entries[0]
+        assert entry["verification_method"] == "synthesized_and_proven"
+        assert entry["verified"] is True
+        assert entry["synthesized"] is True
+        assert entry["source_count"] == 5
+        assert entry["source_queries"] == ["q1", "q2", "q3", "q4", "q5"]
+        assert entry["score"] == 0.65  # default re-verified score
+
+    def test_reverified_entry_is_retrievable(self, tmp_path):
+        """v3.1: A re-verified synthesized master IS retrievable as
+        few-shot context (unlike the unverified synthesized master)."""
+        path = str(tmp_path / "trajectories.json")
+        emb = [0.5, 0.5, 0.5, 0.5]
+        entries = [
+            {
+                "query": "synth q", "answer": "synth a", "score": 0.65,
+                "verification_method": "synthesized_and_proven",
+                "verified": True, "synthesized": True,
+                "embedding": emb, "task_type": "math", "schema_version": 3,
+                "best_answer": "synth a", "best_score": 0.65, "claim_count": 10,
+                "source_count": 3, "source_queries": ["q1", "q2", "q3"],
+            },
+        ]
+        with open(path, "w") as f:
+            json.dump({"model_name": "test", "schema_version": 3, "entries": entries}, f)
+        mock_model = MagicMock()
+        mock_model.encode = _mock_encode(emb)
+        with patch("persistent_cache.SentenceTransformer", return_value=mock_model):
+            store = VerifiedTrajectoryStore(path=path, autosave=True)
+        results = store.retrieve("synth q", task_type="math")
+        # The re-verified synthesized master IS retrievable.
+        assert len(results) == 1
+        assert results[0]["verification_method"] == "synthesized_and_proven"
+
+    def test_empty_answer_not_stored(self, tmp_path):
+        """Empty answer is not stored even for re-verified masters."""
+        path = str(tmp_path / "trajectories.json")
+        with open(path, "w") as f:
+            json.dump({"model_name": "test", "schema_version": 3, "entries": []}, f)
+        mock_model = MagicMock()
+        mock_model.encode = _mock_encode([0.1, 0.2, 0.3, 0.4])
+        with patch("persistent_cache.SentenceTransformer", return_value=mock_model):
+            store = VerifiedTrajectoryStore(path=path, autosave=True)
+        store.store_synthesized_verified("q", "", "math", 3, ["q1", "q2", "q3"])
+        assert len(store) == 0
+
+
+# ---------------------------------------------------------------------- #
 # Orchestrator.synthesize_trajectories
 # ---------------------------------------------------------------------- #
 class TestOrchestratorSynthesize:
@@ -269,7 +338,12 @@ class TestOrchestratorSynthesize:
     @pytest.mark.asyncio
     async def test_full_synthesis_flow(self, tmp_path):
         """End-to-end: 5 similar verified trajectories -> 1 cluster ->
-        generalist synthesizes -> master stored, raw entries removed."""
+        generalist synthesizes -> master stored, raw entries removed.
+
+        v3.1: Without verification_context, the master is stored as
+        unverified (the v0.4.0 behavior). With verification_context and
+        a passing verifier, it's stored as verified=True.
+        """
         from hybrid_orchestrator import HybridReasoningOrchestrator
         path = str(tmp_path / "trajectories.json")
         emb = [0.5, 0.5, 0.5, 0.5]
@@ -311,8 +385,112 @@ class TestOrchestratorSynthesize:
         # The store should now have 1 synthesized entry (5 raw removed).
         assert len(o.trajectory_store) == 1
         assert o.trajectory_store.entries[0]["synthesized"] is True
+        # No verification_context -> not re-verified -> verified=False.
         assert o.trajectory_store.entries[0]["verified"] is False
         assert o.trajectory_store.entries[0]["source_count"] == 5
+
+    @pytest.mark.asyncio
+    async def test_synthesis_reverified_when_context_available(self, tmp_path):
+        """v3.1: When children have verification_context and the master
+        passes re-verification, it's stored as verified=True with
+        verification_method='synthesized_and_proven'."""
+        from hybrid_orchestrator import HybridReasoningOrchestrator
+        from verifiers.base import VerificationResult
+        path = str(tmp_path / "trajectories.json")
+        emb = [0.5, 0.5, 0.5, 0.5]
+        entries = [
+            {
+                "query": f"Solve a_{i+1} = a_i + 2, a_1 = 1",
+                "answer": f"a_n = 2n - 1 (variant {i})",
+                "score": 0.9,
+                "verification_method": "math_verifier",
+                "verified": True, "embedding": emb, "task_type": "math",
+                "schema_version": 3, "best_answer": f"a_n = 2n - 1 (variant {i})",
+                "best_score": 0.9, "claim_count": 10,
+                "verification_context": {"expected_answer": str(2 * i + 1)},
+            }
+            for i in range(5)
+        ]
+        with open(path, "w") as f:
+            json.dump({"model_name": "test", "schema_version": 3, "entries": entries}, f)
+        mock_model = MagicMock()
+        mock_model.encode = _mock_encode(emb)
+        with patch("persistent_cache.SentenceTransformer", return_value=mock_model):
+            o = HybridReasoningOrchestrator(
+                vibe_endpoint="http://localhost:0",
+                generalist_endpoint="http://localhost:0",
+                use_clr=False, use_embedding_router=False,
+                use_clr_cache=False, use_trajectory_store=True,
+                trajectory_store_path=path,
+            )
+        o._call_generalist = AsyncMock(
+            return_value="For linear recurrences a_{n+1} = a_n + d, "
+                         "the solution is a_n = a_1 + (n-1)*d."
+        )
+        # Mock the math verifier to pass re-verification.
+        mock_verifier = MagicMock()
+        mock_verifier.verify = AsyncMock(return_value=VerificationResult(
+            verified=True, score=1.0, method="numeric_comparison",
+            evidence={},
+        ))
+        with patch("hybrid_orchestrator.select_verifier", return_value=mock_verifier):
+            result = await o.synthesize_trajectories(
+                similarity_threshold=0.9, min_cluster_size=3,
+            )
+        assert result["masters_stored"] == 1
+        assert result["masters_reverified"] == 1
+        assert len(o.trajectory_store) == 1
+        entry = o.trajectory_store.entries[0]
+        assert entry["synthesized"] is True
+        assert entry["verified"] is True
+        assert entry["verification_method"] == "synthesized_and_proven"
+
+    @pytest.mark.asyncio
+    async def test_synthesis_not_reverified_when_verifier_fails(self, tmp_path):
+        """v3.1: When the master fails re-verification, it's stored as
+        unverified (the v0.4.0 fallback behavior)."""
+        from hybrid_orchestrator import HybridReasoningOrchestrator
+        from verifiers.base import VerificationResult
+        path = str(tmp_path / "trajectories.json")
+        emb = [0.5, 0.5, 0.5, 0.5]
+        entries = [
+            {
+                "query": f"q{i}", "answer": f"a{i}", "score": 0.9,
+                "verification_method": "math_verifier", "verified": True,
+                "embedding": emb, "task_type": "math", "schema_version": 3,
+                "best_answer": f"a{i}", "best_score": 0.9, "claim_count": 10,
+                "verification_context": {"expected_answer": str(i)},
+            }
+            for i in range(4)
+        ]
+        with open(path, "w") as f:
+            json.dump({"model_name": "test", "schema_version": 3, "entries": entries}, f)
+        mock_model = MagicMock()
+        mock_model.encode = _mock_encode(emb)
+        with patch("persistent_cache.SentenceTransformer", return_value=mock_model):
+            o = HybridReasoningOrchestrator(
+                vibe_endpoint="http://localhost:0",
+                generalist_endpoint="http://localhost:0",
+                use_clr=False, use_embedding_router=False,
+                use_clr_cache=False, use_trajectory_store=True,
+                trajectory_store_path=path,
+            )
+        o._call_generalist = AsyncMock(return_value="master solution")
+        # Mock the verifier to FAIL re-verification.
+        mock_verifier = MagicMock()
+        mock_verifier.verify = AsyncMock(return_value=VerificationResult(
+            verified=False, score=0.0, method="numeric_comparison",
+            evidence={}, error="answer mismatch",
+        ))
+        with patch("hybrid_orchestrator.select_verifier", return_value=mock_verifier):
+            result = await o.synthesize_trajectories(
+                similarity_threshold=0.9, min_cluster_size=3,
+            )
+        assert result["masters_stored"] == 1
+        assert result["masters_reverified"] == 0
+        entry = o.trajectory_store.entries[0]
+        assert entry["verified"] is False
+        assert entry["verification_method"] == "synthesized"
 
     @pytest.mark.asyncio
     async def test_generalist_failure_keeps_raw_entries(self, tmp_path):

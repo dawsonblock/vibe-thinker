@@ -176,13 +176,14 @@ class TestIptablesRules:
         port_rules = [r for r in rules if "--dport 443" in r]
         assert len(port_rules) >= 2  # TCP + UDP
 
-    def test_dns_always_allowed(self):
-        """DNS (port 53) must always be allowed so the candidate code can
-        resolve allow-listed hostnames at runtime."""
+    def test_dns_not_allowed_via_iptables(self):
+        """v3.1: DNS (port 53) is NOT allowed via iptables. DNS resolution
+        is handled by --add-host injection on the host side, closing the
+        DNS exfiltration loophole."""
         al = NetworkAllowList.from_string("10.0.0.1")
         rules = al.generate_iptables_rules()
         dns_rules = [r for r in rules if "--dport 53" in r]
-        assert len(dns_rules) >= 2  # UDP + TCP
+        assert len(dns_rules) == 0  # No DNS allow rules
 
     def test_loopback_always_allowed(self):
         al = NetworkAllowList.from_string("10.0.0.1")
@@ -214,12 +215,12 @@ class TestIptablesRules:
 
     def test_wildcard_skipped_in_iptables(self):
         """Wildcard domains can't be resolved to IPs — they're skipped in
-        iptables rules (rely on DNS allow rule)."""
+        iptables rules (rely on the SNI proxy for runtime resolution)."""
         al = NetworkAllowList.from_string("*.pypi.org")
         rules = al.generate_iptables_rules()
         # No IP-specific ACCEPT rules for the wildcard.
         allow_rules = [r for r in rules if "ACCEPT" in r and "-d " in r]
-        assert len(allow_rules) == 0  # only loopback + DNS + established
+        assert len(allow_rules) == 0  # only loopback + established
 
 
 # ---------------------------------------------------------------------- #
@@ -359,41 +360,86 @@ class TestIPv6Denial:
 
 
 # ---------------------------------------------------------------------- #
-# DNS restriction (v0.4.0 hardening)
+# DNS restriction (v0.4.0 hardening, v3.1 --add-host injection)
 # ---------------------------------------------------------------------- #
 class TestDNSRestriction:
-    """DNS exfiltration prevention — restrict DNS to a specific resolver."""
+    """DNS exfiltration prevention.
 
-    def test_dns_allowed_to_any_resolver_by_default(self):
-        """Without a DNS resolver restriction, DNS is allowed to any
-        resolver (needed for hostname resolution in the allow-list)."""
+    v3.1: DNS is no longer allowed via iptables (port 53 rules removed).
+    Instead, allow-listed domains are resolved on the host and injected
+    into the container via --add-host. This closes the DNS exfiltration
+    loophole entirely — the container has no DNS resolver at all.
+    """
+
+    def test_dns_not_allowed_via_iptables_v31(self):
+        """v3.1: No DNS (port 53) rules in iptables — DNS is injected
+        via --add-host instead."""
         al = NetworkAllowList.from_string("10.0.0.1")
         rules = al.generate_iptables_rules()
         dns_rules = [r for r in rules if "--dport 53" in r]
-        # Should have UDP + TCP DNS rules without a specific destination.
-        assert any("-d " not in r for r in dns_rules)
+        assert len(dns_rules) == 0
 
-    def test_dns_restricted_to_specific_resolver(self):
-        """When a DNS resolver is specified, DNS is restricted to that
-        resolver only — preventing DNS-based data exfiltration."""
+    def test_dns_resolver_param_ignored_in_v31(self):
+        """v3.1: The dns_resolver param is deprecated for iptables —
+        it no longer adds DNS allow rules (DNS is injected via --add-host)."""
         al = NetworkAllowList.from_string("10.0.0.1")
         rules = al.generate_iptables_rules(dns_resolver="8.8.8.8")
         dns_rules = [r for r in rules if "--dport 53" in r]
-        # All DNS rules should target the specific resolver.
-        for rule in dns_rules:
-            assert "-d 8.8.8.8" in rule
-        # Should NOT have any broad DNS allow rules.
-        broad_dns = [r for r in dns_rules if "-d " not in r]
-        assert len(broad_dns) == 0
+        assert len(dns_rules) == 0
 
     def test_dns_resolver_in_empty_allowlist(self):
-        """DNS restriction should work even with an empty allow-list
-        (though in practice, empty allow-list uses --network=none)."""
+        """Empty allow-list denies all — no DNS rules at all."""
         al = NetworkAllowList.from_string("")
         rules = al.generate_iptables_rules(dns_resolver="8.8.8.8")
-        # Empty allow-list denies all — no DNS rules at all.
         dns_rules = [r for r in rules if "--dport 53" in r]
         assert len(dns_rules) == 0
+
+
+# ---------------------------------------------------------------------- #
+# --add-host DNS injection (v3.1)
+# ---------------------------------------------------------------------- #
+class TestAddHostInjection:
+    """v3.1: DNS exfiltration fix — --add-host injection."""
+
+    def test_add_host_args_for_resolvable_domain(self):
+        """A resolvable domain produces a --add-host arg with its IP."""
+        al = NetworkAllowList.from_string("localhost")
+        args = al.generate_add_host_args()
+        # localhost resolves to 127.0.0.1.
+        assert "--add-host" in args
+        assert any("localhost:127.0.0.1" in a for a in args)
+
+    def test_add_host_args_empty_for_no_domains(self):
+        """No domain entries -> no --add-host args."""
+        al = NetworkAllowList.from_string("10.0.0.1")
+        args = al.generate_add_host_args()
+        assert args == []
+
+    def test_add_host_args_skips_wildcards(self):
+        """Wildcard domains cannot be resolved to a single IP — skipped."""
+        al = NetworkAllowList.from_string("*.pypi.org")
+        args = al.generate_add_host_args()
+        assert args == []
+
+    def test_add_host_args_skips_ips(self):
+        """IP entries don't need --add-host (they're already IPs)."""
+        al = NetworkAllowList.from_string("10.0.0.1,10.0.0.0/24")
+        args = al.generate_add_host_args()
+        assert args == []
+
+    def test_add_host_args_skips_unresolvable(self):
+        """Unresolvable domains are skipped (fail-closed)."""
+        al = NetworkAllowList.from_string("nonexistent.invalid")
+        args = al.generate_add_host_args()
+        assert args == []
+
+    def test_add_host_args_multiple_domains(self):
+        """Multiple resolvable domains each get their own --add-host."""
+        al = NetworkAllowList.from_string("localhost,127.0.0.1")
+        args = al.generate_add_host_args()
+        # Only localhost is a domain (127.0.0.1 is an IP).
+        assert "--add-host" in args
+        assert any("localhost:" in a for a in args)
 
 
 # ---------------------------------------------------------------------- #

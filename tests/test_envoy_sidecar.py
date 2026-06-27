@@ -18,6 +18,8 @@ from sandbox.envoy_sidecar import (
     write_envoy_config,
     find_envoy_binary,
     launch_envoy,
+    _is_docker_available,
+    ENVOY_DOCKER_IMAGE,
 )
 from sandbox.network_allowlist import NetworkAllowList
 
@@ -138,21 +140,94 @@ class TestFindEnvoyBinary:
 
 
 class TestLaunchEnvoyFailClosed:
-    def test_raises_when_envoy_not_found(self, tmp_path):
-        """If envoy is not on PATH, launch_envoy raises FileNotFoundError.
+    def test_raises_when_neither_docker_nor_binary(self, tmp_path):
+        """If neither Docker nor envoy binary is available, launch_envoy
+        raises FileNotFoundError.
 
-        We can't easily remove envoy from PATH in a test, so we test
-        the behavior by mocking find_envoy_binary to return None.
+        We mock both _is_docker_available and find_envoy_binary to return
+        False/None so the fail-closed path is exercised.
         """
         import sandbox.envoy_sidecar as mod
 
-        original = mod.find_envoy_binary
+        original_docker = mod._is_docker_available
+        original_binary = mod.find_envoy_binary
+        mod._is_docker_available = lambda: False
         mod.find_envoy_binary = lambda: None
         try:
-            with pytest.raises(FileNotFoundError, match="envoy binary not found"):
+            with pytest.raises(FileNotFoundError, match="Envoy is not available"):
                 launch_envoy("/nonexistent/config.yaml")
         finally:
-            mod.find_envoy_binary = original
+            mod._is_docker_available = original_docker
+            mod.find_envoy_binary = original_binary
+
+    def test_use_docker_false_falls_back_to_binary(self, tmp_path):
+        """When use_docker=False, launch_envoy uses the binary path."""
+        import sandbox.envoy_sidecar as mod
+
+        original_docker = mod._is_docker_available
+        original_binary = mod.find_envoy_binary
+        mod._is_docker_available = lambda: True  # Docker available but...
+        mod.find_envoy_binary = lambda: None  # ...no binary
+        try:
+            with pytest.raises(FileNotFoundError, match="Envoy is not available"):
+                launch_envoy("/nonexistent/config.yaml", use_docker=False)
+        finally:
+            mod._is_docker_available = original_docker
+            mod.find_envoy_binary = original_binary
+
+
+class TestLaunchEnvoyDocker:
+    """v3.1: Tests for the Docker-based Envoy launch path."""
+
+    def test_docker_image_constant(self):
+        """The default Docker image is envoyproxy/envoy."""
+        assert "envoyproxy/envoy" in ENVOY_DOCKER_IMAGE
+
+    def test_is_docker_available_returns_bool(self):
+        """_is_docker_available returns a boolean (True or False)."""
+        result = _is_docker_available()
+        assert isinstance(result, bool)
+
+    def test_docker_launch_uses_docker_run(self, tmp_path):
+        """When Docker is available, launch_envoy uses 'docker run'."""
+        import sandbox.envoy_sidecar as mod
+        from unittest.mock import patch, MagicMock
+
+        config = tmp_path / "envoy.yaml"
+        config.write_text("test: config")
+
+        captured_cmd = []
+        original_popen = subprocess.Popen
+
+        class FakePopen:
+            def __init__(self, cmd, **kwargs):
+                captured_cmd.extend(cmd)
+                self.pid = 12345
+                self.returncode = 0
+            def wait(self):
+                return 0
+            def terminate(self):
+                pass
+            def communicate(self):
+                return (b"", b"")
+
+        original_docker = mod._is_docker_available
+        mod._is_docker_available = lambda: True
+        try:
+            with patch("subprocess.Popen", FakePopen):
+                proc = launch_envoy(str(config))
+            # The command should start with "docker run".
+            assert captured_cmd[0] == "docker"
+            assert captured_cmd[1] == "run"
+            # Should mount the config file.
+            assert "-v" in captured_cmd
+            # Should use --network host.
+            assert "--network" in captured_cmd
+            assert "host" in captured_cmd
+            # Should use the envoyproxy/envoy image.
+            assert any("envoyproxy/envoy" in arg for arg in captured_cmd)
+        finally:
+            mod._is_docker_available = original_docker
 
 
 class TestCLISmoke:

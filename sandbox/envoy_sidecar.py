@@ -337,27 +337,95 @@ def write_envoy_config(
 
 
 def find_envoy_binary() -> Optional[str]:
-    """Locate the envoy binary on PATH. Returns None if not found."""
+    """Locate the envoy binary on PATH. Returns None if not found.
+
+    v3.1: This is used as a fallback when Docker is not available. The
+    preferred launch path is :func:`launch_envoy` which uses the
+    ``envoyproxy/envoy`` Docker image (no host install needed).
+    """
     return shutil.which("envoy")
+
+
+# The default Envoy Docker image (v3.1). Using Docker avoids requiring
+# the envoy binary on the host PATH — vibe-thinker already requires
+# Docker for the code sandbox, so this adds no new dependency.
+ENVOY_DOCKER_IMAGE = "envoyproxy/envoy:v1.30-latest"
+
+
+def _is_docker_available() -> bool:
+    """Check if Docker is installed and the daemon is running."""
+    try:
+        result = subprocess.run(
+            ["docker", "info", "--format", "{{.ServerVersion}}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.returncode == 0 and bool(result.stdout.strip())
+    except Exception:
+        return False
 
 
 def launch_envoy(
     config_path: str,
     log_level: str = "info",
     extra_args: Optional[List[str]] = None,
+    use_docker: bool = True,
+    docker_image: str = ENVOY_DOCKER_IMAGE,
 ) -> subprocess.Popen:
     """Launch Envoy with the given config. Returns the Popen handle.
 
-    Fails closed: raises FileNotFoundError if envoy is not on PATH.
-    The caller is responsible for managing the process lifecycle
-    (terminate, wait).
+    v3.1: By default, launches Envoy via the ``envoyproxy/envoy`` Docker
+    image instead of requiring the envoy binary on the host PATH. This
+    improves portability — vibe-thinker already requires Docker for the
+    code sandbox, so this adds no new dependency.
+
+    The config file is mounted into the container at
+    ``/etc/envoy/envoy.yaml`` via ``-v``. The container uses
+    ``--network host`` so Envoy can listen on the host's network
+    namespace (the sandbox containers route traffic to it via
+    HTTP_PROXY).
+
+    Fails closed: raises FileNotFoundError if neither Docker nor the
+    envoy binary is available.
+
+    Args:
+        config_path: path to the Envoy config file on the host.
+        log_level: Envoy log level (default "info").
+        extra_args: additional CLI args to pass to Envoy.
+        use_docker: when True (default), launch via Docker. When False,
+            fall back to the envoy binary on PATH (the v2.0 behavior).
+        docker_image: the Docker image to use (default
+            ``envoyproxy/envoy:v1.30-latest``).
     """
+    if use_docker and _is_docker_available():
+        # Launch Envoy via Docker — no host install needed.
+        cmd = [
+            "docker", "run", "--rm",
+            "--name", "vibe-envoy-sidecar",
+            "--network", "host",
+            "-v", f"{os.path.abspath(config_path)}:/etc/envoy/envoy.yaml:ro",
+            docker_image,
+            "-c", "/etc/envoy/envoy.yaml",
+            "--log-level", log_level,
+        ]
+        if extra_args:
+            cmd.extend(extra_args)
+        return subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+
+    # Fall back to the envoy binary on PATH (v2.0 behavior).
     envoy = find_envoy_binary()
     if envoy is None:
         raise FileNotFoundError(
-            "envoy binary not found on PATH. Install Envoy (e.g. "
-            "brew install envoy, or use the envoyproxy/envoy Docker "
-            "image) before using the Envoy sidecar egress path."
+            "Envoy is not available. Neither Docker nor the envoy binary "
+            "was found. Options:\n"
+            "  1. Install Docker (preferred — vibe-thinker already uses it "
+            "for the code sandbox).\n"
+            "  2. Install Envoy on PATH (e.g. brew install envoy).\n"
+            "  3. Pass use_docker=False to launch_envoy after installing "
+            "the envoy binary."
         )
     cmd = [
         envoy,

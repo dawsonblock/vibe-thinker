@@ -384,6 +384,96 @@ def _static_analysis_fallback(code: str) -> tuple:
 
 
 # ====================================================================== #
+# Wasmtime sandbox fallback (v3.1)
+# ====================================================================== #
+# Score assigned when code runs successfully in a Wasm/Docker sandbox
+# without trapping. This is the highest self-claim cap — the code
+# actually executed in isolation, proving it doesn't crash or trap.
+# It's NOT full verification (no unit tests), but it's a much stronger
+# signal than AST static analysis alone.
+_WASM_SANDBOX_SCORE = 0.65
+
+
+async def _wasmtime_sandbox_fallback(
+    code: str,
+    code_verifier: Optional["CodeVerifier"] = None,
+) -> tuple:
+    """Sandboxed execution fallback for code verification (v3.1).
+
+    When the Generalist fails to generate unit tests, this function
+    provides a real security boundary by executing the candidate code
+    in a sandbox where file system and network handles literally do
+    not exist. This replaces the v2.0 AST static analysis, which was
+    trivially bypassable via obfuscation (e.g.,
+    ``__import__(chr(111)+chr(115))``).
+
+    Execution priority:
+      1. **Wasmtime** — if the ``wasmtime`` package is installed AND a
+         pre-compiled Python-to-Wasm module is available (configured via
+         ``VIBE_WASM_PYTHON_MODULE`` env var), run the code in a strict
+         Wasm sandbox. File system and network handles do not exist in
+         Wasm — the code cannot exfiltrate data even if it tries.
+      2. **Docker sandbox** — if a CodeVerifier with a sandbox executor
+         is available, execute the code in a Docker container with
+         ``--network=none`` and ``--read-only``. This provides the same
+         isolation as Wasm (no network, no filesystem writes) using the
+         existing sandbox infrastructure.
+      3. **None** — if neither wasmtime nor a Docker sandbox is
+         available, return ``(None, [])`` so the caller falls back to
+         the deprecated AST static analysis with a warning.
+
+    Returns:
+        (score, issues) where:
+        - score = 0.65 if the code runs without trapping/erroring
+        - score = 0.0 if the code traps/errors (with issues describing why)
+        - score = None if no sandbox is available (caller falls back to AST)
+    """
+    # 1. Try wasmtime (if installed + a Wasm Python module is configured).
+    wasm_module_path = os.environ.get("VIBE_WASM_PYTHON_MODULE", "")
+    if wasm_module_path:
+        try:
+            import wasmtime  # type: ignore
+            from wasmtime import Engine, Module, Store, Instance  # type: ignore
+
+            engine = Engine()
+            module = Module.from_file(engine, wasm_module_path)
+            store = Store(engine)
+            instance = Instance(store, module, [])
+            # The Wasm module exposes a `run_python` function that takes
+            # the source code as a string and returns 0 on success.
+            run = instance.exports(store)["run_python"]
+            result = run(store, code)
+            if result == 0:
+                return (_WASM_SANDBOX_SCORE, [])
+            return (0.0, [f"wasm sandbox: code trapped (exit code {result})"])
+        except ImportError:
+            pass  # wasmtime not installed — fall through to Docker
+        except Exception as e:
+            # Wasm execution failed — the code is buggy or dangerous.
+            return (0.0, [f"wasm sandbox: execution failed: {e}"])
+
+    # 2. Try Docker sandbox execution (if a CodeVerifier is available).
+    if code_verifier is not None and code_verifier.executor is not None:
+        try:
+            # Execute the code with no tests — just check it runs without
+            # error. The sandbox provides --network=none and --read-only,
+            # so the code cannot exfiltrate data or persist changes.
+            result = await code_verifier.executor.execute(
+                code, timeout=5.0, network=False, memory_limit="128m",
+            )
+            if result.exit_code == 0:
+                return (_WASM_SANDBOX_SCORE, [])
+            # Non-zero exit — the code errored or crashed.
+            error_msg = result.stderr.strip()[:200] if result.stderr else ""
+            return (0.0, [f"sandbox: exit code {result.exit_code}: {error_msg}"])
+        except Exception as e:
+            return (0.0, [f"sandbox: execution failed: {e}"])
+
+    # 3. No sandbox available — caller falls back to AST (with warning).
+    return (None, [])
+
+
+# ====================================================================== #
 # Orchestrator
 # ====================================================================== #
 class HybridReasoningOrchestrator:
@@ -1397,16 +1487,59 @@ class HybridReasoningOrchestrator:
         if tests is None:
             print("[CodeLoop] No test spec — single-candidate unverified generation")
             answer = await self._call_code_specialist(query)
-            # v2.0: Static analysis fallback. If the Generalist fails to
-            # generate unit tests, do a static analysis pass on the candidate
-            # code. If the code parses cleanly and contains no restricted
-            # imports, assign a partial heuristic score (capped at 0.4).
-            # This is NOT full verification — it's a "better than nothing"
-            # signal that the code is at least syntactically valid and
-            # doesn't import obviously dangerous modules.
+            # v3.1: Sandbox fallback. If the Generalist fails to generate
+            # unit tests, execute the candidate code in a sandbox (Wasm or
+            # Docker) where file system and network handles do not exist.
+            # This replaces the v2.0 AST static analysis, which was trivially
+            # bypassable via obfuscation (e.g., __import__(chr(111)+chr(115))).
+            # If the code runs without trapping, assign a partial score of
+            # 0.65 (the highest self-claim cap — NOT full verification, but
+            # a real security boundary).
+            sandbox_score, sandbox_issues = await _wasmtime_sandbox_fallback(
+                answer, code_verifier=self.code_verifier,
+            )
+            if sandbox_score is not None and sandbox_score > 0.0:
+                print(f"[CodeLoop] Sandbox fallback: score={sandbox_score} "
+                      f"(code ran in sandbox without trapping)")
+                return OrchestratorResult(
+                    final_answer=answer,
+                    route_taken="code_specialist_sandbox",
+                    specialist_used="Code Specialist (ruvltra-claude-code)",
+                    clr_score=sandbox_score,
+                    routing_confidence=0.3,
+                    raw_traces={
+                        "verified": False,
+                        "reason": "no test spec generated — sandbox fallback",
+                        "sandbox": True,
+                        "sandbox_score": sandbox_score,
+                        "sandbox_issues": sandbox_issues,
+                    },
+                )
+            if sandbox_score is not None and sandbox_score == 0.0:
+                # The code trapped/errored in the sandbox — it's buggy or
+                # dangerous. Return with score 0.0 and the error.
+                print(f"[CodeLoop] Sandbox fallback: code trapped — "
+                      f"{sandbox_issues}")
+                return OrchestratorResult(
+                    final_answer=answer,
+                    route_taken="code_specialist_sandbox_failed",
+                    specialist_used="Code Specialist (ruvltra-claude-code)",
+                    clr_score=0.0,
+                    routing_confidence=0.0,
+                    raw_traces={
+                        "verified": False,
+                        "reason": "code trapped in sandbox",
+                        "sandbox": True,
+                        "sandbox_issues": sandbox_issues,
+                    },
+                )
+            # No sandbox available — fall back to deprecated AST static
+            # analysis with a warning. AST is NOT a security boundary.
+            print("[CodeLoop] WARNING: no sandbox available — falling back "
+                  "to AST static analysis (NOT a security boundary)")
             static_score, static_issues = _static_analysis_fallback(answer)
             if static_score > 0.0:
-                print(f"[CodeLoop] Static analysis fallback: score={static_score} "
+                print(f"[CodeLoop] AST fallback: score={static_score} "
                       f"(parses OK, no restricted imports)")
                 return OrchestratorResult(
                     final_answer=answer,
@@ -1416,7 +1549,7 @@ class HybridReasoningOrchestrator:
                     routing_confidence=0.3,
                     raw_traces={
                         "verified": False,
-                        "reason": "no test spec generated — static analysis fallback",
+                        "reason": "no test spec generated — AST static analysis fallback (no sandbox available)",
                         "static_analysis": True,
                         "static_score": static_score,
                         "static_issues": static_issues,
@@ -2011,6 +2144,7 @@ class HybridReasoningOrchestrator:
     def _store_if_verified(
         self, query: str, result: OrchestratorResult,
         clr_result: Optional[CLRResult] = None,
+        verifier_context: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Store a verified result in the trajectory store.
 
@@ -2018,6 +2152,15 @@ class HybridReasoningOrchestrator:
         with a deterministic verifier, not self_claims_only). This is the
         "learning" step: verified solutions become few-shot context for
         future similar queries. Unverified results are never stored.
+
+        Args:
+            verifier_context: optional dict of verification context
+                (e.g. ``{"expected_answer": "42"}`` for math,
+                ``{"unit_tests": "..."}`` for code). Stored with the
+                entry so synthesized masters can be re-verified against
+                the children's ground truths (v3.1). If None, the
+                context is extracted from result.raw_traces (for code
+                tasks, the unit_tests are stored in raw_traces).
         """
         if not self.use_trajectory_store or self.trajectory_store is None:
             return
@@ -2042,6 +2185,15 @@ class HybridReasoningOrchestrator:
         tt, _, _ = self._detect_task_type(query)
         task_type = tt
 
+        # Extract verification context for re-verification of synthesized
+        # masters (v3.1). Priority: explicit verifier_context > raw_traces.
+        vctx = verifier_context
+        if vctx is None:
+            # For code tasks, the unit_tests are in raw_traces.
+            tests = result.raw_traces.get("unit_tests")
+            if tests:
+                vctx = {"unit_tests": tests}
+
         self.trajectory_store.store(
             query=query,
             answer=result.final_answer,
@@ -2049,6 +2201,7 @@ class HybridReasoningOrchestrator:
             verification_method=method,
             task_type=task_type,
             route_taken=result.route_taken,
+            verification_context=vctx,
         )
         print(f"[TrajectoryStore] Stored verified result (method={method}, "
               f"score={score:.3f}, task_type={task_type}) — "
@@ -2260,6 +2413,76 @@ class HybridReasoningOrchestrator:
     # ------------------------------------------------------------------ #
     # Trajectory synthesis (v0.4.0) — memory pruning
     # ------------------------------------------------------------------ #
+    async def _reverify_synthesized_master(
+        self, master: str, children: List[Dict[str, Any]],
+    ) -> bool:
+        """Re-verify a synthesized master against the children's ground truths (v3.1).
+
+        For each child trajectory, the master is run against the child's
+        verification context (unit_tests for code, expected_answer for math).
+        If the master passes ALL children's criteria, it is considered
+        "synthesized_and_proven" and can be stored as verified=True.
+
+        Fail-closed: if any child lacks a verification_context, or if any
+        child's verification fails, the master is NOT re-verified (returns
+        False). This preserves the v0.4.0 behavior (verified=False,
+        provenance only) as the fallback.
+
+        Args:
+            master: the synthesized master trajectory text.
+            children: the child trajectory entries (each a dict with
+                ``query``, ``answer``, ``verification_context``, etc.).
+
+        Returns:
+            True if the master passes ALL children's verification criteria.
+            False if any child lacks context, any verification fails, or
+            no verifier is available.
+        """
+        if not children:
+            return False
+
+        # Collect the verification contexts from the children.
+        contexts = []
+        for child in children:
+            vctx = child.get("verification_context")
+            if not vctx:
+                # No context for this child — can't re-verify. Fail-closed.
+                return False
+            contexts.append((child, vctx))
+
+        if not contexts:
+            return False
+
+        # Determine the task type from the first child.
+        task_type = children[0].get("task_type", "unknown")
+
+        # Select the appropriate verifier.
+        verifier = select_verifier(
+            task_type, llm_judge=self._call_generalist,
+            prefer_encoder_nli=self.prefer_encoder_nli,
+        )
+        if verifier is None:
+            # No verifier for this task type — can't re-verify.
+            return False
+
+        # Run the master against each child's verification context.
+        for child, vctx in contexts:
+            try:
+                result = await verifier.verify(
+                    child["query"], master, vctx,
+                )
+                if not result.verified:
+                    print(f"[Synthesis] Master failed re-verification against "
+                          f"child {child['query'][:50]!r}: {result.error or 'not verified'}")
+                    return False
+            except Exception as e:
+                print(f"[Synthesis] Re-verification error for child "
+                      f"{child['query'][:50]!r}: {e}")
+                return False
+
+        # All children passed — the master is proven.
+        return True
+
     _SYNTHESIS_PROMPT = (
         "You are a knowledge distillation engine. Below are {n} similar "
         "problems that were each independently verified correct, along with "
@@ -2334,7 +2557,8 @@ class HybridReasoningOrchestrator:
                   "nothing to synthesize")
             return {
                 "clusters_found": 0, "clusters_synthesized": 0,
-                "entries_removed": 0, "masters_stored": 0, "errors": [],
+                "entries_removed": 0, "masters_stored": 0,
+                "masters_reverified": 0, "errors": [],
             }
 
         clusters = clusters[:max_clusters]
@@ -2342,6 +2566,7 @@ class HybridReasoningOrchestrator:
               f"(similarity >= {similarity_threshold}, min_size {min_cluster_size})")
 
         masters_stored = 0
+        masters_reverified = 0
         entries_removed = 0
         errors: List[str] = []
         all_removed_indices: List[int] = []
@@ -2385,15 +2610,42 @@ class HybridReasoningOrchestrator:
             # Use the highest-score entry's query as the representative query.
             representative = max(entries, key=lambda e: e.get("score", 0.0))
             source_queries = [e["query"] for e in entries]
+            master_text = master.strip()
 
-            # Store the synthesized master (NOT verified — provenance only).
-            self.trajectory_store.store_synthesized(
-                query=representative["query"],
-                answer=master.strip(),
-                task_type=representative.get("task_type", "unknown"),
-                source_count=len(entries),
-                source_queries=source_queries,
+            # v3.1: Re-verify the synthesized master against the children's
+            # ground truths. If the master passes ALL children's verification
+            # criteria, store it as verified=True with
+            # verification_method="synthesized_and_proven" — it becomes
+            # retrievable as few-shot context (the memory flywheel works).
+            # If re-verification fails or no verification context is
+            # available, fall back to the v0.4.0 behavior (verified=False,
+            # provenance only).
+            reverified = await self._reverify_synthesized_master(
+                master_text, entries,
             )
+            if reverified:
+                self.trajectory_store.store_synthesized_verified(
+                    query=representative["query"],
+                    answer=master_text,
+                    task_type=representative.get("task_type", "unknown"),
+                    source_count=len(entries),
+                    source_queries=source_queries,
+                )
+                masters_reverified += 1
+                print(f"[Synthesis] Cluster {cluster_idx}: synthesized "
+                      f"{len(entries)} trajectories into 1 RE-VERIFIED master "
+                      f"(synthesized_and_proven)")
+            else:
+                # Store the synthesized master (NOT verified — provenance only).
+                self.trajectory_store.store_synthesized(
+                    query=representative["query"],
+                    answer=master_text,
+                    task_type=representative.get("task_type", "unknown"),
+                    source_count=len(entries),
+                    source_queries=source_queries,
+                )
+                print(f"[Synthesis] Cluster {cluster_idx}: synthesized "
+                      f"{len(entries)} trajectories into 1 master (unverified)")
             masters_stored += 1
 
             # Mark the raw entries for removal. Adjust indices for already-
@@ -2401,8 +2653,6 @@ class HybridReasoningOrchestrator:
             # remove in one batch at the end).
             all_removed_indices.extend(cluster)
             entries_removed += len(entries)
-            print(f"[Synthesis] Cluster {cluster_idx}: synthesized "
-                  f"{len(entries)} trajectories into 1 master")
 
         # Remove all synthesized-from entries in one batch.
         if all_removed_indices:
@@ -2415,6 +2665,7 @@ class HybridReasoningOrchestrator:
             "clusters_synthesized": masters_stored,
             "entries_removed": entries_removed,
             "masters_stored": masters_stored,
+            "masters_reverified": masters_reverified,
             "errors": errors,
         }
 

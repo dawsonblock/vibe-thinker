@@ -16,6 +16,8 @@ from retrieval import (
     RetrievalBackend,
     SerperBackend,
     SearchApiBackend,
+    DuckDuckGoBackend,
+    WikipediaBackend,
     make_retrieval_backend,
     _extract_serper_sources,
     _extract_searchapi_sources,
@@ -260,9 +262,18 @@ class TestSearchApiBackend:
 # Factory
 # ---------------------------------------------------------------------- #
 class TestMakeRetrievalBackend:
-    def test_no_keys_returns_none(self):
+    def test_no_keys_returns_free_backend_by_default(self):
+        """v3.1: With no paid keys, the factory falls back to the free
+        DuckDuckGo backend (allow_free defaults to True)."""
         with patch.dict(os.environ, {}, clear=True):
-            assert make_retrieval_backend() is None
+            backend = make_retrieval_backend()
+        assert isinstance(backend, DuckDuckGoBackend)
+        assert backend.name == "duckduckgo"
+
+    def test_no_keys_allow_free_false_returns_none(self):
+        """When allow_free=False, no keys means None (pre-v3.1 behavior)."""
+        with patch.dict(os.environ, {}, clear=True):
+            assert make_retrieval_backend(allow_free=False) is None
 
     def test_serper_key_takes_precedence(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -295,6 +306,12 @@ class TestMakeRetrievalBackend:
             backend = make_retrieval_backend()
         assert isinstance(backend, SerperBackend)
 
+    def test_paid_key_overrides_free(self):
+        """A paid key takes precedence over the free backends."""
+        with patch.dict(os.environ, {}, clear=True):
+            backend = make_retrieval_backend(serper_key="paid")
+        assert isinstance(backend, SerperBackend)
+
 
 # ---------------------------------------------------------------------- #
 # Protocol compliance
@@ -305,6 +322,171 @@ class TestProtocolCompliance:
 
     def test_searchapi_satisfies_protocol(self):
         assert isinstance(SearchApiBackend(api_key="k"), RetrievalBackend)
+
+    def test_duckduckgo_satisfies_protocol(self):
+        assert isinstance(DuckDuckGoBackend(), RetrievalBackend)
+
+    def test_wikipedia_satisfies_protocol(self):
+        assert isinstance(WikipediaBackend(), RetrievalBackend)
+
+
+# ---------------------------------------------------------------------- #
+# DuckDuckGoBackend
+# ---------------------------------------------------------------------- #
+class TestDuckDuckGoBackend:
+    @pytest.mark.asyncio
+    async def test_empty_query_returns_empty(self):
+        backend = DuckDuckGoBackend()
+        assert await backend.search("") == []
+        assert await backend.search("   ") == []
+
+    @pytest.mark.asyncio
+    async def test_missing_package_fail_closed(self):
+        """When duckduckgo_search is not installed, fail-closed to []."""
+        backend = DuckDuckGoBackend()
+        with patch.dict("sys.modules", {"duckduckgo_search": None}):
+            # The import inside search() will fail -> [].
+            result = await backend.search("test query")
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_successful_search(self):
+        """When the package returns results, they are formatted correctly."""
+        backend = DuckDuckGoBackend()
+        fake_results = [
+            {"title": "Paris", "body": "Paris is the capital of France.",
+             "href": "https://en.wikipedia.org/wiki/Paris"},
+        ]
+
+        class FakeDDGS:
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+            def text(self, q, max_results=5):
+                return fake_results
+
+        with patch.dict("sys.modules", {"duckduckgo_search": MagicMock(DDGS=FakeDDGS)}):
+            sources = await backend.search("capital of France")
+        assert len(sources) == 1
+        assert "Paris is the capital of France." in sources[0]
+
+    @pytest.mark.asyncio
+    async def test_network_error_fail_closed(self):
+        """When the search raises, fail-closed to []."""
+        backend = DuckDuckGoBackend(timeout=1.0)
+
+        class FailingDDGS:
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+            def text(self, q, max_results=5):
+                raise OSError("network down")
+
+        with patch.dict("sys.modules", {"duckduckgo_search": MagicMock(DDGS=FailingDDGS)}):
+            assert await backend.search("test") == []
+
+    @pytest.mark.asyncio
+    async def test_empty_results_returns_empty(self):
+        backend = DuckDuckGoBackend()
+
+        class EmptyDDGS:
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+            def text(self, q, max_results=5):
+                return []
+
+        with patch.dict("sys.modules", {"duckduckgo_search": MagicMock(DDGS=EmptyDDGS)}):
+            assert await backend.search("obscure query") == []
+
+
+# ---------------------------------------------------------------------- #
+# WikipediaBackend
+# ---------------------------------------------------------------------- #
+class TestWikipediaBackend:
+    @pytest.mark.asyncio
+    async def test_empty_query_returns_empty(self):
+        backend = WikipediaBackend()
+        assert await backend.search("") == []
+        assert await backend.search("   ") == []
+
+    @pytest.mark.asyncio
+    async def test_missing_package_fail_closed(self):
+        """When wikipedia is not installed, fail-closed to []."""
+        backend = WikipediaBackend()
+        with patch.dict("sys.modules", {"wikipedia": None}):
+            result = await backend.search("test query")
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_successful_lookup(self):
+        """When wikipedia.summary returns text, it is formatted correctly."""
+        backend = WikipediaBackend()
+        fake_wikipedia = MagicMock()
+        fake_wikipedia.summary = MagicMock(return_value="Paris is the capital of France.")
+        fake_wikipedia.search = MagicMock(return_value=[])
+        fake_wikipedia.exceptions = MagicMock()
+        fake_wikipedia.exceptions.DisambiguationError = type(
+            "DisambiguationError", (Exception,), {},
+        )
+        fake_wikipedia.exceptions.PageError = type(
+            "PageError", (Exception,), {},
+        )
+        with patch.dict("sys.modules", {"wikipedia": fake_wikipedia}):
+            sources = await backend.search("Paris")
+        assert len(sources) == 1
+        assert "Paris is the capital of France." in sources[0]
+
+    @pytest.mark.asyncio
+    async def test_page_error_fail_closed(self):
+        """When wikipedia raises PageError, fail-closed to []."""
+        backend = WikipediaBackend()
+        fake_wikipedia = MagicMock()
+
+        class _PageError(Exception):
+            pass
+        fake_wikipedia.exceptions = MagicMock()
+        fake_wikipedia.exceptions.PageError = _PageError
+        fake_wikipedia.exceptions.DisambiguationError = type(
+            "DisambiguationError", (Exception,), {},
+        )
+        fake_wikipedia.summary = MagicMock(side_effect=_PageError("not found"))
+        fake_wikipedia.search = MagicMock(return_value=[])
+        with patch.dict("sys.modules", {"wikipedia": fake_wikipedia}):
+            assert await backend.search("nonexistent topic") == []
+
+    @pytest.mark.asyncio
+    async def test_disambiguation_picks_first_option(self):
+        """On DisambiguationError, the first option is summarized."""
+        backend = WikipediaBackend()
+
+        class _DisambiguationError(Exception):
+            def __init__(self, options):
+                self.options = options
+
+        class _PageError(Exception):
+            pass
+
+        fake_wikipedia = MagicMock()
+        fake_wikipedia.exceptions = MagicMock()
+        fake_wikipedia.exceptions.DisambiguationError = _DisambiguationError
+        fake_wikipedia.exceptions.PageError = _PageError
+
+        call_count = {"n": 0}
+        def _summary(title, auto_suggest=False):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise _DisambiguationError(options=["Paris, France", "Paris, Texas"])
+            return "Paris, France is the capital of France."
+        fake_wikipedia.summary = MagicMock(side_effect=_summary)
+        fake_wikipedia.search = MagicMock(return_value=[])
+        with patch.dict("sys.modules", {"wikipedia": fake_wikipedia}):
+            sources = await backend.search("Paris")
+        assert len(sources) == 1
+        assert "Paris, France is the capital of France." in sources[0]
 
 
 # ---------------------------------------------------------------------- #

