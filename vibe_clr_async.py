@@ -1533,9 +1533,19 @@ class VibeThinkerCLRAsync:
             )
             if structured is not None:
                 final_answer = structured.get("boxed_answer")
+                # v3.2: telemetry — structured JSON path succeeded.
+                self._structured_success_count += 1
             else:
                 # Fallback: regex extraction for unstructured output.
                 final_answer = self._extract_boxed_answer(raw_trace)
+                # v3.2: telemetry — structured JSON failed, fell back to
+                # regex \boxed{} scraping. Tracked for the metric-gated
+                # rollout (remove regex once fallback rate < threshold).
+                self._structured_fallback_count += 1
+                print(f"[CLR] lightweight structured fallback to regex "
+                      f"(success={self._structured_success_count}, "
+                      f"fallback={self._structured_fallback_count}, "
+                      f"rate={self.structured_fallback_rate():.1%})")
         else:
             reasoning_prompt = (
                 "<|im_start|>user\n"

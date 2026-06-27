@@ -527,7 +527,9 @@ class TestStructuredOutput:
     @pytest.mark.asyncio
     async def test_generate_lightweight_structured_falls_back_to_regex(self):
         """When use_structured_output=True but the model returns unstructured
-        text, parse_structured_output returns None and the regex fallback runs."""
+        text, parse_structured_output returns None and the regex fallback runs.
+        v3.2: the fallback counter is incremented so the fallback rate can
+        be monitored for the metric-gated rollout."""
         from vibe_clr_async import VibeThinkerCLRAsync
         from unittest.mock import patch, AsyncMock
 
@@ -541,6 +543,40 @@ class TestStructuredOutput:
         # Should fall back to regex extraction.
         assert result["answer"] == "42"
         assert result["answer_present"] is True
+        # v3.2: telemetry — fallback counter incremented, success not.
+        assert runner._structured_fallback_count == 1
+        assert runner._structured_success_count == 0
+        assert runner.structured_fallback_rate() == 1.0
+
+
+class TestStructuredOutputTelemetry:
+    """v3.2: structured-output vs regex-fallback telemetry counters."""
+
+    def test_initial_counters_zero(self):
+        from vibe_clr_async import VibeThinkerCLRAsync
+        runner = VibeThinkerCLRAsync(use_structured_output=True)
+        assert runner._structured_success_count == 0
+        assert runner._structured_fallback_count == 0
+        assert runner.structured_fallback_rate() == 0.0  # no division by zero
+
+    def test_fallback_rate_calculation(self):
+        from vibe_clr_async import VibeThinkerCLRAsync
+        runner = VibeThinkerCLRAsync(use_structured_output=True)
+        runner._structured_success_count = 98
+        runner._structured_fallback_count = 2
+        # 2 / 100 = 2% fallback rate — at the threshold for removing regex.
+        assert runner.structured_fallback_rate() == 0.02
+
+    def test_telemetry_snapshot(self):
+        from vibe_clr_async import VibeThinkerCLRAsync
+        runner = VibeThinkerCLRAsync(use_structured_output=True)
+        runner._structured_success_count = 50
+        runner._structured_fallback_count = 5
+        snap = runner.structured_telemetry()
+        assert snap["structured_success"] == 50
+        assert snap["structured_fallback"] == 5
+        assert snap["total"] == 55
+        assert snap["fallback_rate"] == round(5 / 55, 4)
 
 
 class TestFastSpecialistPolicy:

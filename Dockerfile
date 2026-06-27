@@ -80,6 +80,16 @@ COPY web/ ./web/
 RUN mkdir -p /data
 VOLUME ["/data"]
 
+# Run as a non-root user for defense-in-depth (the orchestrator never needs
+# root). The `vibe` user owns /app (read-only code) and /data (audit log +
+# trajectory store + CLR cache). The /opt/venv stays root-owned and
+# world-readable/executable so vibe can run python without owning the venv.
+# Docker-socket access for the code sandbox is granted at run time via the
+# mounted /var/run/docker.sock; if your socket is group-restricted, add the
+# vibe user to the host's docker group (the GID varies by host).
+RUN useradd -m -u 1000 vibe && chown -R vibe:vibe /app /data
+USER vibe
+
 # Default env vars consumed by rfsn_cli.py (overridable at run time).
 # These match the env-var precedence in build_argparser (CLI > env > default).
 ENV VIBE_THINKER_URL=http://127.0.0.1:8080 \

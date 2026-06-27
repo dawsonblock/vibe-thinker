@@ -2,6 +2,15 @@
 
 ## Verify / test
 - Full suite: `python3 -m pytest -q` (~1173 tests, ~110s, no live servers needed)
+- v3.2 verifier golden-set regression suite: `python3 -m pytest tests/test_verifier_golden_set.py -q`
+- v3.2 tool-callback scaffold: `python3 -m pytest tests/test_tool_callbacks.py -q`
+- v3.2 train-lora diversity stats + gate: `python3 -m pytest tests/test_train_lora.py -q`
+- v3.2 federation reputation (Sybil-resistant): `python3 -m pytest tests/test_federation_server.py::TestReputationStore tests/test_federation_server.py::TestReputationEndpoints tests/test_federation_server.py::TestExtractIdentity -q`
+- v3.2 wasmtime fuel + wall-clock: `python3 -m pytest tests/test_static_analysis.py::TestWasmtimeFuel -q`
+- v3.2 static-fallback gate: `python3 -m pytest tests/test_static_analysis.py::TestStaticFallbackGate -q`
+- v3.2 CommonMark fence matcher: `python3 -m pytest tests/test_routing.py::TestExtractPythonBlock -q`
+- v3.2 structured-output telemetry: `python3 -m pytest tests/test_clr_scoring.py::TestStructuredOutputTelemetry -q`
+- v3.2 vector-store precedence + ShadowVectorStore deprecation: `python3 -m pytest tests/test_vector_store.py -q`
 - Routing + REPL only: `python3 -m pytest tests/test_routing.py tests/test_repl.py -q`
 - Format enforcer + chat transports + repair loop: `python3 -m pytest tests/test_format_enforcer.py -q`
 - Citation-backed NLI factual verifier: `python3 -m pytest tests/test_factual_verifier.py -q`
@@ -1389,3 +1398,164 @@ new flags are used.
 - **Mutation operator refactor**: `_swap_constants` in
   `verifiers/mutation.py` refactored from unreadable one-liners to
   clear multi-line logic with proper indentation and comments.
+
+## v3.2 (production-hardening pass)
+
+A revision of the multi-month improvement plan, grounded in the actual
+codebase state. Several original-plan items were over-engineered or
+rested on misreads of the current code; this pass implements the
+critique-grounded versions. All changes are backward-compatible unless
+noted.
+
+### ResourceTracker teardown noise fix (`tests/conftest.py`)
+Suppresses the benign `AttributeError` from `multiprocess.resource_tracker.
+ResourceTracker.__del__` at interpreter shutdown on macOS Python 3.12.
+The noise was masking real CI failures. The conftest wraps `__del__` to
+swallow `AttributeError` only (any other exception type still propagates).
+Patches both the `multiprocess` package (the actual source of the noise)
+and stdlib `multiprocessing`. macOS-only; no-op elsewhere.
+
+### Static-analysis fallback gate + score lowering (Step 3.1 revised)
+`_static_analysis_fallback` partial score lowered 0.4 -> 0.2 (less
+epistemic weight for an unexecuted signal). The fallback is now GATED
+behind `--allow-static-fallback` (env `VIBE_THINKER_ALLOW_STATIC_FALLBACK`,
+default OFF). When the gate is closed and no sandbox is available, the
+code route returns `verified=False, score=0.0` instead of the heuristic.
+When open (local dev), the route is renamed `code_specialist_unverified_static_only`
+(so consumers can't confuse it with any verified path). The original
+plan's "return hard 0.0 always" was MORE epistemically wrong (it claims
+"we know this is bad" when the truth is "we know it parses + has no
+restricted imports"). The gate preserves the signal for dev without
+letting it influence production confidence.
+
+### CommonMark-aware fence matcher (Step 2.2 revised)
+`_extract_python_block` now parses fenced code blocks per the CommonMark
+spec: 3+ backticks with <=3 leading spaces, closing fence must match the
+opener's backtick count and have no info string. The old
+`stripped.startswith("```")` toggle broke on (a) `>3`-backtick lines
+closing a `3`-backtick block early, and (b) nested backticks in markdown
+explanations flipping the open/close state mid-block and swallowing real
+code. 5 new tests cover the CommonMark cases.
+
+### Wasmtime fuel + wall-clock belt-and-suspenders (Step 3.2 revised)
+`_wasmtime_sandbox_fallback` now enables Wasmtime fuel metering
+(`Config.consume_fuel = True` + `store.set_fuel(VIBE_WASM_FUEL)`, default
+1e9 instructions) for deterministic infinite-loop detection at the
+CPU-instruction level. The wall-clock timeout (`VIBE_WASM_WALL_CLOCK_TIMEOUT`,
+default 10s) is kept as the OUTER belt — the wasm call runs in a thread
+executor so `asyncio.wait_for` can abandon a hang that fuel can't see
+(e.g. a host syscall). Out-of-fuel traps return `score=0.0` with a
+"fuel" message; wall-clock timeouts return `score=0.0` with a "timeout"
+message. Fuel enabling is guarded for older wasmtime versions (falls
+back to wall-clock only).
+
+### Sybil-resistant federation reputation (Step 4.3 revised)
+`federation_server.py` gains a `ReputationStore` (EMA in [0,1]) keyed on
+the mTLS client cert's cryptographic identity (subject CN -> fingerprint
+-> raw worker_id fallback), NOT the self-asserted `worker_id`. This
+prevents Sybil attacks: one cert = one reputation; minting new
+`worker_id`s doesn't inflate influence. `/complete` updates reputation
+from the result's INDEPENDENT `verified` verdict (True: +1, False: -2
+[hallucination is worst], error: -1). `/api/sona/sync` downweights a
+low-reputation node's gossip imports (0 below floor 0.3, else the score
+itself) so hallucinated patterns don't propagate. `/api/reputation`
+diagnostic endpoint returns the per-identity snapshot. A single failure
+does NOT zero a good node (EMA with alpha=0.3 needs ~3 consecutive bad
+outcomes to drop from 1.0 to ~0.4).
+
+### Vector-store precedence + ShadowVectorStore deprecation (Step 1.3 revised)
+`make_vector_store` now prefers `RuvLLMVectorStore` (in-process Rust HNSW,
+zero Python RAM bloat) when the binding is installed AND `dim` is
+provided AND no `agentdb_url` is set. `LocalVectorStore` is KEPT as the
+zero-build default (NOT deprecated) because it supports `delete` and
+`cluster`, which the HNSW binding does NOT expose — deprecating it would
+regress those features and force a hard Rust build to run the orchestrator.
+`ShadowVectorStore` is DEPRECATED (emits a `DeprecationWarning`); new
+deployments should cut over to `--agentdb-only` mode after verifying
+recall rather than running shadow mode indefinitely.
+
+### Z3-grammar constraint on logic translation (Step 2.3 revised)
+New `SchemaKind.LOGIC_CONSTRAINTS` + `LOGIC_CONSTRAINTS_GRAMMAR` (GBNF)
+in `format_enforcer.py` forces the generalist to emit valid JSON with
+`constraints`/`variables`/`values` keys during the NL->Z3 translation
+step. `_translate_logic_constraints` passes the grammar to
+`_call_generalist` (mapped to `response_format` on the chat endpoint,
+`grammar` on the /completion fallback). The prompt adds an explicit Z3-
+syntax allowlist (And/Or/Not/Implies/If/Xor, no `z3.` prefix). The
+existing `_translate_logic_constraints_with_retry` + `validate_constraints`
+loop is kept — the grammar handles JSON shape, the validator handles Z3
+semantics. Replaces the original plan's "fine-tuned Translator-Specialist
+model" (10x the operational cost for a marginal win) with few-shot +
+schema-validated retry.
+
+### Structured-output + regex fallback telemetry (Step 2.1 revised)
+`vibe_clr_async.py` gains `_structured_success_count` /
+`_structured_fallback_count` counters and a `structured_fallback_rate()`
+method. Both the full-trajectory and lightweight-trajectory fallback
+points increment the fallback counter and log the rate when regex
+`\boxed{}` scraping is used instead of structured JSON. This is the
+metric-gated rollout: the regex fallback is KEPT (not removed "un-
+bypassably" on day one) so a single upstream schema bug doesn't mark
+everything `verified=False`. Once the fallback rate drops below a
+threshold (e.g. 2%) over a sufficient sample, the regex path can be
+removed. `structured_telemetry()` returns the raw counters for logging.
+
+### ruvllm_py per-token logprobs (Step 1.1)
+`ruvllm_py/src/lib.rs` exposes `Engine.complete_with_logprobs()` which
+runs forward passes with `candle_transformers::models::quantized_llama`
+and applies `log_softmax` over the vocab to return per-token logprobs.
+`Engine.supports_logprobs()` and module-level `SUPPORTS_LOGPROBS`
+enable capability detection. `scripts/turboquant_ppl_check.py` uses
+this so `eval_inprocess()` returns a real `PplResult` when the binding
+is built with the `candle` feature; raises `NotImplementedError`
+(fail-closed) when the binding is absent or built without candle.
+Backward-compat: `complete()` is unchanged. The fail-closed contract
+for the absent-binding case is preserved in the tests.
+
+### Unified Docker deployment stack (Step 1.2)
+New files: `docker-compose.yml` (redis/envoy/agentdb sidecars always
+start + 3 orchestrator profiles: `--profile cpu`/`gpu`/`ruvllm`),
+`Dockerfile` (multi-stage python:3.12-slim), `docker/agentdb.Dockerfile`
+(placeholder — no published AgentDB image exists), `docker/envoy/envoy.yaml`
+(SNI-aware egress matching `sandbox/envoy_sidecar.py`), `.dockerignore`,
+`docs/deployment.md`. All healthchecks include `start_period` + retries.
+Honesty notes: AgentDB/RuvLLM have no published images (must be supplied
+by the user); GPU profile requires a `.gguf` model volume mount. This is
+GREENFIELD (no existing compose/Dockerfile to consolidate).
+
+### Manual train-lora subcommand (Step 4.1 revised)
+`scripts/train_lora.py` is the HUMAN-IN-THE-LOOP boundary of the data
+flywheel. It reads an exported DPO/SFT dataset, computes and prints
+DIVERSITY STATS (task-type distribution, unique-query count,
+verification-method breakdown, selection-bias warning when one task type
+is >70%), and requires an explicit `--yes` flag to proceed past the
+stats review. It then shells out to `mlx_lm.lora` (Apple Silicon) or
+`unsloth` (CUDA) and writes a LoRA adapter to `--output-dir` and STOPS.
+NO auto-training (the original plan's "train when X patterns accumulate"
+bakes in selection bias toward verifiable task types). NO hot-swap
+(llama-cpp-python has no `set_lora()` — it's a model reload, and silently
+swapping a learned adapter into production is an unreviewed deployment).
+The operator reviews the adapter and loads it manually.
+
+### Inter-turn tool-callback scaffold (Step 4.2 revised)
+`tool_callbacks.py` implements INTER-TURN tool calls (generate -> tool
+call -> continue), NOT mid-token pausing (which is genuinely hard with
+llama-cpp streaming). A `ToolCallback` protocol + `CallbackRegistry` map
+tool names to async callables. The specialist signals a tool call via
+`<tool_call name="...">query</tool_call>` markers; `run_with_callbacks`
+drives the loop (bounded by `max_rounds`, default 3), executes tools
+fail-safe (unknown tool / exception -> error note fed back, not
+crashed), and strips markers from the final output. Without a registry,
+the loop is a no-op (backward-compat). This is a SCAFFOLD — the
+orchestrator wires the registry (e.g. "generalist_query" -> a
+FactualVerifier RAG call) and passes it to the specialist invocation.
+
+### Verifier golden-set regression suite
+`tests/test_verifier_golden_set.py` — a curated set of (verifier, query,
+answer, context, expected_verified) tuples for MathVerifier and
+LogicVerifier. Guards against regressions: if a verifier starts
+accepting a hallucinated answer or rejecting a correct one, this suite
+catches it. Meta-test (`TestGoldenSetCompleteness`) ensures the golden
+set covers BOTH True and False outcomes for each verifier (a one-
+direction set is vacuous). Already documented a real parser limitation
+(`_extract_numeric` doesn't parse scientific notation — `1e2` -> 2.0).

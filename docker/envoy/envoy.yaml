@@ -54,14 +54,14 @@ static_resources:
                           name: allow
                           typed_config:
                             "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
-                            stat_prefix: allow_pypi_org
+                            stat_prefix: allow_pypi.org
                             cluster: dynamic_upstream
                       files.pythonhosted.org:
                         action:
                           name: allow
                           typed_config:
                             "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
-                            stat_prefix: allow_files_pythonhosted_org
+                            stat_prefix: allow_files.pythonhosted.org
                             cluster: dynamic_upstream
                   # Default: deny (no SNI match -> close connection via sinkhole).
                   on_no_match:
