@@ -740,12 +740,18 @@ they cannot hallucinate a verdict.
 Run: `python3 -m pytest tests/test_nli_encoder.py -q` (17 tests, no model
 download — inference is mocked).
 
-### Process-pool mode for in-process specialist (v1.1, opt-in)
+### Process-pool mode for in-process specialist (v1.1, REMOVED in v2.0)
 The in-process specialist pool historically used a `queue.Queue` of Llama
-instances + `ThreadPoolExecutor` (shared GIL). A new `local_pool_kind`
-param adds a `ProcessPoolExecutor` option where each worker loads its own
-Llama instance (worker-local global), giving each worker its own GIL.
-This eliminates Python-side lock contention under extreme concurrency.
+instances + `ThreadPoolExecutor` (shared GIL). A `ProcessPoolExecutor`
+option was added in v1.1 where each worker loads its own Llama instance
+(worker-local global), giving each worker its own GIL. This eliminated
+Python-side lock contention under extreme concurrency.
+
+**Removed in v2.0**: The ruvllm_py PyO3 binding releases the GIL
+natively, making process-pool mode unnecessary. The
+`--local-specialist-pool-kind process` flag, `LocalPoolKind.PROCESS`
+enum, and all worker functions were removed. Thread mode is the only
+pool kind now.
 - **Opt-in**: `--local-specialist-pool-kind process` CLI flag /
   `VIBE_THINKER_LOCAL_POOL_KIND` env var. Default `thread` (unchanged).
 - **RAM guardrail**: before starting the process pool, estimates the
@@ -1051,10 +1057,10 @@ new flags are used.
   thread-safe pool mode. Grammar param accepted (API compat) but
   candle backend doesn't enforce GBNF — the format enforcer handles
   structured output.
-- **Process-pool mode deprecated**: `DeprecationWarning` emitted when
-  `--local-specialist-pool-kind process` is used. Superseded by the
-  ruvllm_py binding (releases GIL natively, no RAM duplication).
-  Not removed — will be in a future release.
+- **Process-pool mode deprecated** (v1.2) → **removed** (v2.0): The
+  `--local-specialist-pool-kind process` flag was deprecated in v1.2
+  and fully removed in v2.0. Superseded by the ruvllm_py binding
+  (releases GIL natively, no RAM duplication).
 - NOTE: `ruvllm 2.3.0` has a bug where `pub mod claude_flow`
   unconditionally uses `tokio` (gated by `async-runtime`). We work
   around this by enabling `async-runtime` in our Cargo.toml.
@@ -1064,16 +1070,17 @@ new flags are used.
   present. The sandbox routes traffic through a proxy at
   `DEFAULT_PROXY_EGRESS` (127.0.0.1:8888) via HTTP_PROXY/HTTPS_PROXY
   env vars. No NET_ADMIN cap needed. Solves CDN IP rotation.
-- **`--legacy-iptables-egress`** flag restores the v0.4.0 iptables
-  path (in-container firewall rules, NET_ADMIN cap). Deprecated.
+- **`--legacy-iptables-egress`** flag (v1.2) → **removed** (v2.0):
+  The v0.4.0 iptables path (in-container firewall rules, NET_ADMIN cap)
+  was deprecated in v1.2 and fully removed in v2.0. SNI-proxy is now
+  the only egress mode.
 - **`sandbox/envoy_sidecar.py`** (new): Envoy config generator +
   launcher. Generates SNI-aware tcp_proxy config from a
   NetworkAllowList. Fail-closed if envoy binary not on PATH.
   `--envoy-sidecar` CLI flag auto-launches Envoy as a child process
   with cleanup on exit.
 - Tests: `test_envoy_sidecar.py` (16 tests). Integration tests
-  (`test_network_integration.py`) use `legacy_iptables_egress=True`
-  to keep testing the iptables path. Run:
+  (`test_network_integration.py`) test the SNI-proxy egress path. Run:
   `python3 -m pytest tests/test_envoy_sidecar.py tests/test_network_allowlist.py -q`
 
 ## v2.0 remediation (deprecated code removal + PyO3 HNSW/SONA + verification hardening)

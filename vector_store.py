@@ -538,18 +538,25 @@ class RuvLLMVectorStore:
     ) -> List[Tuple[str, float, Dict[str, Any]]]:
         """Return the top_k most similar entries as
         ``(vector_id, similarity_score, metadata)`` tuples.
+
+        The HNSW binding returns cosine **distance** (0 = identical,
+        higher = more different). We convert to cosine **similarity**
+        (1 - distance) so the score is comparable with
+        ``LocalVectorStore`` and ``AgentDBVectorStore``, which both
+        return similarity in [0, 1].
         """
         results = self._index.search(query_embedding, top_k)
         out = []
         for r in results:
             vid = r.get("id", "")
-            score = r.get("score", 0.0)
+            distance = r.get("score", 0.0)
+            similarity = 1.0 - distance
             meta = self._metadata.get(vid, {})
             # Apply filters if provided.
             if filters:
                 if not all(meta.get(k) == v for k, v in filters.items()):
                     continue
-            out.append((vid, score, meta))
+            out.append((vid, similarity, meta))
         return out
 
     def delete(self, vector_id: str) -> bool:

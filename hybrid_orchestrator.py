@@ -1986,12 +1986,12 @@ class HybridReasoningOrchestrator:
             try:
                 import uuid as _uuid
                 req_id = str(_uuid.uuid4())
-                # Get query embedding from the trajectory store's model.
-                q_emb = self.trajectory_store._embed(query) if hasattr(
-                    self.trajectory_store, "_embed") else []
-                a_emb = self.trajectory_store._embed(result.final_answer) if hasattr(
-                    self.trajectory_store, "_embed") else []
-                if q_emb and a_emb:
+                # Use the trajectory store's sentence-transformers model
+                # to embed the query and response.
+                model = getattr(self.trajectory_store, "model", None)
+                if model is not None:
+                    q_emb = model.encode([query])[0].tolist()
+                    a_emb = model.encode([result.final_answer])[0].tolist()
                     self._sona_recorder.record(
                         request_id=req_id,
                         session_id="default",

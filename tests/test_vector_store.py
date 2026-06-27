@@ -439,6 +439,11 @@ class TestRuvLLMVectorStore:
         assert len(results) >= 1
         # v1 should be closer to the query than v2 (if both returned).
         assert results[0][0] == "v1"
+        # Score should be similarity (1 - distance), in [0, 1].
+        # An identical query should have similarity ~1.0.
+        exact = store.search([1.0, 0.0, 0.0, 0.0], top_k=1)
+        if exact:
+            assert exact[0][1] > 0.99  # ~1.0 similarity for identical vector
 
     def test_count(self, store):
         """Count returns the number of stored vectors."""

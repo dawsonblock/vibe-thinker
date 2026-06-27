@@ -1,6 +1,6 @@
 [package]
 name = "ruvllm_py"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Python bindings for the RuvLLM Rust inference engine with TurboQuant KV cache compression"
 license = "MIT"
