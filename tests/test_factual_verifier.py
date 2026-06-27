@@ -176,7 +176,13 @@ class TestFactualVerifierCitationBacked:
 
     @pytest.mark.asyncio
     async def test_contradiction_with_quote_rejects(self, nli_verifier):
-        """CONTRADICTION with a quote → rejected, nli_citation_backed."""
+        """CONTRADICTION with a quote → rejected, nli_llm_judge.
+
+        Note: the citation is NOT verified for CONTRADICTION (only
+        ENTAILMENT gets the normalized substring check), so the method
+        tag is nli_llm_judge, not nli_citation_backed. The quote is still
+        included in evidence for debugging.
+        """
         verifier, judge = nli_verifier
         judge.return_value = json.dumps({
             "verdict": "CONTRADICTION",
@@ -188,8 +194,9 @@ class TestFactualVerifierCitationBacked:
             context={"sources": ["Paris is the capital of France."]},
         )
         assert result.verified is False
-        assert result.method == "nli_citation_backed"
+        assert result.method == "nli_llm_judge"
         assert "contradicts" in (result.error or "")
+        assert result.evidence.get("quote") == "Paris is the capital of France."
 
     @pytest.mark.asyncio
     async def test_neutral_fails_closed(self, nli_verifier):

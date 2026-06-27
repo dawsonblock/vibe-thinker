@@ -407,18 +407,6 @@ class AnthropicEnforcer(_BaseEnforcer):
             "input_schema": _schema_to_json_schema(self._schema),
         }
 
-    def parse(self, text: str) -> Optional[Dict[str, Any]]:
-        """Anthropic may return the structured payload as a tool_use JSON
-        string inside the text content, or as plain JSON. Try the shared
-        JSON parser first; if that fails, look for a tool_use block shape.
-        """
-        parsed = parse_structured_output(text)
-        if parsed is not None:
-            return parsed
-        # Some Anthropic SDKs return the tool input as a JSON string; the
-        # shared parser already handles that. Nothing more to do here.
-        return None
-
 
 # --------------------------------------------------------------------------- #
 # Factory

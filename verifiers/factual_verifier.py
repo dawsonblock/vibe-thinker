@@ -204,10 +204,16 @@ class FactualVerifier:
                               "source_count": len(sources)},
                 )
             if verdict == "CONTRADICTION":
+                # Note: we do NOT verify the citation for CONTRADICTION
+                # (only ENTAILMENT gets the normalized substring check).
+                # The method tag is therefore always nli_llm_judge, not
+                # nli_citation_backed — the latter implies the quote was
+                # verified, which it wasn't here. The quote is still
+                # included in evidence for debugging.
                 return VerificationResult(
                     verified=False,
                     score=0.0,
-                    method="nli_citation_backed" if quote else "nli_llm_judge",
+                    method="nli_llm_judge",
                     evidence={"source": str(src)[:100],
                               "verdict": verdict,
                               "quote": quote[:200] if quote else None,

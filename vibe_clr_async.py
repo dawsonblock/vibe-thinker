@@ -51,6 +51,7 @@ from format_enforcer import (  # noqa: E402
 from format_enforcer import (  # noqa: E402
     SchemaKind,
     make_enforcer,
+    parse_error_detail,
     parse_structured_output as _parse_structured_output_shared,
 )
 
@@ -914,14 +915,13 @@ class VibeThinkerCLRAsync:
         this).
 
         Structured output (``grammar``): the GBNF string cannot be sent to
-        OpenAI or Anthropic. When a FormatEnforcer is wired in (S1.1), it
-        maps the schema to ``response_format`` (OpenAI) or a tool definition
-        (Anthropic). Until then, we map the two known grammars by identity:
-        ``_STRUCTURED_OUTPUT_GRAMMAR`` and ``_CLAIMS_JSON_GRAMMAR`` become a
-        JSON-object instruction appended to the user message and, for OpenAI,
-        a ``response_format={"type": "json_object"}`` hint. This is weaker
-        than native GBNF enforcement — the parse-repair loop (S1.3) covers
-        the resulting malformed-JSON cases.
+        OpenAI or Anthropic. A :class:`FormatEnforcer` is built from the
+        grammar string and maps the schema to ``response_format`` (OpenAI)
+        or a tool definition + ``tool_choice`` (Anthropic). A JSON-output
+        instruction is also appended to the user message as a
+        belt-and-suspenders hint for models that partially ignore
+        response_format/tool_choice. The parse-repair loop (S1.3) covers
+        any malformed-JSON cases that still result.
 
         Args:
             transport: "openai_chat" (OpenAI-compatible /v1/chat/completions)
@@ -1006,10 +1006,12 @@ class VibeThinkerCLRAsync:
     def _augment_with_json_instruction(user_text: str, grammar: str) -> str:
         """Append a JSON-output instruction when a structured grammar is set.
 
-        This is a transitional shim used until the FormatEnforcer (S1.1)
-        supplies a transport-native schema. It does NOT enforce JSON — it
-        only steers the model. The parse-repair loop (S1.3) handles the
-        malformed-JSON cases that result.
+        This is a belt-and-suspenders hint used alongside the
+        FormatEnforcer's native enforcement (response_format / tool_choice).
+        The native enforcement is the primary mechanism; this text hint
+        helps models that partially ignore response_format/tool_choice.
+        The parse-repair loop (S1.3) handles any malformed-JSON cases that
+        still result.
         """
         if grammar == _STRUCTURED_OUTPUT_GRAMMAR:
             return (
@@ -1132,8 +1134,7 @@ class VibeThinkerCLRAsync:
                 if isinstance(b, dict) and b.get("type") == "tool_use"
             ]
             if tool_inputs and enforcer is not None:
-                import json as _json
-                return _json.dumps(tool_inputs[0].get("input", {}))
+                return json.dumps(tool_inputs[0].get("input", {}))
             # No tool_use block (e.g. enforcer was None, or the model emitted
             # text despite tool_choice). Concatenate text blocks.
             return "".join(
@@ -1547,7 +1548,6 @@ class VibeThinkerCLRAsync:
             return raw, parsed
 
         # Parse failed — attempt repairs.
-        from format_enforcer import parse_error_detail
         for attempt in range(self.max_parse_repairs):
             error = parse_error_detail(raw)
             repair_prompt = (

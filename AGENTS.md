@@ -695,7 +695,11 @@ the quote is absent, the verdict is voided — fail-closed.
   `nli_llm_judge`, score **0.7** (BELOW the 0.75 cache threshold, so
   un-cited entailment can no longer poison the CLR cache — this was the
   v0.4.0 risk: a hallucinating judge at 0.85 could get cached).
-- CONTRADICTION with a quote → `nli_citation_backed`, score 0.0.
+- CONTRADICTION (with or without a quote) → `nli_llm_judge`, score 0.0.
+  The citation is NOT verified for CONTRADICTION (only ENTAILMENT gets
+  the normalized substring check), so the method tag is `nli_llm_judge`
+  even when a quote is present. The quote is included in evidence for
+  debugging.
 - NEUTRAL / judge error / no judge → unchanged fail-closed paths.
 The normalization is deliberately conservative (no lemmatization, no
 synonym mapping) so a real match is meaningful. Run:
