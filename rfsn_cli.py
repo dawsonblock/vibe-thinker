@@ -381,16 +381,23 @@ def build_argparser() -> argparse.ArgumentParser:
                         "Fail-closed: falls back to regex extraction if no "
                         "repair parses.")
     p.add_argument("--prefer-encoder-nli", dest="prefer_encoder_nli",
-                   action="store_true",
-                   help="Prefer an encoder-only NLI model (e.g. DeBERTa-v3) "
-                        "over the LLM judge for factual verification. More "
-                        "robust to fabrication (encoder models can't "
-                        "hallucinate). Requires the optional 'nli' extra: "
-                        "pip install \"vibe-thinker[nli]\". The model is "
-                        "downloaded from HuggingFace on first use. Default "
-                        "off — fail-closed to the LLM judge when unavailable.")
-    p.set_defaults(prefer_encoder_nli=_env_bool(
-        "VIBE_THINKER_PREFER_ENCODER_NLI", False))
+                   action="store_true", default=True,
+                   help="(Default ON) Prefer an encoder-only NLI model (e.g. "
+                        "DeBERTa-v3) over the LLM judge for factual "
+                        "verification. More robust to fabrication (encoder "
+                        "models can't hallucinate). Requires the optional "
+                        "'nli' extra: pip install \"vibe-thinker[nli]\". "
+                        "The model is downloaded from HuggingFace on first "
+                        "use. Fail-closed to the LLM judge when unavailable.")
+    p.add_argument("--no-encoder-nli", dest="prefer_encoder_nli",
+                   action="store_false",
+                   help="Disable the encoder NLI judge and use the LLM judge "
+                        "for factual verification. Useful when the encoder "
+                        "model download is undesirable or when you want the "
+                        "LLM judge's citation extraction (encoder NLI "
+                        "doesn't extract supporting quotes).")
+    p.set_defaults(prefer_encoder_nli=not _env_bool(
+        "VIBE_THINKER_NO_ENCODER_NLI", False))
     p.add_argument("--generalist",
                    default=os.environ.get("GENERALIST_URL", "http://127.0.0.1:8081"),
                    help="Generalist model endpoint")
@@ -679,17 +686,20 @@ async def _amain() -> None:
                   "--specialist-api-key is configured. Set VIBE_THINKER_SPECIALIST_API_KEY "
                   "or --specialist-api-key for authenticated providers.")
 
-    # --- Encoder NLI judge (v1.1) ---
+    # --- Encoder NLI judge (v1.1, default ON as of Phase 3.3) ---
     if args.prefer_encoder_nli:
         from verifiers.nli_encoder import is_available as encoder_available
         if encoder_available():
-            print("[CLI] Encoder NLI judge enabled (factual verification). "
-                  "Model downloads from HuggingFace on first use.")
+            print("[CLI] Encoder NLI judge enabled (default, factual "
+                  "verification). Model downloads from HuggingFace on "
+                  "first use. Use --no-encoder-nli to disable.")
         else:
-            print("[CLI] Warning: --prefer-encoder-nli set but the 'nli' "
-                  "extra is not installed. Install with: "
-                  "pip install \"vibe-thinker[nli]\". "
-                  "Falling back to the LLM judge.")
+            print("[CLI] Encoder NLI judge: 'nli' extra not installed. "
+                  "Install with: pip install \"vibe-thinker[nli]\". "
+                  "Falling back to the LLM judge (default behavior).")
+    else:
+        print("[CLI] Encoder NLI judge disabled (--no-encoder-nli). "
+              "Using LLM judge for factual verification.")
 
     # --- Fast code-specialist preset (v0.3.9) ---
     # Bumps code_candidates to 15 for ultra-fast 0.5B code models.

@@ -293,6 +293,80 @@ class TestLogicVerifier:
         assert result.verified is True
 
 
+@pytest.mark.skipif(not _Z3_AVAILABLE, reason="z3-solver not installed")
+class TestLogicVerifierValidateConstraints:
+    """Phase 3.2: validate_constraints checks parseability without
+    running the full verification. Used by the translation retry loop."""
+
+    def test_valid_constraints_return_none(self):
+        error = LogicVerifier.validate_constraints(
+            ["x > 0", "x + y == 10", "y < x"],
+            {"x": "Int", "y": "Int"},
+        )
+        assert error is None
+
+    def test_invalid_syntax_returns_error(self):
+        error = LogicVerifier.validate_constraints(
+            ["x >>> 0"],  # invalid Python/Z3 syntax
+            {"x": "Int"},
+        )
+        assert error is not None
+        assert "failed to parse" in error
+        assert "x >>> 0" in error
+
+    def test_undefined_variable_returns_error(self):
+        error = LogicVerifier.validate_constraints(
+            ["z > 0"],  # z is not declared
+            {"x": "Int"},
+        )
+        assert error is not None
+        assert "failed to parse" in error
+
+    def test_bad_sort_returns_error(self):
+        error = LogicVerifier.validate_constraints(
+            ["x > 0"],
+            {"x": "Float"},  # not a valid Z3 sort
+        )
+        assert error is not None
+        assert "failed to create Z3 variable" in error
+
+    def test_empty_constraints_return_none(self):
+        # Empty list — vacuously valid (no constraints to parse).
+        error = LogicVerifier.validate_constraints([], {})
+        assert error is None
+
+    def test_error_includes_constraint_index(self):
+        error = LogicVerifier.validate_constraints(
+            ["x > 0", "bad syntax !!!", "y < x"],
+            {"x": "Int", "y": "Int"},
+        )
+        assert error is not None
+        assert "constraint 1" in error
+
+    def test_error_includes_guidance(self):
+        error = LogicVerifier.validate_constraints(
+            ["bad !!!"],
+            {"x": "Int"},
+        )
+        assert error is not None
+        # The error should include guidance on valid Z3 syntax.
+        assert "Z3" in error or "variable" in error.lower()
+
+    def test_bool_constraints_valid(self):
+        error = LogicVerifier.validate_constraints(
+            ["Implies(raining, wet)", "Not(wet)"],
+            {"raining": "Bool", "wet": "Bool"},
+        )
+        assert error is None
+
+    def test_real_constraints_valid(self):
+        error = LogicVerifier.validate_constraints(
+            ["x > 0.5", "x < 2.0"],
+            {"x": "Real"},
+        )
+        assert error is None
+
+
 class TestLogicVerifierUnavailable:
     @pytest.mark.skipif(_Z3_AVAILABLE, reason="z3-solver IS installed — test the fail-closed path only when absent")
     @pytest.mark.asyncio

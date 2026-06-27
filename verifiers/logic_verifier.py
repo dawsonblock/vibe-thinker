@@ -189,6 +189,50 @@ class LogicVerifier:
     # Z3 helpers
     # ------------------------------------------------------------------ #
     @staticmethod
+    def validate_constraints(
+        constraints: List[str], variables: Dict[str, str]
+    ) -> Optional[str]:
+        """Validate that constraints parse as Z3 expressions.
+
+        Used by the translation retry loop (Phase 3.2) to check whether
+        a generalist-produced constraint set is syntactically valid Z3
+        BEFORE running the full verification. This separates "bad
+        translation" (the generalist wrote invalid Z3 syntax) from "bad
+        answer" (the answer's values violate valid constraints).
+
+        Args:
+            constraints: list of Z3 assertion strings.
+            variables: dict mapping variable names to Z3 sorts.
+
+        Returns:
+            None if all constraints parse successfully, or an error
+            message string describing the first parse failure (suitable
+            for feeding back to the generalist for a retry).
+        """
+        if not _Z3_AVAILABLE:
+            return "z3-solver not installed; cannot validate constraints"
+        # Build Z3 variables.
+        z3_vars: Dict[str, Any] = {}
+        try:
+            for name, sort in variables.items():
+                z3_vars[name] = LogicVerifier._make_var(name, sort)
+        except Exception as e:
+            return f"failed to create Z3 variable: {e}"
+        # Parse each constraint.
+        for i, c in enumerate(constraints):
+            try:
+                LogicVerifier._parse_constraint(c, z3_vars)
+            except Exception as e:
+                return (
+                    f"constraint {i} ({c!r}) failed to parse: {e}. "
+                    f"Use only Z3 Python syntax with the declared "
+                    f"variables: {list(z3_vars.keys())}. Supported ops: "
+                    f"arithmetic (+, -, *, /), comparison (==, !=, <, >, "
+                    f"<=, >=), And(), Or(), Not(), Implies(), If()."
+                )
+        return None
+
+    @staticmethod
     def _make_var(name: str, sort: str):
         """Create a Z3 variable of the given sort."""
         sort = (sort or "Int").strip().capitalize()
@@ -207,8 +251,22 @@ class LogicVerifier:
         Uses z3.parse_smt2_string when possible; otherwise evals in a
         restricted namespace containing only the Z3 variables.
         """
-        # Build a namespace with the Z3 vars + common Python operators.
-        namespace = {**z3_vars, "z3": z3}
+        # Build a namespace with the Z3 vars + common Z3 boolean ops.
+        namespace = {
+            **z3_vars,
+            "z3": z3,
+            # Expose common Z3 boolean functions directly so constraint
+            # strings like "Implies(a, b)" and "Not(a)" parse without
+            # requiring a "z3." prefix.
+            "And": z3.And,
+            "Or": z3.Or,
+            "Not": z3.Not,
+            "Implies": z3.Implies,
+            "If": z3.If,
+            "Xor": z3.Xor,
+            "True": z3.BoolVal(True),
+            "False": z3.BoolVal(False),
+        }
         # z3.Int/Real overloads make arithmetic work directly.
         return eval(expr_str, {"__builtins__": {}}, namespace)
 

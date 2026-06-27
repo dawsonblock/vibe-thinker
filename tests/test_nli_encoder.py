@@ -153,12 +153,43 @@ class TestFailClosed:
 
 class TestSelectVerifierFallback:
     """select_verifier must fall back to the LLM judge when the encoder
-    is unavailable or prefer_encoder_nli is False."""
+    is unavailable or prefer_encoder_nli is False.
 
-    def test_default_prefers_llm_judge(self):
+    Phase 3.3: the encoder NLI judge is now the DEFAULT (prefer_encoder_nli
+    defaults to True). These tests verify the fallback chain:
+    encoder available → encoder judge; encoder unavailable → LLM judge;
+    prefer_encoder_nli=False → LLM judge."""
+
+    def test_default_uses_encoder_when_available(self):
+        """Phase 3.3: the default (no explicit flag) now prefers the
+        encoder NLI judge when it's available."""
         from hybrid_orchestrator import select_verifier
         from verifiers.factual_verifier import FactualVerifier
-        v = select_verifier("factual", llm_judge="mock_judge")
+        with patch("verifiers.nli_encoder.is_available", return_value=True):
+            v = select_verifier("factual", llm_judge="mock_judge")
+        assert isinstance(v, FactualVerifier)
+        assert isinstance(v._llm_judge, EncoderNLIJudge)
+
+    def test_default_falls_back_when_encoder_unavailable(self):
+        """When the encoder is not installed (the common test env case),
+        the default still falls back to the LLM judge."""
+        from hybrid_orchestrator import select_verifier
+        from verifiers.factual_verifier import FactualVerifier
+        with patch("verifiers.nli_encoder.is_available", return_value=False):
+            v = select_verifier("factual", llm_judge="mock_judge")
+        assert isinstance(v, FactualVerifier)
+        assert v._llm_judge == "mock_judge"
+
+    def test_no_encoder_nli_flag_forces_llm_judge(self):
+        """Phase 3.3: --no-encoder-nli (prefer_encoder_nli=False) forces
+        the LLM judge even when the encoder is available."""
+        from hybrid_orchestrator import select_verifier
+        from verifiers.factual_verifier import FactualVerifier
+        with patch("verifiers.nli_encoder.is_available", return_value=True):
+            v = select_verifier(
+                "factual", llm_judge="mock_judge",
+                prefer_encoder_nli=False,
+            )
         assert isinstance(v, FactualVerifier)
         assert v._llm_judge == "mock_judge"
 

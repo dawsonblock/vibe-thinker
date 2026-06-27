@@ -58,7 +58,7 @@ from math_solver import solve as solve_math
 _UNSET = object()
 
 
-def select_verifier(task_type: str, llm_judge=None, prefer_encoder_nli: bool = False):
+def select_verifier(task_type: str, llm_judge=None, prefer_encoder_nli: bool = True):
     """Select a deterministic verifier based on the detected task type.
 
     Returns None if no verifier applies (conversation, summarization, etc.).
@@ -71,25 +71,25 @@ def select_verifier(task_type: str, llm_judge=None, prefer_encoder_nli: bool = F
         llm_judge: optional async callable (prompt -> response str) used
             by FactualVerifier as an NLI judge. Typically the
             orchestrator's ``_call_generalist``.
-        prefer_encoder_nli: when True and the optional ``transformers``+
-            ``torch`` deps are installed, prefer an
+        prefer_encoder_nli: when True (default) and the optional
+            ``transformers``+``torch`` deps are installed, prefer an
             :class:`EncoderNLIJudge` (encoder-only NLI model, robust to
-            fabrication) over the LLM judge for factual tasks. Default
-            False (opt-in) — the encoder model is downloaded from
-            HuggingFace on first use, so it's not enabled by default.
-            Fail-closed: if the encoder judge can't be constructed, falls
-            back to the LLM judge. The orchestrator wires this to the
-            ``--prefer-encoder-nli`` CLI flag / ``VIBE_THINKER_PREFER_ENCODER_NLI``
-            env var.
+            fabrication) over the LLM judge for factual tasks. Phase 3.3:
+            this is now the DEFAULT — the encoder NLI judge is preferred
+            whenever available, without requiring an opt-in flag. Set to
+            False via ``--no-encoder-nli`` / ``VIBE_THINKER_NO_ENCODER_NLI``
+            to force the LLM judge. Fail-closed: if the encoder judge
+            can't be constructed, falls back to the LLM judge.
     """
     if task_type == "math":
         return MathVerifier()
     if task_type == "code":
         return CodeVerifier()
     if task_type == "factual":
-        # v1.1: prefer the encoder-only NLI judge (no fabrication risk)
-        # when the optional nli extra is installed. Fail-closed fallback
-        # to the LLM judge when it's not.
+        # Phase 3.3: the encoder-only NLI judge is the DEFAULT when
+        # available (no fabrication risk — encoder models can't
+        # hallucinate). Fail-closed fallback to the LLM judge when
+        # the encoder deps are missing or the judge can't be constructed.
         if prefer_encoder_nli:
             try:
                 from verifiers.nli_encoder import EncoderNLIJudge, is_available
@@ -515,7 +515,7 @@ class HybridReasoningOrchestrator:
         specialist_api_key: Optional[str] = None,
         specialist_model_name: Optional[str] = None,
         max_parse_repairs: int = 2,
-        prefer_encoder_nli: bool = False,
+        prefer_encoder_nli: bool = True,
         sona_sync_url: Optional[str] = None,
         sona_sync_interval: int = 3600,
         federation_secret: Optional[str] = None,
@@ -1442,6 +1442,54 @@ class HybridReasoningOrchestrator:
             return tests
         return None
 
+    async def _mutation_check(
+        self, code: str, tests: str
+    ) -> tuple[bool, Optional[dict]]:
+        """Mutation testing for vacuous-test detection (Phase 3.1).
+
+        Injects a known bug into ``code`` and re-runs ``tests`` against
+        the mutated code. If the mutated (broken) code still passes the
+        tests, the tests are vacuous — they cannot distinguish correct
+        from incorrect code.
+
+        Returns:
+            (tests_are_vacuous, mutation_details)
+            - tests_are_vacuous: True if the mutated code passed (tests
+              are vacuous), False if the mutated code correctly failed
+              (tests are meaningful) or no mutation could be applied.
+            - mutation_details: a dict with the mutation operator and
+              description for audit, or None if no mutation was applied.
+        """
+        from verifiers.mutation import mutate_code
+        mutation = mutate_code(code)
+        if not mutation.applied:
+            # Code too simple to mutate — not a failure, skip the check.
+            return False, None
+        try:
+            mutated_result = await self.code_verifier.verify(
+                "", mutation.mutated_code, {"unit_tests": tests}
+            )
+        except Exception as e:
+            # If the mutation check itself errors, fail-safe: treat the
+            # tests as NOT vacuous (don't reject a passing candidate on
+            # an infrastructure error). Log the issue.
+            print(f"[CodeLoop] Mutation check errored (treating as non-vacuous): {e}")
+            return False, {"operator": mutation.operator, "error": str(e)}
+        details = {
+            "operator": mutation.operator,
+            "description": mutation.description,
+            "mutated_passed": mutated_result.verified,
+        }
+        if mutated_result.verified:
+            # The mutated (broken) code passed the tests -> VACUOUS.
+            print(f"[CodeLoop] VACUOUS TESTS detected: mutated code "
+                  f"({mutation.operator}: {mutation.description}) still "
+                  f"passed — rejecting candidate, triggering test retry")
+            return True, details
+        print(f"[CodeLoop] Mutation check passed: mutated code "
+              f"({mutation.operator}) correctly failed — tests are meaningful")
+        return False, details
+
     async def _run_code_specialist_verified(
         self, query: str
     ) -> OrchestratorResult:
@@ -1656,6 +1704,29 @@ class HybridReasoningOrchestrator:
                 }
                 verification_traces.append(trace)
                 if result.verified:
+                    # Phase 3.1: Mutation testing — before accepting a
+                    # 1.0 verified score, inject a known bug into the
+                    # winning code and re-run the tests. If the mutated
+                    # (broken) code still passes, the tests are vacuous.
+                    vacuous, mutation_details = await self._mutation_check(
+                        candidates[i][1], tests
+                    )
+                    if vacuous:
+                        # Tests are vacuous — reject, score 0.0, trigger
+                        # the test-feedback loop (same as TEST_ERROR).
+                        test_error_count = len(candidates)
+                        first_test_error = (
+                            f"VACUOUS_TESTS: mutation ({mutation_details['operator']}: "
+                            f"{mutation_details['description']}) still passed — "
+                            f"tests cannot distinguish correct from incorrect code"
+                        )
+                        verification_traces[-1]["mutation_check"] = mutation_details
+                        verification_traces[-1]["vacuous_tests"] = True
+                        if attempt == 0:
+                            test_error_feedback = first_test_error
+                            break  # break out of the candidate loop, retry tests
+                        # Already retried — fall through to best-effort.
+                        break
                     print(f"[CodeLoop] Candidate {i} PASSED verification — returning")
                     return OrchestratorResult(
                         final_answer=candidates[i][1],
@@ -1671,6 +1742,7 @@ class HybridReasoningOrchestrator:
                             "unit_tests": tests,
                             "all_verification_traces": verification_traces,
                             "test_spec_retry": attempt,
+                            "mutation_check": mutation_details,
                         },
                     )
                 print(f"[CodeLoop] Candidate {i} failed: {result.error or 'not verified'}")
@@ -1762,6 +1834,16 @@ class HybridReasoningOrchestrator:
                     "repair_attempt": repair_attempt + 1,
                 })
                 if result.verified:
+                    # Phase 3.1: Mutation testing on repaired candidates too.
+                    vacuous, mutation_details = await self._mutation_check(
+                        repair_candidates[i][1], tests
+                    )
+                    if vacuous:
+                        print(f"[CodeLoop] Repaired candidate {i} passed but "
+                              f"tests are VACUOUS — rejecting")
+                        verification_traces[-1]["mutation_check"] = mutation_details
+                        verification_traces[-1]["vacuous_tests"] = True
+                        continue  # try next repair candidate
                     print(f"[CodeLoop] Repaired candidate {i} PASSED — returning")
                     return OrchestratorResult(
                         final_answer=repair_candidates[i][1],
@@ -1779,6 +1861,7 @@ class HybridReasoningOrchestrator:
                             "all_verification_traces": verification_traces,
                             "test_spec_retry": attempt,
                             "repair_attempts": repair_attempt + 1,
+                            "mutation_check": mutation_details,
                         },
                     )
                 print(f"[CodeLoop] Repaired candidate {i} failed: "
@@ -1939,7 +2022,16 @@ class HybridReasoningOrchestrator:
             # the generalist is unreachable or returns malformed JSON, no
             # constraints are set — the verifier returns verified=False
             # (honest — we can't verify what we can't parse).
-            constraints = await self._translate_logic_constraints(query)
+            #
+            # Phase 3.2: translation retry loop. If the generalist's
+            # constraints fail to parse as valid Z3, the parse error is
+            # fed back to the generalist for a corrected attempt (up to
+            # max_logic_translation_retries). This separates "bad
+            # translation" from "bad answer" — a parse error means the
+            # constraint set is malformed, not that the answer is wrong.
+            constraints = await self._translate_logic_constraints_with_retry(
+                query
+            )
             if constraints is not None:
                 context["constraints"] = constraints.get("constraints", [])
                 context["variables"] = constraints.get("variables", {})
@@ -2037,7 +2129,81 @@ class HybridReasoningOrchestrator:
             print(f"[CLR] Logic constraint translation error: {e}")
             return None
 
-    async def _run_clr_with_cache(self, query: str) -> Tuple[CLRResult, bool]:
+    async def _translate_logic_constraints_with_retry(
+        self, query: str, max_retries: int = 2
+    ) -> Optional[Dict[str, Any]]:
+        """Translate logic constraints with a Z3 parse-validation retry loop.
+
+        Phase 3.2: wraps _translate_logic_constraints with a validation
+        step. After the generalist produces a constraint set, we validate
+        that the constraints actually parse as Z3 expressions (using
+        LogicVerifier.validate_constraints). If parsing fails, the error
+        is fed back to the generalist for a corrected attempt. Bounded by
+        max_retries. Fail-closed: returns None if all retries fail.
+
+        This separates "bad translation" (the generalist wrote invalid Z3
+        syntax — retryable) from "bad answer" (the answer's values violate
+        valid constraints — not retryable, that's a verification failure).
+        """
+        from verifiers.logic_verifier import LogicVerifier, _Z3_AVAILABLE
+
+        # If Z3 is not installed, no point retrying — the verifier will
+        # return smt_unavailable anyway.
+        if not _Z3_AVAILABLE:
+            return await self._translate_logic_constraints(query)
+
+        feedback: Optional[str] = None
+        for attempt in range(max_retries + 1):
+            # On retry, append the parse error feedback to the query.
+            if feedback is not None:
+                print(f"[CLR] Logic translation retry {attempt}/"
+                      f"{max_retries}: feeding parse error back to generalist")
+                result = await self._translate_logic_constraints(
+                    f"{query}\n\n--- Z3 PARSE ERROR ---\n"
+                    f"The previous constraint translation failed to parse "
+                    f"as valid Z3:\n{feedback}\n\n"
+                    f"Rewrite the constraints using only valid Z3 Python "
+                    f"syntax. Ensure all variables are declared in the "
+                    f"'variables' object and referenced correctly in the "
+                    f"constraints."
+                )
+            else:
+                result = await self._translate_logic_constraints(query)
+
+            if result is None:
+                # Translation itself failed (network, JSON parse, etc.).
+                # No point validating — retry if we have attempts left.
+                if attempt < max_retries:
+                    feedback = "Previous response was not valid JSON or "
+                    "did not contain a constraints array."
+                    continue
+                return None
+
+            # Validate that the constraints parse as Z3.
+            error = LogicVerifier.validate_constraints(
+                result.get("constraints", []),
+                result.get("variables", {}),
+            )
+            if error is None:
+                # All constraints parse — return the validated set.
+                if attempt > 0:
+                    print(f"[CLR] Logic translation succeeded on retry "
+                          f"{attempt}")
+                return result
+
+            # Parse error — feed it back and retry.
+            print(f"[CLR] Logic constraint parse error (attempt "
+                  f"{attempt + 1}): {error}")
+            feedback = error
+
+        # All retries exhausted — return the last result anyway. The
+        # LogicVerifier will catch the parse error and return
+        # verified=False (fail-closed). This is better than returning
+        # None (which would skip verification entirely) because the
+        # error trace will be visible in the verification result.
+        print(f"[CLR] Logic translation retries exhausted — returning "
+              f"best-effort (will fail at verification)")
+        return result
         """Run CLR, but return a cached result if a similar high-score
         problem was solved before. Returns (result, cache_hit).
 

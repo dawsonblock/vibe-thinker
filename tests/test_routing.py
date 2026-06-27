@@ -242,9 +242,18 @@ class TestCodeSpecialistRouting:
         o._generate_test_spec = AsyncMock(return_value="assert square(2) == 4")
         o._call_code_specialist = AsyncMock(return_value="```python\ndef square(n): return n*n\n```")
         o.code_verifier = MagicMock()
-        o.code_verifier.verify = AsyncMock(return_value=VerificationResult(
-            verified=True, score=1.0, method="unit_tests",
-        ))
+        # Phase 3.1: the mutation check calls verify a second time with
+        # mutated code. The original code passes; the mutated code must
+        # fail (meaningful tests). Use side_effect to distinguish.
+        original_code = "def square(n): return n*n"
+
+        async def verify_side_effect(query, code, context):
+            if code == original_code:
+                return VerificationResult(verified=True, score=1.0, method="unit_tests")
+            return VerificationResult(verified=False, score=0.0, method="unit_tests",
+                                      error="mutation correctly failed")
+
+        o.code_verifier.verify = verify_side_effect
         o._run_clr_with_cache = AsyncMock(side_effect=AssertionError("CLR should not run for code"))
 
         result = await o.run("Write a Python function to square a number")
@@ -278,6 +287,43 @@ class TestCodeSpecialistRouting:
         assert result.route_taken == "code_specialist_unverified"
         assert result.clr_score == 0.0
         assert result.raw_traces["verified"] is False
+
+    @pytest.mark.asyncio
+    async def test_code_task_vacuous_tests_detected_by_mutation(self):
+        """Phase 3.1: When the candidate passes but mutation testing
+        reveals the tests are vacuous (mutated code also passes), the
+        candidate is rejected and the test-feedback loop is triggered.
+        After the retry also detects vacuous tests, the result is
+        unverified with score 0.0."""
+        o = HybridReasoningOrchestrator(
+            vibe_endpoint="http://localhost:0",
+            generalist_endpoint="http://localhost:0",
+            code_specialist_endpoint="http://127.0.0.1:8082",
+            code_candidates=2,
+            use_clr=True,
+            use_embedding_router=False,
+            use_clr_cache=False,
+            use_trajectory_store=False,
+        )
+        o._generate_test_spec = AsyncMock(return_value="assert True")
+        o._call_code_specialist = AsyncMock(
+            return_value="```python\ndef square(n): return n*n\n```"
+        )
+        o.code_verifier = MagicMock()
+        # The mock returns verified=True for ALL code (original AND
+        # mutated) — simulating vacuous tests that pass anything.
+        o.code_verifier.verify = AsyncMock(return_value=VerificationResult(
+            verified=True, score=1.0, method="unit_tests",
+        ))
+
+        result = await o.run("Write a Python function to square a number")
+        # Vacuous tests detected -> not verified, score 0.0.
+        assert result.route_taken == "code_specialist_unverified"
+        assert result.clr_score == 0.0
+        assert result.raw_traces["verified"] is False
+        # The traces should record the vacuous test detection.
+        traces = result.raw_traces.get("all_verification_traces", [])
+        assert any(t.get("vacuous_tests") for t in traces)
 
     @pytest.mark.asyncio
     async def test_code_task_no_test_spec_falls_back_unverified(self):
@@ -834,20 +880,34 @@ class TestCodeSpecialistRouting:
         # completes. If sequential, only 1 would be active at a time.
         started = []
         can_complete = aio.Event()
+        original_code = "def square(n): return n*n"
 
         async def slow_verify(query, code, config):
             started.append(len(started))
             await aio.sleep(0.05)
+            # Phase 3.1: mutation check calls verify with mutated code.
+            # Original code passes; mutated code fails (meaningful tests).
+            if code == original_code:
+                return VerificationResult(
+                    verified=True, score=1.0, method="unit_tests",
+                )
             return VerificationResult(
-                verified=True, score=1.0, method="unit_tests",
+                verified=False, score=0.0, method="unit_tests",
+                error="mutation correctly failed",
             )
 
         o.code_verifier.verify = slow_verify
 
         result = await o.run("Write a function to square a number")
         assert result.route_taken == "code_specialist_verified"
-        # All 3 verify calls were made (gather fires all concurrently)
-        assert len(started) == 3
+        # All 3 candidate verify calls were made concurrently (gather
+        # fires all before any completes). Phase 3.1 adds a 4th call
+        # for the mutation check (sequential, after the gather).
+        assert len(started) >= 3
+        # The first 3 calls (the gather) all started before any completed
+        # — that's the concurrency proof. The 4th (mutation check) starts
+        # after the gather resolves.
+        assert started[:3] == [0, 1, 2]
 
 
 class TestTestSpecValidation:
@@ -943,4 +1003,111 @@ class TestExtractPythonBlock:
         )
         result = HybridReasoningOrchestrator._extract_python_block(text)
         assert "also not valid" in result
+
+
+class TestLogicTranslationRetry:
+    """Phase 3.2: Z3/SMT translation retry loop tests."""
+
+    def _make_orch(self):
+        o = HybridReasoningOrchestrator(
+            vibe_endpoint="http://localhost:0",
+            generalist_endpoint="http://localhost:0",
+            use_clr=True,
+            use_embedding_router=False,
+            use_clr_cache=False,
+            use_trajectory_store=False,
+        )
+        return o
+
+    @pytest.mark.asyncio
+    async def test_valid_translation_first_try(self):
+        """When the first translation produces valid Z3, no retry needed."""
+        o = self._make_orch()
+        o._translate_logic_constraints = AsyncMock(return_value={
+            "constraints": ["x > 0", "x + y == 10"],
+            "variables": {"x": "Int", "y": "Int"},
+            "values": {"x": 7, "y": 3},
+        })
+        result = await o._translate_logic_constraints_with_retry("test")
+        assert result is not None
+        assert result["constraints"] == ["x > 0", "x + y == 10"]
+        # Should have called _translate_logic_constraints exactly once.
+        o._translate_logic_constraints.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_retry_on_parse_error(self):
+        """When the first translation has a parse error, retry with feedback."""
+        o = self._make_orch()
+        # First call: invalid Z3 syntax. Second call: valid.
+        o._translate_logic_constraints = AsyncMock(side_effect=[
+            {
+                "constraints": ["x >>> 0"],  # invalid
+                "variables": {"x": "Int"},
+                "values": {"x": 5},
+            },
+            {
+                "constraints": ["x > 0"],  # valid
+                "variables": {"x": "Int"},
+                "values": {"x": 5},
+            },
+        ])
+        result = await o._translate_logic_constraints_with_retry("test")
+        assert result is not None
+        assert result["constraints"] == ["x > 0"]
+        assert o._translate_logic_constraints.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_exhausted_retries_returns_best_effort(self):
+        """When all retries fail, return the last (invalid) result —
+        the LogicVerifier will catch the parse error at verification time."""
+        o = self._make_orch()
+        o._translate_logic_constraints = AsyncMock(return_value={
+            "constraints": ["bad !!!"],
+            "variables": {"x": "Int"},
+            "values": {"x": 5},
+        })
+        result = await o._translate_logic_constraints_with_retry(
+            "test", max_retries=2
+        )
+        # Returns the best-effort result (not None) — the verifier will
+        # fail-closed on the parse error.
+        assert result is not None
+        assert result["constraints"] == ["bad !!!"]
+        # Should have called 3 times (initial + 2 retries).
+        assert o._translate_logic_constraints.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_none_translation_no_retry_wasted(self):
+        """When _translate_logic_constraints returns None (network/JSON
+        error), retry once with feedback, but don't waste all retries."""
+        o = self._make_orch()
+        o._translate_logic_constraints = AsyncMock(return_value=None)
+        result = await o._translate_logic_constraints_with_retry(
+            "test", max_retries=2
+        )
+        assert result is None
+        # Should retry (with feedback) up to max_retries + 1 times.
+        assert o._translate_logic_constraints.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_retry_feedback_contains_parse_error(self):
+        """The retry prompt should include the specific Z3 parse error."""
+        o = self._make_orch()
+        o._translate_logic_constraints = AsyncMock(side_effect=[
+            {
+                "constraints": ["x >>> 0"],
+                "variables": {"x": "Int"},
+                "values": {"x": 5},
+            },
+            {
+                "constraints": ["x > 0"],
+                "variables": {"x": "Int"},
+                "values": {"x": 5},
+            },
+        ])
+        await o._translate_logic_constraints_with_retry("test")
+        # The second call should have the parse error in the query.
+        second_call_args = o._translate_logic_constraints.call_args_list[1]
+        query_arg = second_call_args[0][0]  # positional arg
+        assert "Z3 PARSE ERROR" in query_arg or "parse" in query_arg.lower()
 
