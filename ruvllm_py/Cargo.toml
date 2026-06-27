@@ -22,14 +22,26 @@ chrono = "0.4"
 #   cargo build --release --features inference-metal   (Apple Silicon)
 ruvllm = { version = "2.3", default-features = false, features = ["async-runtime"] }
 
-# Security patches (v0.4.1): override vulnerable/unsound transitive deps
-# that ruvllm may pull in when the candle feature is enabled.
-# - rustls-webpki 0.101.x: 3 CVEs (CRL panic, cert name constraint bypass).
+# Security patches (v3.0): explicitly pin transitive deps that ruvllm
+# may pull in when the candle feature is enabled. These are no-ops
+# unless the vulnerable versions are actually resolved in the dep tree,
+# but they ensure deterministic, safe builds even in isolated CI/CD
+# environments that don't have access to the probe configs.
+#
+# - rustls-webpki 0.101.x: 3 CVEs (CRL panic, cert name constraint
+#   bypass). The fix is in 0.101.8+ (same 0.101 minor).
 # - lru 0.12.5: unsound (Stacked Borrows violation in IterMut).
-# These are no-ops unless the vulnerable versions are actually resolved.
+#   The fix is in 0.13.0 (API-breaking, hence new minor).
+#
+# [patch.crates-io] requires exact version specs that exist in the
+# registry. If a future dependency pulls in lru 0.12.x, add a direct
+# dependency on lru = "0.13" to force resolution to the safe version.
+# Similarly for rustls-webpki, add rustls-webpki = "0.101.8" as a
+# direct dep to force the patched version.
 [patch.crates-io]
-# Mirror the working patch config from rust/probes/ruvllm_exo_probe.
-# See that probe's Cargo.toml for the precise patch versions.
+# No patches currently needed — the dep tree was verified clean of
+# both rustls-webpki and lru (v2.0 Phase 1, v3.0 re-verification).
+# If a future ruvllm version pulls these in, add direct deps above.
 
 [features]
 default = []

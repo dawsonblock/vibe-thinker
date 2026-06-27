@@ -558,6 +558,25 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--mtls-ca",
                    default=os.environ.get("FEDERATION_MTLS_CA", ""),
                    help="Path to the mTLS CA certificate (PEM) that signed all node certs.")
+    # v3.0: Zero-trust federation encryption
+    p.add_argument("--federation-secret",
+                   default=os.environ.get("FEDERATION_SECRET", ""),
+                   help="Shared secret for zero-trust payload encryption (v3.0). "
+                        "When set, all federation payloads (job queries, results) "
+                        "are encrypted with Fernet AEAD before transmission. "
+                        "Nodes without the secret see only opaque ciphertext. "
+                        "Requires the 'cryptography' package.")
+    # v3.0: SONA gossip protocol — Distributed Brain
+    p.add_argument("--sona-sync-url",
+                   default=os.environ.get("SONA_SYNC_URL", ""),
+                   help="Federation coordinator URL for SONA pattern sync (v3.0). "
+                        "When set, the orchestrator periodically exports its "
+                        "learned patterns and imports global patterns from "
+                        "other nodes. Enables swarm-wide learning.")
+    p.add_argument("--sona-sync-interval",
+                   type=int,
+                   default=int(os.environ.get("SONA_SYNC_INTERVAL", "3600")),
+                   help="Interval in seconds between SONA sync cycles (default 3600).")
     # --- Active retrieval (v0.4.0) ---
     # When configured, factual tasks fetch real source text from a search API
     # and feed it to the FactualVerifier's NLI judge. Fail-closed: no key =
@@ -711,6 +730,8 @@ async def _amain() -> None:
         specialist_model_name=args.specialist_model_name or None,
         max_parse_repairs=args.max_parse_repairs,
         prefer_encoder_nli=args.prefer_encoder_nli,
+        sona_sync_url=args.sona_sync_url or None,
+        sona_sync_interval=args.sona_sync_interval,
     )
 
     # --- Envoy sidecar egress (v1.2) ---
@@ -775,6 +796,7 @@ async def _amain() -> None:
         signing_key=signing_key,
         ed25519_private_key_hex=ed25519_private,
         ed25519_public_key_hex=ed25519_public,
+        federation_secret=args.federation_secret or None,
     )
     await queue.start()
     repl = JobQueueREPL(queue)

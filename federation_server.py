@@ -534,6 +534,7 @@ def make_federation_state(
 
 def create_federation_app(
     state: Optional[FederationStateProtocol] = None,
+    federation_secret: Optional[str] = None,
 ) -> FastAPI:
     """Create the federation server FastAPI app.
 
@@ -542,10 +543,39 @@ def create_federation_app(
             :class:`InMemoryFederationState` (the pre-v1.2 single-
             coordinator behavior). Pass a :class:`RedisFederationState`
             for multi-coordinator HA deployments.
+        federation_secret: v3.0 zero-trust encryption secret. When set,
+            the server decrypts incoming payloads encrypted with the
+            same secret by worker nodes. See FederatedJobQueue.
     """
     app = FastAPI(title="vibe-thinker federation", docs_url="/docs")
     if state is None:
         state = InMemoryFederationState()
+
+    # v3.0: Set up decryption if a secret is provided.
+    _fernet = None
+    if federation_secret:
+        try:
+            from cryptography.fernet import Fernet
+            import base64
+            import hashlib
+            key = base64.urlsafe_b64encode(
+                hashlib.sha256(federation_secret.encode()).digest()
+            )
+            _fernet = Fernet(key)
+        except ImportError:
+            pass
+
+    def _decrypt(body: dict) -> dict:
+        """Decrypt an incoming payload if it's encrypted."""
+        if "__encrypted__" not in body:
+            return body  # Plaintext (no encryption configured by sender)
+        if _fernet is None:
+            raise ValueError("Received encrypted payload but no "
+                             "federation_secret configured on server")
+        import json as _json
+        ciphertext = body["__encrypted__"].encode("ascii")
+        plaintext = _fernet.decrypt(ciphertext).decode("utf-8")
+        return _json.loads(plaintext)
 
     @app.get("/health")
     async def health():
@@ -554,6 +584,7 @@ def create_federation_app(
     @app.post("/submit")
     async def submit_job(req: Request):
         body = await req.json()
+        body = _decrypt(body)
         job = await state.submit(
             job_id=body.get("job_id", ""),
             query=body.get("query", ""),
@@ -579,6 +610,7 @@ def create_federation_app(
     @app.post("/complete")
     async def complete_job(req: Request):
         body = await req.json()
+        body = _decrypt(body)
         job_id = body.get("job_id", "")
         result = body.get("result")
         error = body.get("error")
@@ -600,6 +632,63 @@ def create_federation_app(
             "job_id": job.job_id, "query": job.query,
             "status": job.status, "result": job.result,
             "error": job.error,
+        }
+
+    # v3.0: SONA gossip protocol — Distributed Brain endpoint.
+    # Workers export their learned patterns (clustered trajectories,
+    # MicroLoRA matrices) to the coordinator. The coordinator aggregates
+    # them and broadcasts a global update back.
+    #
+    # Data flow:
+    #   1. Worker POSTs to /api/sona/sync with its patterns + stats.
+    #   2. Coordinator merges patterns into a global set (dedup by ID).
+    #   3. Worker GETs /api/sona/sync to retrieve the global pattern set.
+    #   4. Worker imports the global patterns into its local SONA engine.
+    _sona_global_patterns: Dict[str, dict] = {}
+    _sona_worker_stats: Dict[str, dict] = {}
+
+    @app.post("/api/sona/sync")
+    async def sona_sync(req: Request):
+        """Receive SONA pattern export from a worker node.
+
+        Body:
+            worker_id: str — the exporting node's ID.
+            patterns: list of dict — learned patterns (centroid, cluster_size,
+                avg_quality, etc.).
+            stats: dict — SONA stats (total_trajectories, updates, etc.).
+        """
+        body = await req.json()
+        body = _decrypt(body)
+        worker_id = body.get("worker_id", "unknown")
+        patterns = body.get("patterns", [])
+        stats = body.get("stats", {})
+
+        # Merge patterns into the global set (dedup by pattern ID).
+        for p in patterns:
+            pid = str(p.get("id", ""))
+            if pid:
+                _sona_global_patterns[pid] = p
+
+        _sona_worker_stats[worker_id] = stats
+
+        return {
+            "status": "ok",
+            "global_pattern_count": len(_sona_global_patterns),
+            "worker_count": len(_sona_worker_stats),
+        }
+
+    @app.get("/api/sona/sync")
+    async def sona_get_global():
+        """Retrieve the global aggregated SONA patterns.
+
+        Returns the merged pattern set from all worker nodes. Workers
+        call this periodically to update their local SONA engine with
+        patterns learned by other nodes in the swarm.
+        """
+        return {
+            "patterns": list(_sona_global_patterns.values()),
+            "worker_stats": _sona_worker_stats,
+            "total_patterns": len(_sona_global_patterns),
         }
 
     return app

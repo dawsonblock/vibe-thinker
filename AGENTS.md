@@ -1,7 +1,7 @@
 # vibe-thinker — project notes for agents
 
 ## Verify / test
-- Full suite: `python3 -m pytest -q` (970 tests, ~130s, no live servers needed)
+- Full suite: `python3 -m pytest -q` (997 tests, ~120s, no live servers needed)
 - Routing + REPL only: `python3 -m pytest tests/test_routing.py tests/test_repl.py -q`
 - Format enforcer + chat transports + repair loop: `python3 -m pytest tests/test_format_enforcer.py -q`
 - Citation-backed NLI factual verifier: `python3 -m pytest tests/test_factual_verifier.py -q`
@@ -1146,3 +1146,68 @@ new flags are used.
   AND offline_sources exist AND an LLM judge is configured, the verifier
   uses the NLI judge against the offline documents. Only returns
   `unsupported_factual` if BOTH online and offline sources are empty.
+
+## v3.0 (enterprise swarm hardening)
+
+### Phase 1: Rust build pipeline hardening
+- **`ruvllm_py/Cargo.toml`**: The `[patch.crates-io]` block was a
+  comment-only no-op. Replaced with explicit documentation of the
+  security posture: `rustls-webpki` and `lru` are NOT in the dep tree
+  (verified via `cargo tree --features candle`). If a future ruvllm
+  version pulls them in, add direct deps to force safe versions.
+- `cargo update` run, `Cargo.lock` committed for deterministic builds.
+
+### Phase 2: Rust-native embedding pipeline (SONA decoupling)
+- **`RuvLLMBinding.get_embeddings(text, dim=384)`**: New method on
+  `ruvllm_adapter.RuvLLMBinding`. Uses character n-gram hashing (not
+  semantic — the ruvllm crate's `LlmBackend` trait doesn't expose
+  embeddings). Deterministic, L2-normalized, configurable dimension.
+  Fallback for when `sentence-transformers` is not installed.
+- **Orchestrator embedding source priority** (`_store_if_verified`):
+  1. `RuvLLMBinding.get_embeddings()` (Rust-native, no Python deps)
+  2. `trajectory_store.model.encode()` (sentence-transformers)
+  3. Skip (no embedding source available)
+- This decouples SONA from the `sentence-transformers` Python extra.
+
+### Phase 3: Static analysis evasion vector sealing
+- **`_static_analysis_fallback`** now checks `ast.Call` nodes for:
+  - `__import__('os')` — direct builtin call
+  - `importlib.import_module('os')` — method call on importlib
+  - `exec()` / `eval()` — dynamic code execution
+  - Any `ast.Name` referencing `importlib` or `__builtins__`
+- All evasion vectors result in score 0.0 (same as restricted imports).
+- Tests: `tests/test_static_analysis.py::TestStaticAnalysisEvasionVectors`
+  (8 tests covering each vector + clean code still passes).
+
+### Phase 4: Zero-trust federation (encrypted payloads)
+- **`--federation-secret` CLI flag** / `FEDERATION_SECRET` env var:
+  shared secret for AEAD encryption of federation payloads.
+- **`FederatedJobQueue._encrypt_payload()` / `_decrypt_payload()`**:
+  Fernet (AES-128-CBC + HMAC-SHA256) encryption layer. When enabled,
+  all job queries and results are encrypted before transmission.
+  Nodes without the secret see only opaque ciphertext in Redis/HTTP.
+- **`federation_server.py`**: `create_federation_app()` accepts
+  `federation_secret=` and decrypts incoming payloads on /submit and
+  /complete endpoints.
+- Tests: `tests/test_federated_queue.py::TestFederationEncryption`
+  (5 tests: roundtrip, passthrough, error on missing secret, ciphertext
+  doesn't contain plaintext).
+
+### Phase 5: SONA gossip protocol (Distributed Brain)
+- **`/api/sona/sync` endpoints** on `federation_server.py`:
+  - `POST /api/sona/sync`: Workers export learned patterns (centroid,
+    cluster_size, avg_quality) + stats. Coordinator merges into a
+    global set (dedup by pattern ID).
+  - `GET /api/sona/sync`: Workers retrieve the global aggregated
+    pattern set from all nodes.
+- **Orchestrator methods**:
+  - `_sona_export_patterns()`: Uses `search_patterns` with a zero
+    vector to retrieve all local patterns.
+  - `_sona_import_patterns(patterns)`: Records global patterns as
+    trajectories in the local SONA engine.
+  - `sona_sync_once()`: One sync cycle (export + import).
+  - `_sona_sync_loop()`: Background loop for periodic sync.
+- **CLI flags**: `--sona-sync-url` / `SONA_SYNC_URL`,
+  `--sona-sync-interval` / `SONA_SYNC_INTERVAL` (default 3600s).
+- Tests: `tests/test_sona_gossip.py` (8 tests: endpoint POST/GET,
+  pattern dedup, orchestrator export/import, disabled state).

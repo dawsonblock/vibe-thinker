@@ -86,7 +86,7 @@ v1.1 direction decision — sync ``__call__``-compatible, NOT async batched:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional
 
 
 @dataclass
@@ -314,6 +314,59 @@ class RuvLLMBinding:
             stop=stop_list,
             grammar=grammar_str,
         )
+
+    def get_embeddings(self, text: str, dim: int = 384) -> List[float]:
+        """Generate a text embedding vector (v3.0).
+
+        The ruvllm crate's ``LlmBackend`` trait does not expose a
+        ``get_embeddings()`` method — it only has ``load_model`` and
+        ``generate``. When the ruvllm crate adds embedding support,
+        this method will delegate to the Rust engine. Until then,
+        it uses a deterministic hash-based embedding that provides:
+          - Deterministic: same text → same vector.
+          - Dimensionality: configurable (default 384 to match
+            all-MiniLM-L6-v2).
+          - Locality-sensitive: similar texts produce similar vectors
+            (via character n-gram hashing).
+
+        This is NOT a semantic embedding — it cannot capture meaning.
+        It's a fallback for when sentence-transformers is not installed,
+        allowing SONA to still record and cluster trajectories by
+        structural similarity (code patterns, query templates).
+
+        Args:
+            text: The text to embed.
+            dim: Embedding dimension (default 384).
+
+        Returns:
+            A list of floats representing the text embedding.
+        """
+        import hashlib
+        import struct
+
+        # Character n-gram hashing embedding.
+        # For each n-gram (n=3), hash it and accumulate into the vector.
+        vector = [0.0] * dim
+        text_lower = text.lower().strip()
+        if not text_lower:
+            return vector
+
+        ngrams = set()
+        for n in (2, 3, 4):
+            for i in range(len(text_lower) - n + 1):
+                ngrams.add(text_lower[i:i + n])
+
+        for ngram in ngrams:
+            h = hashlib.md5(ngram.encode()).digest()
+            idx = struct.unpack("<I", h[:4])[0] % dim
+            sign = 1.0 if (h[4] & 1) == 0 else -1.0
+            vector[idx] += sign
+
+        # L2 normalize.
+        norm = sum(v * v for v in vector) ** 0.5
+        if norm > 0:
+            vector = [v / norm for v in vector]
+        return vector
 
 
 def is_ruvllm_binding_available() -> bool:

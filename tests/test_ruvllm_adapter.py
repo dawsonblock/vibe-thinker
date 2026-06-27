@@ -109,6 +109,54 @@ class TestRuvLLMBinding:
             # RuntimeError or other load errors are expected with a fake path
 
 
+class TestRuvLLMBindingEmbeddings:
+    """v3.0: Tests for the Rust-native embedding fallback."""
+
+    def test_get_embeddings_returns_correct_dim(self):
+        """get_embeddings returns a vector of the requested dimension."""
+        # We can't construct a full RuvLLMBinding without a model, but
+        # we can test the get_embeddings method in isolation by creating
+        # a mock instance.
+        binding = object.__new__(RuvLLMBinding)
+        emb = binding.get_embeddings("hello world", dim=384)
+        assert len(emb) == 384
+        assert all(isinstance(v, float) for v in emb)
+
+    def test_get_embeddings_deterministic(self):
+        """Same text produces the same embedding."""
+        binding = object.__new__(RuvLLMBinding)
+        emb1 = binding.get_embeddings("def solve(x): return x + 1")
+        emb2 = binding.get_embeddings("def solve(x): return x + 1")
+        assert emb1 == emb2
+
+    def test_get_embeddings_different_text_different_vector(self):
+        """Different texts produce different embeddings."""
+        binding = object.__new__(RuvLLMBinding)
+        emb1 = binding.get_embeddings("hello world")
+        emb2 = binding.get_embeddings("goodbye universe")
+        assert emb1 != emb2
+
+    def test_get_embeddings_normalized(self):
+        """The embedding vector is L2-normalized."""
+        binding = object.__new__(RuvLLMBinding)
+        emb = binding.get_embeddings("some text for embedding", dim=128)
+        norm = sum(v * v for v in emb) ** 0.5
+        assert abs(norm - 1.0) < 0.01  # approximately unit norm
+
+    def test_get_embeddings_empty_text(self):
+        """Empty text returns a zero vector."""
+        binding = object.__new__(RuvLLMBinding)
+        emb = binding.get_embeddings("", dim=64)
+        assert len(emb) == 64
+        assert all(v == 0.0 for v in emb)
+
+    def test_get_embeddings_custom_dim(self):
+        """Custom dimension is respected."""
+        binding = object.__new__(RuvLLMBinding)
+        emb = binding.get_embeddings("test", dim=768)
+        assert len(emb) == 768
+
+
 class TestCLIFlags:
     """Tests that the CLI flags are wired correctly."""
 

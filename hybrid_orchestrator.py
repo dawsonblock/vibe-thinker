@@ -290,7 +290,7 @@ _RESTRICTED_IMPORTS = frozenset({
 
 
 def _static_analysis_fallback(code: str) -> tuple:
-    """Static analysis fallback for code verification (v2.0).
+    """Static analysis fallback for code verification (v2.0, hardened v3.0).
 
     When the Generalist fails to generate unit tests, this function
     performs a lightweight static analysis pass on the candidate code:
@@ -298,10 +298,16 @@ def _static_analysis_fallback(code: str) -> tuple:
     1. Parses the code with ``ast.parse`` — if it doesn't parse, score 0.0.
     2. Checks for restricted imports (os, subprocess, socket, etc.) —
        if any are found, score 0.0.
-    3. If the code parses cleanly and has no restricted imports, assign
-       a partial heuristic score of 0.4 (capped — this is NOT full
-       verification, just a "syntactically valid and not obviously
-       dangerous" signal).
+    3. Checks for dynamic import evasion vectors (v3.0):
+       - ``__import__('os')`` calls
+       - ``importlib.import_module('os')`` calls
+       - ``getattr(__builtins__, 'eval')`` style reflection
+       - Any reference to ``importlib`` or ``__builtins__`` in the AST
+       If any are found, score 0.0.
+    4. If the code parses cleanly and has no restricted imports or
+       evasion vectors, assign a partial heuristic score of 0.4 (capped
+       — this is NOT full verification, just a "syntactically valid and
+       not obviously dangerous" signal).
 
     Returns (score, issues) where issues is a list of strings describing
     any problems found (empty list if score > 0.0).
@@ -317,6 +323,7 @@ def _static_analysis_fallback(code: str) -> tuple:
 
     # 2. Restricted import check.
     restricted_found = []
+    evasion_found = []
     for node in _ast.walk(tree):
         if isinstance(node, _ast.Import):
             for alias in node.names:
@@ -328,11 +335,34 @@ def _static_analysis_fallback(code: str) -> tuple:
                 top = node.module.split(".")[0]
                 if top in _RESTRICTED_IMPORTS:
                     restricted_found.append(node.module)
+        # 3. Dynamic import evasion checks (v3.0).
+        elif isinstance(node, _ast.Call):
+            func = node.func
+            # __import__('os') — direct builtin call.
+            if isinstance(func, _ast.Name) and func.id == "__import__":
+                evasion_found.append("__import__() call")
+            # importlib.import_module('os') — method call on importlib.
+            elif isinstance(func, _ast.Attribute) and func.attr == "import_module":
+                if isinstance(func.value, _ast.Name) and func.value.id == "importlib":
+                    evasion_found.append("importlib.import_module() call")
+            # exec()/eval() — dynamic code execution.
+            elif isinstance(func, _ast.Name) and func.id in ("exec", "eval"):
+                evasion_found.append(f"{func.id}() call")
+        # Any Name node referencing importlib or __builtins__.
+        elif isinstance(node, _ast.Name):
+            if node.id == "importlib":
+                evasion_found.append("importlib reference")
+            elif node.id == "__builtins__":
+                evasion_found.append("__builtins__ reference")
+
     if restricted_found:
         issues.append(f"restricted imports: {', '.join(restricted_found)}")
         return (0.0, issues)
+    if evasion_found:
+        issues.append(f"dynamic import evasion: {', '.join(evasion_found)}")
+        return (0.0, issues)
 
-    # 3. Clean parse, no restricted imports — partial heuristic score.
+    # 4. Clean parse, no restricted imports, no evasion — partial score.
     return (0.4, [])
 
 
@@ -379,6 +409,8 @@ class HybridReasoningOrchestrator:
         specialist_model_name: Optional[str] = None,
         max_parse_repairs: int = 2,
         prefer_encoder_nli: bool = False,
+        sona_sync_url: Optional[str] = None,
+        sona_sync_interval: int = 3600,
     ):
         self.vibe_endpoint = vibe_endpoint.rstrip("/")
         self.generalist_endpoint = generalist_endpoint.rstrip("/")
@@ -554,6 +586,15 @@ class HybridReasoningOrchestrator:
                       "(ruvllm_py binding)")
         except Exception:
             pass  # Fail silently — SONA is optional
+
+        # v3.0: SONA gossip protocol — periodic sync of learned patterns
+        # with the federation coordinator. When enabled, the orchestrator
+        # exports its SONA patterns and imports global patterns from
+        # other nodes every sync_interval_secs seconds.
+        self._sona_sync_interval = sona_sync_interval
+        self._sona_sync_url = sona_sync_url
+        self._sona_sync_task = None
+        self._sona_sync_count = 0
 
         # Keyword fallback
         self.verifiable_keywords = {
@@ -1979,19 +2020,37 @@ class HybridReasoningOrchestrator:
               f"score={score:.3f}, task_type={task_type}) — "
               f"store now has {len(self.trajectory_store)} entries")
 
-        # v2.0: Also record into the SONA learning engine if available.
+        # v2.0/v3.0: Also record into the SONA learning engine if available.
         # The SONA recorder uses the query + response embeddings for
         # continuous model improvement (LoRA adaptation, pattern learning).
+        #
+        # Embedding source priority (v3.0):
+        #   1. RuvLLMBinding.get_embeddings() — Rust-native, no Python deps.
+        #   2. trajectory_store.model.encode() — sentence-transformers.
+        #   3. Skip — no embedding source available.
         if self._sona_recorder is not None:
             try:
                 import uuid as _uuid
                 req_id = str(_uuid.uuid4())
-                # Use the trajectory store's sentence-transformers model
-                # to embed the query and response.
-                model = getattr(self.trajectory_store, "model", None)
-                if model is not None:
-                    q_emb = model.encode([query])[0].tolist()
-                    a_emb = model.encode([result.final_answer])[0].tolist()
+
+                q_emb = None
+                a_emb = None
+
+                # 1. Try Rust-native embeddings from the RuvLLMBinding.
+                local_llm = getattr(self.reasoner, "_local_llm", None)
+                if local_llm is not None and hasattr(local_llm, "get_embeddings"):
+                    q_emb = local_llm.get_embeddings(query)
+                    a_emb = local_llm.get_embeddings(result.final_answer)
+
+                # 2. Fall back to sentence-transformers via the trajectory store.
+                if q_emb is None and a_emb is None:
+                    model = getattr(self.trajectory_store, "model", None)
+                    if model is not None:
+                        q_emb = model.encode([query])[0].tolist()
+                        a_emb = model.encode([result.final_answer])[0].tolist()
+
+                # 3. Record into SONA if we have embeddings.
+                if q_emb and a_emb:
                     self._sona_recorder.record(
                         request_id=req_id,
                         session_id="default",
@@ -2001,6 +2060,120 @@ class HybridReasoningOrchestrator:
                     )
             except Exception as e:
                 print(f"[SONA] Warning: failed to record trajectory: {e}")
+
+    def _sona_export_patterns(self) -> list:
+        """Export learned SONA patterns for gossip protocol sync (v3.0).
+
+        Returns a list of pattern dicts (id, centroid, cluster_size,
+        avg_quality) that can be POSTed to the federation coordinator's
+        /api/sona/sync endpoint.
+        """
+        if self._sona_recorder is None:
+            return []
+        try:
+            # Use search_patterns with a zero vector and high limit to
+            # retrieve all learned patterns.
+            dim = 384  # default embedding dim
+            zero_query = [0.0] * dim
+            patterns = self._sona_recorder.search_patterns(zero_query, 100)
+            return patterns
+        except Exception as e:
+            print(f"[SONA] Warning: failed to export patterns: {e}")
+            return []
+
+    def _sona_import_patterns(self, patterns: list) -> int:
+        """Import global SONA patterns from the federation coordinator (v3.0).
+
+        Records each global pattern as a trajectory in the local SONA
+        engine, allowing the node to learn from patterns discovered by
+        other nodes in the swarm.
+
+        Returns the number of patterns successfully imported.
+        """
+        if self._sona_recorder is None or not patterns:
+            return 0
+        imported = 0
+        for p in patterns:
+            try:
+                import uuid as _uuid
+                centroid = p.get("centroid", [])
+                quality = p.get("avg_quality", 0.5)
+                if centroid and quality > 0:
+                    self._sona_recorder.record(
+                        request_id=str(_uuid.uuid4()),
+                        session_id="global_sync",
+                        query_embedding=centroid,
+                        response_embedding=centroid,
+                        quality_score=quality,
+                    )
+                    imported += 1
+            except Exception:
+                pass
+        return imported
+
+    async def sona_sync_once(self) -> dict:
+        """Perform one SONA gossip sync cycle (v3.0).
+
+        Exports local patterns to the coordinator and imports the
+        global pattern set. Returns a dict with sync statistics.
+        """
+        if not self._sona_sync_url or self._sona_recorder is None:
+            return {"status": "disabled"}
+        try:
+            import aiohttp
+            import json as _json
+
+            # Export local patterns.
+            local_patterns = self._sona_export_patterns()
+            local_stats = self._sona_recorder.stats()
+
+            export_payload = {
+                "worker_id": getattr(self, "_node_id", "orchestrator"),
+                "patterns": local_patterns,
+                "stats": dict(local_stats) if local_stats else {},
+            }
+
+            timeout = aiohttp.ClientTimeout(total=10.0)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                # POST local patterns.
+                async with session.post(
+                    f"{self._sona_sync_url}/api/sona/sync",
+                    json=export_payload,
+                ) as resp:
+                    post_result = await resp.json()
+
+                # GET global patterns.
+                async with session.get(
+                    f"{self._sona_sync_url}/api/sona/sync",
+                ) as resp:
+                    global_data = await resp.json()
+
+            # Import global patterns.
+            global_patterns = global_data.get("patterns", [])
+            imported = self._sona_import_patterns(global_patterns)
+
+            self._sona_sync_count += 1
+            result = {
+                "status": "ok",
+                "exported": len(local_patterns),
+                "imported": imported,
+                "global_patterns": len(global_patterns),
+                "sync_count": self._sona_sync_count,
+            }
+            print(f"[SONA] Sync #{self._sona_sync_count}: exported "
+                  f"{len(local_patterns)}, imported {imported}, "
+                  f"global pool: {len(global_patterns)}")
+            return result
+        except Exception as e:
+            print(f"[SONA] Sync failed: {e}")
+            return {"status": "error", "error": str(e)}
+
+    async def _sona_sync_loop(self):
+        """Background loop for periodic SONA gossip sync (v3.0)."""
+        import asyncio as _asyncio
+        while True:
+            await _asyncio.sleep(self._sona_sync_interval)
+            await self.sona_sync_once()
 
     def _get_few_shot_context(self, query: str, task_type: Optional[str] = None) -> str:
         """Retrieve verified trajectories as few-shot context for the query.

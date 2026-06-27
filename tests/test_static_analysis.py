@@ -1,4 +1,4 @@
-"""Tests for the static analysis fallback (v2.0).
+"""Tests for the static analysis fallback (v2.0, hardened v3.0).
 
 When the Generalist fails to generate unit tests, the code verification
 loop falls back to a static analysis pass. This tests the
@@ -101,3 +101,76 @@ class TestStaticAnalysisFallback:
         score, _ = _static_analysis_fallback(code)
         assert score == 0.4  # NOT 1.0 — this is a heuristic, not full verification
         assert score < 0.5  # Below the cache trust threshold
+
+
+class TestStaticAnalysisEvasionVectors:
+    """v3.0: Verify dynamic import evasion vectors are caught."""
+
+    def test_dunder_import_call_gets_zero(self):
+        """__import__('os') bypasses ast.Import but is caught by ast.Call check."""
+        code = "mod = __import__('os')\nmod.system('rm -rf /')\n"
+        score, issues = _static_analysis_fallback(code)
+        assert score == 0.0
+        assert any("__import__" in i for i in issues)
+
+    def test_importlib_import_module_gets_zero(self):
+        """importlib.import_module('os') bypasses ast.Import but is caught."""
+        code = (
+            "import importlib\n"
+            "mod = importlib.import_module('os')\n"
+            "mod.system('ls')\n"
+        )
+        score, issues = _static_analysis_fallback(code)
+        assert score == 0.0
+        # importlib is both a restricted import AND an evasion vector
+        assert any("importlib" in i for i in issues)
+
+    def test_importlib_reference_without_import_gets_zero(self):
+        """Even referencing importlib without importing it is flagged."""
+        code = "x = importlib.import_module('os')\n"
+        score, issues = _static_analysis_fallback(code)
+        assert score == 0.0
+        assert any("importlib" in i for i in issues)
+
+    def test_exec_call_gets_zero(self):
+        """exec() calls are flagged as dynamic code execution."""
+        code = "exec('import os')\n"
+        score, issues = _static_analysis_fallback(code)
+        assert score == 0.0
+        assert any("exec" in i for i in issues)
+
+    def test_eval_call_gets_zero(self):
+        """eval() calls are flagged as dynamic code execution."""
+        code = "eval('__import__(\"os\")')\n"
+        score, issues = _static_analysis_fallback(code)
+        assert score == 0.0
+        assert any("eval" in i for i in issues)
+
+    def test_builtins_reference_gets_zero(self):
+        """__builtins__ reference is flagged as a reflection vector."""
+        code = "f = getattr(__builtins__, 'eval')\nf('1+1')\n"
+        score, issues = _static_analysis_fallback(code)
+        assert score == 0.0
+        assert any("__builtins__" in i for i in issues)
+
+    def test_clean_code_with_no_evasion_still_gets_partial(self):
+        """Code without any evasion vectors still gets 0.4."""
+        code = (
+            "def solve(data):\n"
+            "    result = []\n"
+            "    for item in data:\n"
+            "        result.append(item * 2)\n"
+            "    return result\n"
+        )
+        score, issues = _static_analysis_fallback(code)
+        assert score == 0.4
+        assert issues == []
+
+    def test_mixed_evasion_and_restricted_both_reported(self):
+        """Both restricted imports and evasion vectors are reported."""
+        code = "import os\nmod = __import__('subprocess')\n"
+        score, issues = _static_analysis_fallback(code)
+        assert score == 0.0
+        # Restricted import (os) is found first, so it's reported.
+        # The evasion (__import__) is also detected.
+        assert any("os" in i for i in issues)

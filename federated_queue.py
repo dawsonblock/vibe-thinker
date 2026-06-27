@@ -271,6 +271,7 @@ class FederatedJobQueue:
         signing_key=None,
         ed25519_private_key_hex: Optional[str] = None,
         ed25519_public_key_hex: Optional[str] = None,
+        federation_secret: Optional[str] = None,
     ):
         # HA failover: accept a comma-separated list of coordinator URLs.
         # The client tries each in order and sticks to the first that
@@ -290,6 +291,31 @@ class FederatedJobQueue:
         self._node_id = node_id or os.uname().nodename
         self._federation_available: Optional[bool] = None
         self._publish_failed = False  # track first failure for warning
+
+        # v3.0: Zero-trust federation encryption. When a federation_secret
+        # is provided, all payloads (job queries, results) are encrypted
+        # with Fernet (AES-128-CBC + HMAC-SHA256) before transmission.
+        # The secret is shared across all nodes in the swarm. Nodes without
+        # the secret see only opaque ciphertext in Redis/HTTP traffic.
+        self._fernet = None
+        if federation_secret:
+            try:
+                from cryptography.fernet import Fernet
+                import base64
+                import hashlib
+                # Derive a Fernet key from the secret (Fernet requires
+                # a 32-byte base64-encoded key). We use SHA-256 of the
+                # secret to get a deterministic 32-byte key.
+                key = base64.urlsafe_b64encode(
+                    hashlib.sha256(federation_secret.encode()).digest()
+                )
+                self._fernet = Fernet(key)
+                print("[FederatedQueue] Zero-trust encryption enabled "
+                      "(Fernet AEAD)")
+            except ImportError:
+                print("[FederatedQueue] Warning: federation_secret provided "
+                      "but cryptography package not installed — payloads "
+                      "will be sent in plaintext")
 
         # Local fallback queue — always present. When the federation is
         # down, all jobs run here. When it's up, this node's spare
@@ -316,6 +342,36 @@ class FederatedJobQueue:
         if name == "_local":
             raise AttributeError(name)  # not set yet — avoid infinite recursion
         return getattr(self._local, name)
+
+    def _encrypt_payload(self, data: dict) -> dict:
+        """Encrypt a payload dict for zero-trust federation (v3.0).
+
+        If encryption is enabled (``_fernet`` is set), the payload is
+        JSON-serialized and encrypted. The returned dict has a single
+        key ``__encrypted__`` with the ciphertext. If encryption is
+        not enabled, the payload is returned unchanged.
+        """
+        if self._fernet is None:
+            return data
+        plaintext = json.dumps(data, default=str).encode("utf-8")
+        ciphertext = self._fernet.encrypt(plaintext).decode("ascii")
+        return {"__encrypted__": ciphertext}
+
+    def _decrypt_payload(self, data: dict) -> dict:
+        """Decrypt a payload dict received from the federation (v3.0).
+
+        If the data has an ``__encrypted__`` key and encryption is
+        enabled, decrypts and JSON-parses the payload. If encryption
+        is not enabled but the data is encrypted, raises ValueError.
+        """
+        if "__encrypted__" not in data:
+            return data  # Plaintext (no encryption configured by sender)
+        if self._fernet is None:
+            raise ValueError("Received encrypted payload but no "
+                             "federation_secret configured")
+        ciphertext = data["__encrypted__"].encode("ascii")
+        plaintext = self._fernet.decrypt(ciphertext).decode("utf-8")
+        return json.loads(plaintext)
 
     def _federation_configured(self) -> bool:
         """True if the federation URL and mTLS certs are all provided."""
@@ -393,17 +449,20 @@ class FederatedJobQueue:
         background task — errors are logged but do not propagate to
         submit(). Tries each HA coordinator URL in turn (sticky-first)
         and sticks to the first that succeeds.
+
+        v3.0: Payloads are encrypted with Fernet AEAD if
+        ``federation_secret`` was provided.
         """
         try:
             import aiohttp
             import ssl
-            payload = {
+            payload = self._encrypt_payload({
                 "job_id": job.job_id,
                 "query": job.query,
                 "priority": job.priority,
                 "force_route": job.force_route,
                 "submitted_by": self._node_id,
-            }
+            })
             ctx = ssl.create_default_context(cafile=self._mtls_ca)
             ctx.load_cert_chain(self._mtls_cert, self._mtls_key)
             timeout = aiohttp.ClientTimeout(total=5.0)
@@ -440,13 +499,13 @@ class FederatedJobQueue:
         try:
             import urllib.request
             import ssl
-            payload = json.dumps({
+            payload = json.dumps(self._encrypt_payload({
                 "job_id": job.job_id,
                 "query": job.query,
                 "priority": job.priority,
                 "force_route": job.force_route,
                 "submitted_by": self._node_id,
-            }).encode("utf-8")
+            })).encode("utf-8")
             ctx = ssl.create_default_context(cafile=self._mtls_ca)
             ctx.load_cert_chain(self._mtls_cert, self._mtls_key)
             last_err = "no coordinator reachable"
@@ -562,10 +621,10 @@ class FederatedJobQueue:
             urls = [origin_url] + urls
         try:
             result = await self._local.wait_for(local_job_id, timeout=600.0)
-            payload = {
+            payload = self._encrypt_payload({
                 "job_id": remote_job_id,
                 "result": _serialize_result(result),
-            }
+            })
             await self._post_to_any_url(urls, "/complete", payload, ssl_ctx,
                                         success_log=f"Reported result for "
                                                     f"federation job {remote_job_id}")
@@ -686,6 +745,7 @@ def make_job_queue(
     signing_key=None,
     ed25519_private_key_hex: Optional[str] = None,
     ed25519_public_key_hex: Optional[str] = None,
+    federation_secret: Optional[str] = None,
 ) -> BaseJobQueue:
     """Factory: build the appropriate job queue from config.
 
@@ -727,6 +787,7 @@ def make_job_queue(
             signing_key=signing_key,
             ed25519_private_key_hex=ed25519_private_key_hex,
             ed25519_public_key_hex=ed25519_public_key_hex,
+            federation_secret=federation_secret,
         )
     return LocalJobQueue(
         orchestrator,

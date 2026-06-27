@@ -413,3 +413,82 @@ class TestSerializeResult:
         """A bare string is wrapped in a dict."""
         result = _serialize_result("just a string")
         assert result == {"result": "just a string"}
+
+
+class TestFederationEncryption:
+    """v3.0: Tests for zero-trust payload encryption."""
+
+    def test_encrypt_decrypt_roundtrip(self):
+        """Encrypting and decrypting a payload returns the original."""
+        from federated_queue import FederatedJobQueue
+        queue = object.__new__(FederatedJobQueue)
+        queue._fernet = None
+
+        # Without a secret, no encryption (passthrough).
+        payload = {"job_id": "123", "query": "hello world"}
+        encrypted = queue._encrypt_payload(payload)
+        assert encrypted == payload  # No encryption, passthrough
+
+        # With a secret, encryption is applied.
+        from cryptography.fernet import Fernet
+        import base64
+        import hashlib
+        secret = "my_shared_secret"
+        key = base64.urlsafe_b64encode(
+            hashlib.sha256(secret.encode()).digest()
+        )
+        queue._fernet = Fernet(key)
+
+        encrypted = queue._encrypt_payload(payload)
+        assert "__encrypted__" in encrypted
+        assert encrypted["__encrypted__"] != "hello world"
+
+        decrypted = queue._decrypt_payload(encrypted)
+        assert decrypted == payload
+
+    def test_encrypt_without_secret_is_passthrough(self):
+        """Without a secret, _encrypt_payload returns the payload unchanged."""
+        from federated_queue import FederatedJobQueue
+        queue = object.__new__(FederatedJobQueue)
+        queue._fernet = None
+        payload = {"job_id": "123", "query": "test"}
+        assert queue._encrypt_payload(payload) == payload
+
+    def test_decrypt_plaintext_without_secret_returns_unchanged(self):
+        """Decrypting a plaintext payload without a secret returns it unchanged."""
+        from federated_queue import FederatedJobQueue
+        queue = object.__new__(FederatedJobQueue)
+        queue._fernet = None
+        payload = {"job_id": "123", "query": "test"}
+        assert queue._decrypt_payload(payload) == payload
+
+    def test_decrypt_encrypted_without_secret_raises(self):
+        """Decrypting an encrypted payload without a secret raises ValueError."""
+        from federated_queue import FederatedJobQueue
+        queue = object.__new__(FederatedJobQueue)
+        queue._fernet = None
+        payload = {"__encrypted__": "some_ciphertext"}
+        with pytest.raises(ValueError, match="no federation_secret"):
+            queue._decrypt_payload(payload)
+
+    def test_encrypted_payload_is_not_plaintext(self):
+        """The encrypted payload does not contain the original text."""
+        from federated_queue import FederatedJobQueue
+        from cryptography.fernet import Fernet
+        import base64
+        import hashlib
+        import json
+
+        queue = object.__new__(FederatedJobQueue)
+        secret = "swarm_secret_key"
+        key = base64.urlsafe_b64encode(
+            hashlib.sha256(secret.encode()).digest()
+        )
+        queue._fernet = Fernet(key)
+
+        payload = {"query": "sensitive user query", "result": {"answer": 42}}
+        encrypted = queue._encrypt_payload(payload)
+        encrypted_str = json.dumps(encrypted)
+        # The sensitive data should NOT appear in the ciphertext.
+        assert "sensitive user query" not in encrypted_str
+        assert "answer" not in encrypted_str
