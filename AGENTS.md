@@ -1,11 +1,11 @@
 # vibe-thinker — project notes for agents
 
 ## Verify / test
-- Full suite: `python3 -m pytest -q` (1008 tests, ~180s, no live servers needed)
+- Full suite: `python3 -m pytest -q` (~1170 tests, ~180s, no live servers needed)
 - Routing + REPL only: `python3 -m pytest tests/test_routing.py tests/test_repl.py -q`
 - Format enforcer + chat transports + repair loop: `python3 -m pytest tests/test_format_enforcer.py -q`
 - Citation-backed NLI factual verifier: `python3 -m pytest tests/test_factual_verifier.py -q`
-- Encoder NLI judge (optional): `python3 -m pytest tests/test_nli_encoder.py -q`
+- Encoder NLI judge (optional, default ON since Phase 3.3): `python3 -m pytest tests/test_nli_encoder.py -q`
 - Warm pool + code verifier: `python3 -m pytest tests/test_warm_pool.py tests/test_code_verifier.py -q`
 - Trajectory store: `python3 -m pytest tests/test_trajectory_store.py -q`
 - Grammar enforcement: `python3 -m pytest tests/test_clr_scoring.py::TestGrammarEnforcement -q`
@@ -29,6 +29,10 @@
 - Federated job queue: `python3 -m pytest tests/test_federated_queue.py -q`
 - Factual verifier NLI + negation + offline RAG: `python3 -m pytest tests/test_factual_verifier.py -q`
 - Job queue disk persistence: `python3 -m pytest tests/test_job_queue.py::TestDiskPersistence -q`
+- Mutation testing (vacuous test detection, Phase 3.1): `python3 -m pytest tests/test_mutation.py -q`
+- Hardware guardrails (OOM prevention, Phase 4.1): `python3 -m pytest tests/test_hardware_guardrail.py -q`
+- Federation zombie claim detection (Phase 4.2): `python3 -m pytest tests/test_federation_zombie.py -q`
+- Redis federation heartbeat + reaping (Phase 4.2): `python3 -m pytest tests/test_redis_federation.py::TestRedisHeartbeat tests/test_redis_federation.py::TestRedisReapStaleClaims -q`
 - Full-stack integration (needs live model servers): `python test_full_stack.py`
 - A benign `ResourceTracker.__del__` AttributeError prints after pytest exits on
   macOS Python 3.12 — it is multiprocessing teardown noise, NOT a test failure.
@@ -128,6 +132,93 @@ federation coordinator:
 The existing `JobQueue` satisfies `BaseJobQueue` structurally
 (runtime_checkable Protocol) — no changes needed to use it as a
 `BaseJobQueue`.
+
+### Federation zombie claim detection (Phase 4.2)
+Heartbeat-based zombie detection prevents jobs from being stuck in
+"claimed" state forever when a worker crashes after claiming but before
+completing.
+- `FederatedJob.heartbeat_at`: updated by the `/heartbeat` endpoint
+  while a worker is actively processing a job. Initialized on claim.
+- `InMemoryFederationState.heartbeat(job_id, worker_id)`: updates the
+  timestamp, validates worker_id matches (prevents stale workers from
+  extending re-queued claims).
+- `InMemoryFederationState.reap_stale_claims(timeout=300)`: scans
+  claimed jobs, re-queues those whose heartbeat (or claimed_at
+  fallback) is older than the timeout. Transitions claimed → pending,
+  clears claim fields.
+- `RedisFederationState`: implements the same `heartbeat()` and
+  `reap_stale_claims()` methods using Redis hashes + sorted sets.
+  `heartbeat_at` is stored in the job hash and read by
+  `_job_from_hash`.
+- `POST /heartbeat` endpoint (federation_server.py): workers call this
+  periodically. `POST /api/jobs/heartbeat` (web/app.py): same for the
+  web UI coordinator.
+- Background reaper task: runs every `claim_timeout / 2` seconds
+  (default timeout 300s), logs reaped job IDs.
+- `federated_queue.py._claim_and_report`: sends heartbeats every 60s
+  while a job is running. Stops after 3 consecutive failures
+  (coordinator may have re-queued the job). Heartbeat loop is
+  cancelled in a finally block.
+
+### AgentDB-only mode (Phase 4.3)
+`--agentdb-only` CLI flag (or `VIBE_THINKER_AGENTDB_ONLY` env) for
+post-cut-over AgentDB-only mode. After running `finalize-migration`
+(which archives local JSON files), restart with `--agentdb-only` to
+use AgentDB directly (no local shadow/fallback). Fail-closed: searches
+return empty if AgentDB is down. Requires `--agentdb-url` (warns and
+falls back to in-memory numpy if set without it). `agentdb_only`
+parameter is threaded through the orchestrator → CLRResultCache and
+VerifiedTrajectoryStore → `make_vector_store()` (skips shadow_primary).
+
+### Hardware guardrails (Phase 4.1)
+`hardware_guardrail.py` prevents OOM crashes by checking model size
+against available RAM before loading. `check_model_fits_ram()` estimates
+model RAM (file size + KV cache + safety multiplier × pool_size) and
+compares against available RAM (via psutil, or a 4GB fallback when
+psutil is absent). Wired into `VibeThinkerCLRAsync._init_local_backend`:
+before loading a local .gguf model, the guardrail checks whether it
+fits. If not, the load is refused and the CLR falls back to HTTP
+(instead of crashing with OOM). Non-local paths (HuggingFace repo_ids)
+skip the guardrail (can't estimate size without a network fetch). The
+error message includes actionable remediation (smaller model, reduce
+pool_size, reduce n_ctx, install psutil).
+
+### Mutation testing for vacuous test detection (Phase 3.1)
+`verifiers/mutation.py` with 5 syntactic mutation operators
+(`flip_arithmetic`, `flip_comparison`, `return_none`, `swap_constants`,
+`drop_statement`). `mutate_code()` tries each operator in order and
+returns the first mutation that produces syntactically valid Python
+that differs from the original. Wired into
+`_run_code_specialist_verified` at both candidate PASSED return points:
+before accepting a verified=1.0 score, the winning code is mutated and
+re-run. If the mutated (broken) code still passes, the tests are
+vacuous — the candidate is rejected and the test-feedback loop is
+triggered. Fail-safe: if the mutation check itself errors, the
+candidate is accepted (infrastructure error doesn't reject a passing
+candidate).
+
+### Z3/SMT translation retry loop (Phase 3.2)
+`LogicVerifier.validate_constraints()` checks whether constraint
+strings parse as valid Z3 expressions WITHOUT running the full
+verification. Returns None if all parse, or an error message describing
+the first failure. `_translate_logic_constraints_with_retry()` wraps
+the translation with a parse-validation + retry loop (default 2
+retries). When the generalist's constraints fail to parse as Z3, the
+specific parse error is fed back for a corrected attempt. This
+separates "bad translation" (retryable) from "bad answer" (not
+retryable — that's a verification failure). Z3 boolean functions
+(`And`, `Or`, `Not`, `Implies`, `If`, `Xor`) are exposed directly in
+the eval namespace so constraint strings like `Implies(a, b)` work
+without a `z3.` prefix.
+
+### NLI encoder default (Phase 3.3)
+The encoder-only NLI judge (`EncoderNLIJudge`) is now the DEFAULT for
+factual verification when available, instead of requiring
+`--prefer-encoder-nli` opt-in. `select_verifier()` and the orchestrator
+constructor default `prefer_encoder_nli=True`. Added `--no-encoder-nli`
+CLI flag (and `VIBE_THINKER_NO_ENCODER_NLI` env) to explicitly disable
+it. Fallback chain: EncoderNLIJudge (if available) → LLM judge →
+fail-closed.
 
 ## Robust answer extraction (v0.4.1)
 The system relies on regex to parse `\boxed{...}` from model output. Two
@@ -717,9 +808,10 @@ they cannot hallucinate a verdict.
 - **Optional extra**: `pip install "vibe-thinker[nli]"` (transformers +
   torch). Not a core dependency — follows the project's pattern for
   `cryptography`, `z3-solver`, `llama-cpp-python`.
-- **Opt-in**: `--prefer-encoder-nli` CLI flag /
-  `VIBE_THINKER_PREFER_ENCODER_NLI` env var. Default off — the model
-  downloads from HuggingFace on first use, so it's not enabled by default.
+- **Default ON (Phase 3.3)**: the encoder NLI judge is preferred
+  whenever available. `--no-encoder-nli` CLI flag /
+  `VIBE_THINKER_NO_ENCODER_NLI` env var disables it. The model
+  downloads from HuggingFace on first use (lazy loading).
 - **Fail-closed**: when transformers/torch are absent, or the model can't
   load, `select_verifier` falls back to the LLM judge (or
   `nli_unavailable`). `is_available()` checks deps without importing them

@@ -295,3 +295,101 @@ class TestRedisFederationApp:
         resp = tc.get("/jobs/j1")
         assert resp.json()["status"] == "done"
         assert resp.json()["result"]["answer"] == "4"
+
+
+# --------------------------------------------------------------------------- #
+# Phase 4.2: Heartbeat + zombie reaping (Redis backend)
+# --------------------------------------------------------------------------- #
+
+class TestRedisHeartbeat:
+    """Tests for the heartbeat method on RedisFederationState."""
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_updates_timestamp(self, redis_state):
+        await redis_state.submit("job1", "test query")
+        job = await redis_state.claim("worker-1")
+        assert job is not None
+        assert job.heartbeat_at is not None  # set on claim
+
+        await asyncio.sleep(0.01)
+        ok = await redis_state.heartbeat("job1", "worker-1")
+        assert ok is True
+
+        job = await redis_state.get_job("job1")
+        assert job.heartbeat_at is not None
+        assert job.status == "claimed"
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_wrong_worker_fails(self, redis_state):
+        await redis_state.submit("job1", "test query")
+        await redis_state.claim("worker-1")
+        ok = await redis_state.heartbeat("job1", "worker-2")
+        assert ok is False
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_nonexistent_job_fails(self, redis_state):
+        ok = await redis_state.heartbeat("nonexistent", "worker-1")
+        assert ok is False
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_on_completed_job_fails(self, redis_state):
+        await redis_state.submit("job1", "test query")
+        await redis_state.claim("worker-1")
+        await redis_state.complete("job1", result={"answer": "42"})
+        ok = await redis_state.heartbeat("job1", "worker-1")
+        assert ok is False
+
+
+class TestRedisReapStaleClaims:
+    """Tests for the reap_stale_claims method on RedisFederationState."""
+
+    @pytest.mark.asyncio
+    async def test_reap_stale_claim_requeues_job(self, redis_state):
+        import time as _time
+        await redis_state.submit("job1", "test query")
+        job = await redis_state.claim("worker-1")
+        assert job is not None
+        # Backdate the heartbeat to simulate a stale claim.
+        await redis_state._redis.hset(
+            f"{redis_state._job_prefix}job1",
+            "heartbeat_at", str(_time.time() - 400),
+        )
+        reaped = await redis_state.reap_stale_claims(timeout=300.0)
+        assert reaped == ["job1"]
+        job = await redis_state.get_job("job1")
+        assert job.status == "pending"
+        assert job.claimed_by is None
+
+    @pytest.mark.asyncio
+    async def test_reap_skips_fresh_claims(self, redis_state):
+        await redis_state.submit("job1", "test query")
+        await redis_state.claim("worker-1")
+        reaped = await redis_state.reap_stale_claims(timeout=300.0)
+        assert reaped == []
+        job = await redis_state.get_job("job1")
+        assert job.status == "claimed"
+
+    @pytest.mark.asyncio
+    async def test_reap_skips_completed_jobs(self, redis_state):
+        await redis_state.submit("job1", "test query")
+        await redis_state.claim("worker-1")
+        await redis_state.complete("job1", result={"answer": "42"})
+        reaped = await redis_state.reap_stale_claims(timeout=300.0)
+        assert reaped == []
+
+    @pytest.mark.asyncio
+    async def test_reap_requeued_job_can_be_claimed_again(self, redis_state):
+        import time as _time
+        await redis_state.submit("job1", "test query")
+        await redis_state.claim("worker-1")
+        await redis_state._redis.hset(
+            f"{redis_state._job_prefix}job1",
+            "heartbeat_at", str(_time.time() - 400),
+        )
+        await redis_state.reap_stale_claims(timeout=300.0)
+        # A different worker should be able to claim the re-queued job.
+        job = await redis_state.claim("worker-2")
+        assert job is not None
+        assert job.job_id == "job1"
+        assert job.claimed_by == "worker-2"
+        assert job.status == "claimed"

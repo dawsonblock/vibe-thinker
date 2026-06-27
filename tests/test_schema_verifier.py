@@ -335,6 +335,16 @@ class TestLogicVerifierValidateConstraints:
         error = LogicVerifier.validate_constraints([], {})
         assert error is None
 
+    def test_none_constraints_return_none(self):
+        # None constraints — treated as empty (vacuously valid).
+        error = LogicVerifier.validate_constraints(None, {})
+        assert error is None
+
+    def test_none_variables_return_none(self):
+        # None variables — treated as empty dict.
+        error = LogicVerifier.validate_constraints(["True"], None)
+        assert error is None
+
     def test_error_includes_constraint_index(self):
         error = LogicVerifier.validate_constraints(
             ["x > 0", "bad syntax !!!", "y < x"],

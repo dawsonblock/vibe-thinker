@@ -201,8 +201,8 @@ class LogicVerifier:
         answer" (the answer's values violate valid constraints).
 
         Args:
-            constraints: list of Z3 assertion strings.
-            variables: dict mapping variable names to Z3 sorts.
+            constraints: list of Z3 assertion strings, or None/empty.
+            variables: dict mapping variable names to Z3 sorts, or None.
 
         Returns:
             None if all constraints parse successfully, or an error
@@ -211,6 +211,10 @@ class LogicVerifier:
         """
         if not _Z3_AVAILABLE:
             return "z3-solver not installed; cannot validate constraints"
+        if constraints is None:
+            constraints = []
+        if variables is None:
+            variables = {}
         # Build Z3 variables.
         z3_vars: Dict[str, Any] = {}
         try:

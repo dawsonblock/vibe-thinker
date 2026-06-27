@@ -269,7 +269,8 @@ redis.call('ZREM', KEYS[1], member)
 local key = ARGV[3] .. job_id
 redis.call('HSET', key, 'status', 'claimed',
            'claimed_by', ARGV[1],
-           'claimed_at', ARGV[2])
+           'claimed_at', ARGV[2],
+           'heartbeat_at', ARGV[2])
 return job_id
 """
 
@@ -327,6 +328,7 @@ def _job_from_hash(job_id: str, h: Dict[bytes, bytes]) -> Optional[FederatedJob]
         created_at=_gf("created_at") or time.time(),
         claimed_at=_gf("claimed_at"),
         completed_at=_gf("completed_at"),
+        heartbeat_at=_gf("heartbeat_at"),
     )
 
 
@@ -498,6 +500,7 @@ class RedisFederationState:
                     "status": "claimed",
                     "claimed_by": worker_id,
                     "claimed_at": str(time.time()),
+                    "heartbeat_at": str(time.time()),
                 })
                 result = await pipe.execute()
                 # If EXEC was aborted (nil), result is None — retry.
@@ -527,6 +530,64 @@ class RedisFederationState:
             mapping["error"] = error
         await self._redis.hset(key, mapping=mapping)
         return True
+
+    async def heartbeat(self, job_id: str, worker_id: str) -> bool:
+        """Update the heartbeat timestamp for a claimed job (Phase 4.2).
+
+        Returns True if the job was found, is claimed, and belongs to the
+        given worker. Atomically checks status + claimed_by before updating
+        to prevent a stale worker from extending a re-queued claim.
+        """
+        key = f"{self._job_prefix}{job_id}"
+        h = await self._redis.hgetall(key)
+        if not h:
+            return False
+        job = _job_from_hash(job_id, h)
+        if job is None or job.status != "claimed" or job.claimed_by != worker_id:
+            return False
+        await self._redis.hset(key, "heartbeat_at", str(time.time()))
+        return True
+
+    async def reap_stale_claims(self, timeout: float = 300.0) -> List[str]:
+        """Re-queue claimed jobs whose heartbeat is older than timeout (Phase 4.2).
+
+        Scans all job hashes for claimed status; if heartbeat_at (or
+        claimed_at fallback) is older than `timeout`, transitions the job
+        back to pending and re-adds it to the pending sorted set.
+        """
+        now = time.time()
+        ids = await self._redis.smembers(self._ids_key)
+        ids = [i.decode() if isinstance(i, bytes) else i for i in ids]
+        reaped: List[str] = []
+        for jid in ids:
+            key = f"{self._job_prefix}{jid}"
+            h = await self._redis.hgetall(key)
+            if not h:
+                continue
+            job = _job_from_hash(jid, h)
+            if job is None or job.status != "claimed":
+                continue
+            last_contact = job.heartbeat_at or job.claimed_at
+            if last_contact is None:
+                continue
+            if (now - last_contact) > timeout:
+                # Zombie — re-queue.
+                pipe = self._redis.pipeline()
+                pipe.hset(key, mapping={
+                    "status": "pending",
+                    "claimed_by": "",
+                    "claimed_at": "",
+                    "heartbeat_at": "",
+                })
+                # Re-add to pending sorted set. Recompute member + score.
+                created_at = job.created_at or now
+                priority = job.priority
+                member = f"{created_at:.6f}:{jid}"
+                score = float(-priority)
+                pipe.zadd(self._pending_key, {member: score})
+                await pipe.execute()
+                reaped.append(jid)
+        return reaped
 
     async def list_jobs(self) -> List[Dict[str, Any]]:
         ids = await self._redis.smembers(self._ids_key)

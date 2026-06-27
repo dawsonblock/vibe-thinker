@@ -37,11 +37,13 @@ from typing import Optional
 # and avoid OOM on edge-case hardware.
 _RAM_SAFETY_MULTIPLIER = 1.5
 
-# KV cache RAM per token (bytes). For q8_0 K cache + turbo3 V cache
-# (the TurboQuant default), this is roughly 0.5 bytes per element per
-# layer. For a typical 32-layer model, that's ~16 bytes per token per
-# parameter byte. We use a conservative estimate of 1KB per token per
-# layer as a rough approximation. This is intentionally conservative.
+# KV cache RAM per token per layer (bytes). This is intentionally
+# conservative — actual KV cache size depends on the model's hidden
+# dimension, number of attention heads, and quantization. For a typical
+# 7B model with 4096 hidden dim, 32 layers, and q8_0 K + turbo3 V
+# cache, the actual KV cache is ~0.5-2 KB per token per layer. We use
+# 1 KB as a round, conservative estimate that overestimates slightly
+# (safe — better to refuse a load than to OOM-crash).
 _KV_CACHE_BYTES_PER_TOKEN_PER_LAYER = 1024
 
 # Default layer count for estimating KV cache (most 3B-7B models have

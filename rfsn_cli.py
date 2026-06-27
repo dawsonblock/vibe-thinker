@@ -709,7 +709,12 @@ async def _amain() -> None:
               "Using LLM judge for factual verification.")
 
     # --- AgentDB vector store mode (Phase 4.3) ---
-    if args.agentdb_url and args.agentdb_only:
+    if args.agentdb_only and not args.agentdb_url:
+        print("[CLI] WARNING: --agentdb-only set but --agentdb-url is empty. "
+              "AgentDB-only mode requires --agentdb-url. Falling back to "
+              "in-memory numpy (default behavior).")
+        args.agentdb_only = False
+    elif args.agentdb_url and args.agentdb_only:
         print(f"[CLI] AgentDB-only mode: vector store is AgentDB at "
               f"{args.agentdb_url} (no local fallback). Fail-closed: "
               f"searches return empty if AgentDB is down.")

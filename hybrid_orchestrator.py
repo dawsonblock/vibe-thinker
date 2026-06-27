@@ -2199,11 +2199,15 @@ class HybridReasoningOrchestrator:
                   f"{attempt + 1}): {error}")
             feedback = error
 
-        # All retries exhausted — return the last result anyway. The
-        # LogicVerifier will catch the parse error and return
-        # verified=False (fail-closed). This is better than returning
-        # None (which would skip verification entirely) because the
-        # error trace will be visible in the verification result.
+        # All retries exhausted with parse errors. Return the last
+        # non-None result — the LogicVerifier will catch the parse error
+        # and return verified=False (fail-closed). This is better than
+        # returning None (which would skip verification entirely) because
+        # the error trace will be visible in the verification result.
+        # Note: result is guaranteed non-None here because None results
+        # return early inside the loop (line above).
+        if result is None:
+            return None
         print(f"[CLR] Logic translation retries exhausted — returning "
               f"best-effort (will fail at verification)")
         return result
