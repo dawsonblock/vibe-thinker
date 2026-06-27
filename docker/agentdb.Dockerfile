@@ -58,11 +58,8 @@ RUN printf '%s\n' \
     '            self.wfile.write(json.dumps({"results":[]}).encode())' \
     '        else: self.send_response(404); self.end_headers()' \
     '    def log_message(self, *a): pass' \
-    'http.server.HTTPServer(("0.0.0.0",8080),H).serve_forever()' \
+    'http.server.HTTPServer(("0.0.0.0",8088),H).serve_forever()' \
     > /usr/local/bin/agentdb_placeholder.py
-
-# NOTE: the placeholder listens on 8088 to match the orchestrator's AGENTDB_URL.
-RUN sed -i 's/8080/8088/' /usr/local/bin/agentdb_placeholder.py
 
 HEALTHCHECK --interval=15s --timeout=5s --retries=5 --start-period=10s \
     CMD wget -q -O- http://127.0.0.1:8088/health || exit 1

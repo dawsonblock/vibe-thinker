@@ -169,12 +169,14 @@ class TestInProcessContract:
             # Any exception is acceptable as long as no PplResult is returned.
             pass
 
+    @pytest.mark.timeout(300)
     def test_inprocess_logprobs_returns_ppl_result(self):
         # When ruvllm_py IS built with candle (SUPPORTS_LOGPROBS == True)
         # and a real GGUF model is available, eval_inprocess should return a
         # PplResult with real per-token log-probs computed via log_softmax
         # over the vocabulary. Skips when the binding isn't built or no
-        # model is available.
+        # model is available. Timeout is 300s because loading a 3B GGUF
+        # model + running inference takes >60s on first load.
         if not self._ruvllm_has_logprobs():
             pytest.skip(
                 "ruvllm_py not built with candle — no logprobs capability. "

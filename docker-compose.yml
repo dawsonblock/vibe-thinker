@@ -205,8 +205,9 @@ services:
   # ---------------------------------------------------------------------------
   # GPU llama.cpp inference server (gpu profile).
   #   Serves an OpenAI-compatible /completion endpoint for the specialist
-  #   (--vibe) AND the generalist on separate ports. The orchestrator points
-  #   VIBE_THINKER_URL at this server's :8080 and GENERALIST_URL at :8081.
+  #   (--vibe) AND the generalist. llama-server listens on a single port
+  #   (8080); both VIBE_THINKER_URL and GENERALIST_URL point at it. The
+  #   orchestrator makes different prompt requests to the same server.
   #
   #   IMPORTANT: You MUST supply a real .gguf model file. Mount it into the
   #   container and set LLAMA_MODEL_PATH (default /models/model.gguf). The
@@ -235,10 +236,8 @@ services:
       # Mount your model directory here, e.g. /host/models:/models
       - ${LLAMA_MODEL_DIR:-./models}:/models:ro
     ports:
-      # specialist endpoint (VIBE_THINKER_URL)
+      # specialist + generalist endpoint (both VIBE_THINKER_URL and GENERALIST_URL)
       - "8080:8080"
-      # generalist endpoint (GENERALIST_URL)
-      - "8081:8081"
     command:
       - "--model"
       - "${LLAMA_MODEL_PATH:-/models/model.gguf}"
@@ -264,8 +263,9 @@ services:
     environment:
       <<: *orchestrator-env
       # Override to point at the GPU llama-server in this stack.
+      # Both specialist and generalist use the same server/port.
       VIBE_THINKER_URL: http://llama-server:8080
-      GENERALIST_URL: http://llama-server:8081
+      GENERALIST_URL: http://llama-server:8080
     depends_on:
       redis:
         condition: service_healthy

@@ -1511,6 +1511,14 @@ is built with the `candle` feature; raises `NotImplementedError`
 (fail-closed) when the binding is absent or built without candle.
 Backward-compat: `complete()` is unchanged. The fail-closed contract
 for the absent-binding case is preserved in the tests.
+End-to-end verified: built with `maturin build --release --features
+inference-metal` on Apple Silicon, installed into pyenv 3.12, and ran
+`eval-inprocess` against Llama-3.2-3B-Instruct-Q5_K_M.gguf (with a
+tokenizer.json from HuggingFace alongside it) — produces a real
+PplResult with source="ruvllm_py". Note: candle's `quantized_llama`
+only supports Llama/Mistral GGUF architectures (NOT Qwen2/Phi/Gemma).
+The test `test_inprocess_logprobs_returns_ppl_result` passes with
+`RUVLLM_PPL_TEST_MODEL` set (timeout 300s for model load + inference).
 
 ### Unified Docker deployment stack (Step 1.2)
 New files: `docker-compose.yml` (redis/envoy/agentdb sidecars always
@@ -1522,6 +1530,12 @@ start + 3 orchestrator profiles: `--profile cpu`/`gpu`/`ruvllm`),
 Honesty notes: AgentDB/RuvLLM have no published images (must be supplied
 by the user); GPU profile requires a `.gguf` model volume mount. This is
 GREENFIELD (no existing compose/Dockerfile to consolidate).
+Verified: `docker compose config` passes for all 3 profiles; hadolint
+clean (only version-pinning warnings); envoy.yaml matches
+`envoy_sidecar.py` generate_envoy_config() structure; all runtime
+.py modules confirmed in Dockerfile COPY via AST import scan; llama-server
+uses a single port (8080) for both specialist and generalist (not separate
+ports — llama-server doesn't support multi-port).
 
 ### Manual train-lora subcommand (Step 4.1 revised)
 `scripts/train_lora.py` is the HUMAN-IN-THE-LOOP boundary of the data
@@ -1536,6 +1550,11 @@ bakes in selection bias toward verifiable task types). NO hot-swap
 (llama-cpp-python has no `set_lora()` — it's a model reload, and silently
 swapping a learned adapter into production is an unreviewed deployment).
 The operator reviews the adapter and loads it manually.
+`--dry-run` validates the dataset format against the trainer's expectations
+(SFT vs DPO, messages structure) and prints the exact command without
+executing — exits 0 on valid, 1 on format error, 3 when no trainer is
+detected. `validate_dataset_format()` catches mlx_lm/DPO mismatches and
+malformed messages entries before shelling out.
 
 ### Inter-turn tool-callback scaffold (Step 4.2 revised)
 `tool_callbacks.py` implements INTER-TURN tool calls (generate -> tool

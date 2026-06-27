@@ -382,6 +382,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("=" * 60)
         print(f"DRY RUN — trainer: {trainer}")
         print("=" * 60)
+        # No trainer available — fail with exit 3 (same as the real path).
+        if trainer == "none":
+            print("Would fail: no trainer found (install mlx-lm or unsloth)")
+            return 3
         # Validate dataset format against the trainer's expectations.
         errors = validate_dataset_format(examples, trainer)
         if errors:
@@ -400,7 +404,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"Would write driver to: {driver}")
             print(f"Would invoke: python3 {driver}")
         else:
-            print(f"Would fail: no trainer found (install mlx-lm or unsloth)")
+            print(f"Would fail: unknown trainer '{trainer}'")
             return 3
         print("DRY RUN complete — no training executed.")
         return 0
