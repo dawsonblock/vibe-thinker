@@ -42,14 +42,40 @@ ruvllm = { version = "2.3", default-features = false, features = ["async-runtime
 rustls-webpki = { version = "0.103", optional = true }
 lru = { version = "0.13", optional = true }
 
+# Semantic embedding pipeline (Phase 2.2): candle-transformers' BERT
+# model + tokenizers + hf-hub to run all-MiniLM-L6-v2 in-process. These
+# are gated behind the "candle" feature. Feature unification with
+# ruvllm's `inference-metal` enables the `metal` feature on the candle
+# crates automatically, so no explicit metal enablement is needed here.
+candle-core = { version = "0.9", optional = true, default-features = false }
+candle-nn = { version = "0.9", optional = true, default-features = false }
+candle-transformers = { version = "0.9", optional = true, default-features = false }
+hf-hub = { version = "0.4", optional = true, default-features = false, features = ["ureq"] }
+tokenizers = { version = "0.20", optional = true }
+serde_json = { version = "1", optional = true }
+
 [features]
 default = []
 # Real inference via candle-core (CPU). Enables CandleBackend::load_gguf
 # + generate(). Without this, Engine.complete() returns a stub response.
 # Also activates the security-pinned transitive deps (rustls-webpki,
-# lru) so the resolver picks the safe versions when candle pulls them in.
-candle = ["ruvllm/candle", "dep:rustls-webpki", "dep:lru"]
-# Apple Silicon Metal acceleration (implies candle).
+# lru) so the resolver picks the safe versions when candle pulls them in,
+# and the semantic-embedding deps (candle-transformers BERT + tokenizers
+# + hf-hub) for the Engine.embed() / Embedder path (Phase 2.2).
+candle = [
+    "ruvllm/candle",
+    "dep:rustls-webpki",
+    "dep:lru",
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:hf-hub",
+    "dep:tokenizers",
+    "dep:serde_json",
+]
+# Apple Silicon Metal acceleration (implies candle). Feature unification
+# with ruvllm/inference-metal enables candle-core/metal, candle-nn/metal,
+# and candle-transformers/metal on the shared crate instances.
 inference-metal = ["candle", "ruvllm/inference-metal"]
 
 [profile.release]

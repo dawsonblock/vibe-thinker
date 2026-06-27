@@ -435,7 +435,12 @@ class RuvLLMBinding:
         if not text or not text.strip():
             return []
 
-        # 1. Rust-native embeddings (Phase 4.2 — future).
+        # 1. Rust-native embeddings (v1.0 Phase 2.2 — implemented). The
+        # ruvllm_py Engine.embed() runs a real BERT model
+        # (all-MiniLM-L6-v2) via candle-transformers with GIL release.
+        # When the binding is built with --features candle this is the
+        # zero-overhead primary path; the stub build returns [] and
+        # falls through to the Python sources below.
         engine = getattr(self, "_engine", None)
         if engine is not None and hasattr(engine, "embed"):
             try:

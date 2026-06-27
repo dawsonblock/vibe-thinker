@@ -213,6 +213,324 @@ mod backend {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Semantic embedding backend (Phase 2.2): real BERT via candle-transformers
+// or stub. Exposes an `Embedder` PyO3 class and powers `Engine.embed()`.
+//
+// The ruvllm 2.3 `CandleBackend::get_embeddings` is a placeholder that
+// returns all-zero vectors (it does not extract hidden states). Wrapping it
+// would produce fake vectors — exactly what the production plan eliminates.
+// Instead, this module runs a real BERT model (all-MiniLM-L6-v2, 384-dim)
+// via candle-transformers: tokenize -> forward -> attention-masked mean pool
+// -> L2 normalize. This matches sentence-transformers' all-MiniLM-L6-v2
+// output so embeddings are compatible with the trajectory store.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "candle")]
+mod embed_backend {
+    use candle_core::{DType, Device, Tensor};
+    use candle_nn::VarBuilder;
+    use candle_transformers::models::bert::{BertModel, Config};
+    use pyo3::prelude::*;
+    use std::path::Path;
+
+    /// Default embedding model (sentence-transformers/all-MiniLM-L6-v2,
+    /// 384-dim — the same model the Python trajectory store uses).
+    pub const DEFAULT_EMBED_MODEL: &str = "sentence-transformers/all-MiniLM-L6-v2";
+
+    /// A semantic text embedder backed by a real BERT model.
+    ///
+    /// The model is loaded from a HuggingFace Hub repo id (downloaded via
+    /// hf-hub) or a local directory containing config.json, tokenizer.json,
+    /// and model.safetensors. Embeddings are mean-pooled over the sequence
+    /// dimension with the attention mask and L2-normalized.
+    #[pyclass]
+    pub struct Embedder {
+        model: BertModel,
+        tokenizer: tokenizers::Tokenizer,
+        device: Device,
+        // The BERT forward pass is &self, but tokenizers::Tokenizer encode
+        // is &self too, so a plain Mutex suffices for thread safety. We use
+        // a Mutex to satisfy Send/Sync for the pyclass.
+        inner: std::sync::Mutex<()>,
+    }
+
+    // Safety: BertModel, Tokenizer, and Device are all Send+Sync once the
+    // model is loaded (candle Tensors are Send). The Mutex<()> guards
+    // concurrent tokenizer access.
+    unsafe impl Send for Embedder {}
+    unsafe impl Sync for Embedder {}
+
+    impl Embedder {
+        /// Load the embedder (called from Engine.embed lazily and from Py new).
+        pub fn load(
+            model_id: &str,
+            use_metal: bool,
+            revision: Option<&str>,
+        ) -> PyResult<Self> {
+            let device = if use_metal {
+                Device::new_metal(0)
+                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Metal device init failed: {e}"
+                    )))?
+            } else {
+                Device::Cpu
+            };
+
+            // Resolve model files: a local directory takes precedence;
+            // otherwise download from the HuggingFace Hub via hf-hub.
+            let (config_path, tokenizer_path, weights_path) = if Path::new(model_id).is_dir() {
+                let dir = Path::new(model_id);
+                (
+                    dir.join("config.json"),
+                    dir.join("tokenizer.json"),
+                    dir.join("model.safetensors"),
+                )
+            } else {
+                let api = hf_hub::api::sync::ApiBuilder::new()
+                    .with_progress(false)
+                    .build()
+                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "hf-hub api init failed: {e}"
+                    )))?;
+                let repo = match revision {
+                    Some(r) => hf_hub::Repo::with_revision(
+                        model_id.to_string(),
+                        hf_hub::RepoType::Model,
+                        r.to_string(),
+                    ),
+                    None => hf_hub::Repo::new(
+                        model_id.to_string(),
+                        hf_hub::RepoType::Model,
+                    ),
+                };
+                let repo = api.repo(repo);
+                (
+                    repo.get("config.json").map_err(hf_err)?,
+                    repo.get("tokenizer.json").map_err(hf_err)?,
+                    repo.get("model.safetensors").map_err(hf_err)?,
+                )
+            };
+
+            let config_str = std::fs::read_to_string(&config_path)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "read config.json at {}: {e}",
+                    config_path.display()
+                )))?;
+            let config: Config = serde_json::from_str(&config_str)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "parse config.json: {e}"
+                )))?;
+
+            let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "load tokenizer.json at {}: {e}",
+                    tokenizer_path.display()
+                )))?;
+
+            // MMap the safetensors weights. unsafe: the file must not be
+            // mutated while mapped — the hf-hub cache and local model dirs
+            // guarantee this (read-only model artifacts).
+            let vb = unsafe {
+                VarBuilder::from_mmaped_safetensors(&[weights_path.clone()], DType::F32, &device)
+            }
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "mmap weights at {}: {e}",
+                weights_path.display()
+            )))?;
+            let model = BertModel::load(vb, &config).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "BertModel::load failed: {e}"
+                ))
+            })?;
+
+            Ok(Embedder {
+                model,
+                tokenizer,
+                device,
+                inner: std::sync::Mutex::new(()),
+            })
+        }
+
+        /// Compute a semantic embedding for `text`.
+        ///
+        /// Returns a 384-dim (for MiniLM) L2-normalized Vec<f32>. The GIL
+        /// is released during the forward pass.
+        pub fn embed_vec(&self, text: &str) -> PyResult<Vec<f32>> {
+            let _guard = self.inner.lock().unwrap();
+            let enc = self
+                .tokenizer
+                .encode(text, true)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "tokenize failed: {e}"
+                )))?;
+            let ids = enc.get_ids().to_vec();
+            let attn = enc.get_attention_mask().to_vec();
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            // Build tensors: [1, seq].
+            let input_ids = Tensor::from_iter(ids.iter().map(|&v| v as i64), &self.device)
+                .map_err(candle_err)?
+                .unsqueeze(0)
+                .map_err(candle_err)?;
+            let token_type_ids = input_ids.zeros_like().map_err(candle_err)?;
+            let attention_mask = Tensor::from_iter(
+                attn.iter().map(|&v| v as i64),
+                &self.device,
+            )
+            .map_err(candle_err)?
+            .unsqueeze(0)
+            .map_err(candle_err)?;
+
+            // Forward -> [1, seq, hidden_size] (f32).
+            let hidden = self
+                .model
+                .forward(&input_ids, &token_type_ids, Some(&attention_mask))
+                .map_err(candle_err)?;
+
+            // Mean-pool over the sequence dim with the attention mask, then
+            // L2-normalize (matches sentence-transformers all-MiniLM-L6-v2).
+            let mask_f = attention_mask.to_dtype(DType::F32).map_err(candle_err)?;
+            let mask_3d = mask_f.unsqueeze(2).map_err(candle_err)?; // [1, seq, 1]
+            let masked = hidden.broadcast_mul(&mask_3d).map_err(candle_err)?; // [1, seq, hidden]
+            let sum_hidden = masked.sum(1).map_err(candle_err)?; // [1, hidden]
+            let mask_sum = mask_f.sum_keepdim(1).map_err(candle_err)?; // [1, 1]
+            let pooled = sum_hidden
+                .broadcast_div(&mask_sum)
+                .map_err(candle_err)?; // [1, hidden]
+
+            // L2 normalize.
+            let norm = pooled.sqr().map_err(candle_err)?.sum_all().map_err(candle_err)?.sqrt().map_err(candle_err)?;
+            let pooled = pooled
+                .broadcast_div(&norm)
+                .map_err(candle_err)?;
+
+            let vec = pooled.to_vec1::<f32>().map_err(candle_err)?;
+            Ok(vec)
+        }
+    }
+
+    #[pymethods]
+    impl Embedder {
+        /// Create a new Embedder and load the BERT model.
+        ///
+        /// Args:
+        ///     model_id: HuggingFace repo id (e.g.
+        ///         "sentence-transformers/all-MiniLM-L6-v2") OR a local
+        ///         directory containing config.json, tokenizer.json, and
+        ///         model.safetensors.
+        ///     use_metal: Use Apple Silicon Metal (default False = CPU).
+        ///     revision: Optional HuggingFace revision (git commit/branch).
+        #[new]
+        #[pyo3(signature = (model_id = DEFAULT_EMBED_MODEL, use_metal = false, revision = None))]
+        fn new(
+            model_id: &str,
+            use_metal: bool,
+            revision: Option<&str>,
+        ) -> PyResult<Self> {
+            Embedder::load(model_id, use_metal, revision)
+        }
+
+        /// Compute a semantic embedding for `text`.
+        ///
+        /// Returns a list of floats (L2-normalized). The GIL is released
+        /// during the forward pass so the orchestrator's asyncio loop is
+        /// not blocked.
+        fn embed<'a>(
+            &self,
+            py: Python<'a>,
+            text: String,
+        ) -> PyResult<Vec<f32>> {
+            if text.trim().is_empty() {
+                return Ok(Vec::new());
+            }
+            py.allow_threads(|| self.embed_vec(&text))
+        }
+
+        /// Whether a real BERT model is loaded.
+        #[getter]
+        fn is_loaded(&self) -> bool {
+            true
+        }
+    }
+
+    fn hf_err(e: hf_hub::api::sync::ApiError) -> PyErr {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("hf-hub download failed: {e}"))
+    }
+
+    fn candle_err(e: candle_core::Error) -> PyErr {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("candle error: {e}"))
+    }
+}
+
+#[cfg(not(feature = "candle"))]
+mod embed_backend {
+    use pyo3::prelude::*;
+
+    pub const DEFAULT_EMBED_MODEL: &str = "sentence-transformers/all-MiniLM-L6-v2";
+
+    /// Semantic embedder (STUB — build with --features candle).
+    ///
+    /// `embed()` returns an empty Vec so the Python RuvLLMBinding falls
+    /// back to sentence-transformers / ONNX / fail-closed. NEVER returns
+    /// fake/hash vectors.
+    #[pyclass]
+    pub struct Embedder;
+
+    impl Embedder {
+        /// Stub load — always fails (the Engine.embed path treats this as
+        /// fail-closed and returns an empty Vec so Python falls back).
+        pub fn load(
+            _model_id: &str,
+            _use_metal: bool,
+            _revision: Option<&str>,
+        ) -> PyResult<Self> {
+            Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "ruvllm_py Embedder stub — build with --features candle \
+                 for real semantic embeddings",
+            ))
+        }
+
+        pub fn embed_vec(&self, _text: &str) -> PyResult<Vec<f32>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[pymethods]
+    impl Embedder {
+        #[new]
+        #[pyo3(signature = (model_id = DEFAULT_EMBED_MODEL, use_metal = false, revision = None))]
+        fn new(
+            model_id: &str,
+            use_metal: bool,
+            revision: Option<&str>,
+        ) -> PyResult<Self> {
+            // The stub cannot load a real model; surface the error so the
+            // caller knows to fall back. (Engine.embed catches this.)
+            let _ = (model_id, use_metal, revision);
+            eprintln!(
+                "[ruvllm_py] Embedder stub — build with --features candle \
+                 for real semantic embeddings"
+            );
+            Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "ruvllm_py Embedder stub — no real embeddings available",
+            ))
+        }
+
+        fn embed<'a>(&self, _py: Python<'a>, _text: String) -> PyResult<Vec<f32>> {
+            // Fail-closed: empty Vec -> Python falls back. No fake vectors.
+            Ok(Vec::new())
+        }
+
+        #[getter]
+        fn is_loaded(&self) -> bool {
+            false
+        }
+    }
+}
+
 /// The RuvLLM inference engine.
 ///
 /// This is the main entry point. It holds the candle backend in an
@@ -224,6 +542,10 @@ mod backend {
 pub struct Engine {
     config: EngineConfig,
     backend: Arc<Mutex<backend::RealBackend>>,
+    // Lazily-initialized semantic embedder (Phase 2.2). None until the
+    // first embed() call. Arc<Mutex<...>> for thread-safe lazy init from
+    // multiple Python pool threads.
+    embedder: Arc<Mutex<Option<embed_backend::Embedder>>>,
 }
 
 #[pymethods]
@@ -258,6 +580,7 @@ impl Engine {
         Ok(Engine {
             config,
             backend: Arc::new(Mutex::new(backend)),
+            embedder: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -305,6 +628,65 @@ impl Engine {
         dict.set_item("usage", usage)?;
 
         Ok(dict)
+    }
+
+    /// Compute a semantic embedding for `text` (Phase 2.2).
+    ///
+    /// Lazily loads a BERT embedder (all-MiniLM-L6-v2 by default, 384-dim)
+    /// on the first call and caches it for subsequent calls. The GIL is
+    /// released during the forward pass. Returns an L2-normalized Vec<f32>,
+    /// or an empty Vec if the embedder could not be loaded (fail-closed —
+    /// the Python RuvLLMBinding then falls back to sentence-transformers /
+    /// ONNX / fail-closed; never returns fake/hash vectors).
+    ///
+    /// Args:
+    ///     text: The text to embed.
+    ///     model_id: Override the embedding model (HF repo id or local
+    ///         dir). Defaults to all-MiniLM-L6-v2. Only applied on the
+    ///         first call (the embedder is cached).
+    #[pyo3(signature = (text, model_id = None))]
+    fn embed<'a>(
+        &self,
+        py: Python<'a>,
+        text: String,
+        model_id: Option<&str>,
+    ) -> PyResult<Vec<f32>> {
+        if text.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        // Lazily initialize the embedder on first call. The model_id
+        // override only applies on the first call (subsequent calls reuse
+        // the cached embedder regardless of model_id).
+        {
+            let mut guard = self.embedder.lock().unwrap();
+            if guard.is_none() {
+                let mid = model_id
+                    .unwrap_or(embed_backend::DEFAULT_EMBED_MODEL)
+                    .to_string();
+                match embed_backend::Embedder::load(&mid, self.config.use_metal, None) {
+                    Ok(e) => *guard = Some(e),
+                    Err(e) => {
+                        // Fail-closed: don't cache the failure; a later
+                        // call (or the Python side) can fall back. Return
+                        // empty so the Python fallback chain runs.
+                        eprintln!(
+                            "[ruvllm_py] Embedder load failed (model_id={}): {} \
+                             — returning empty vec; Python will fall back",
+                            mid, e
+                        );
+                        return Ok(Vec::new());
+                    }
+                }
+            }
+        }
+        // Now the embedder is guaranteed Some. Release the GIL for the
+        // forward pass. We re-lock to borrow the embedder; the inner Mutex
+        // in Embedder guards concurrent tokenizer access.
+        py.allow_threads(|| {
+            let guard = self.embedder.lock().unwrap();
+            let embedder = guard.as_ref().expect("embedder initialized above");
+            embedder.embed_vec(&text)
+        })
     }
 
     /// Get the model's context window size.
@@ -676,6 +1058,7 @@ mod sona_backend {
 fn ruvllm_py(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<EngineConfig>()?;
     m.add_class::<Engine>()?;
+    m.add_class::<embed_backend::Embedder>()?;
     m.add_class::<hnsw_backend::HnswIndex>()?;
     m.add_class::<sona_backend::SonaRecorder>()?;
     // Use add() instead of setattr() for __version__ — setattr on
