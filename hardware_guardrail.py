@@ -31,27 +31,25 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 
+from vt_config import config as vt_config
+
 
 # Safety multiplier: actual RAM usage is typically 1.2-1.5x the model
-# file size (KV cache + runtime overhead). We use 1.5x to be conservative
-# and avoid OOM on edge-case hardware.
-_RAM_SAFETY_MULTIPLIER = 1.5
+# file size (KV cache + runtime overhead). Configurable via env var
+# VIBE_THINKER_RAM_SAFETY_MULTIPLIER (default 1.5).
+_RAM_SAFETY_MULTIPLIER = vt_config.ram_safety_multiplier
 
-# KV cache RAM per token per layer (bytes). This is intentionally
-# conservative — actual KV cache size depends on the model's hidden
-# dimension, number of attention heads, and quantization. For a typical
-# 7B model with 4096 hidden dim, 32 layers, and q8_0 K + turbo3 V
-# cache, the actual KV cache is ~0.5-2 KB per token per layer. We use
-# 1 KB as a round, conservative estimate that overestimates slightly
-# (safe — better to refuse a load than to OOM-crash).
-_KV_CACHE_BYTES_PER_TOKEN_PER_LAYER = 1024
+# KV cache RAM per token per layer (bytes). Configurable via env var
+# VIBE_THINKER_KV_CACHE_BYTES (default 1024).
+_KV_CACHE_BYTES_PER_TOKEN_PER_LAYER = vt_config.kv_cache_bytes_per_token_per_layer
 
 # Default layer count for estimating KV cache (most 3B-7B models have
-# 32-40 layers). Used only when we can't determine the actual count.
-_DEFAULT_LAYERS = 32
+# 32-40 layers). Configurable via env var VIBE_THINKER_DEFAULT_LAYERS.
+_DEFAULT_LAYERS = vt_config.default_layers
 
-# Conservative static RAM cap when psutil is not installed.
-_FALLBACK_AVAILABLE_RAM_MB = 4096
+# Conservative static RAM cap when psutil is not installed. Configurable
+# via env var VIBE_THINKER_FALLBACK_RAM_MB (default 4096).
+_FALLBACK_AVAILABLE_RAM_MB = vt_config.fallback_available_ram_mb
 
 
 @dataclass

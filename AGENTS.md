@@ -1,7 +1,7 @@
 # vibe-thinker — project notes for agents
 
 ## Verify / test
-- Full suite: `python3 -m pytest -q` (~1170 tests, ~180s, no live servers needed)
+- Full suite: `python3 -m pytest -q` (~1173 tests, ~110s, no live servers needed)
 - Routing + REPL only: `python3 -m pytest tests/test_routing.py tests/test_repl.py -q`
 - Format enforcer + chat transports + repair loop: `python3 -m pytest tests/test_format_enforcer.py -q`
 - Citation-backed NLI factual verifier: `python3 -m pytest tests/test_factual_verifier.py -q`
@@ -1303,3 +1303,89 @@ new flags are used.
   `--sona-sync-interval` / `SONA_SYNC_INTERVAL` (default 3600s).
 - Tests: `tests/test_sona_gossip.py` (8 tests: endpoint POST/GET,
   pattern dedup, orchestrator export/import, disabled state).
+
+## Phase 5: Hardening (security, reliability, operational maturity)
+
+### Track 1: Security hardening
+- **Vulnerable dependency pins**: `aiohttp>=3.10.11` (CVE-2024-52304),
+  `fastapi>=0.109.1` (CVE-2024-24762 ReDoS), `cryptography>=43.0.1`
+  (CVE-2024-6119). Updated in `requirements.txt` and `pyproject.toml`.
+- **Safe Z3 constraint parsing**: Replaced bypassable `eval()` in
+  `verifiers/logic_verifier.py` with `_SafeZ3Evaluator` — an AST-based
+  whitelist evaluator that only allows arithmetic, comparisons, boolean
+  ops, and calls to predefined Z3 functions. Prevents code injection via
+  Python introspection (e.g. `().__class__.__base__.__subclasses__()`).
+- **API key authentication** (`web_security.py`): Shared middleware for
+  both `federation_server.py` and `web/app.py`. Header-based (`X-API-Key`),
+  constant-time comparison (`hmac.compare_digest`), env var fallback
+  (`VIBE_THINKER_API_KEY`). CLI flag `--api-key` on federation server.
+  Health endpoint exempted.
+- **CORS configuration**: Explicit allowed origins (localhost by default).
+  Configurable via `allowed_origins` parameter.
+- **Rate limiting**: In-memory sliding-window per-IP limiter. Configurable
+  via `--rate-limit` CLI flag (requests per minute, 0=disabled).
+- **Request body size limits**: Configurable via `--max-body-bytes`.
+  Returns 413 when exceeded.
+- **Input validation on federation endpoints**: Query length (max 10000),
+  job_id format (alphanumeric/underscore/hyphen), worker_id format,
+  priority range, error message length. Returns 400 on invalid input.
+- **Input validation on web UI**: Query length limit (10000 chars).
+- **Error message sanitization**: Web UI returns generic "internal error"
+  to clients; full exception logged server-side only.
+- **Federation secret logging**: Removed mention of "federation_secret"
+  from log messages; now says "encryption configured" generically.
+- **Sandbox entrypoint.sh**: Replaced `eval "$rule"` with validated
+  execution — rules must start with `iptables ` and contain no shell
+  metacharacters (`;|&\`$(){}`). Prevents command injection via
+  `VT_IPTABLES_RULES` env var.
+- **TLS warnings**: Federation server now emits `warnings.warn()` when
+  running without TLS or without API key auth.
+
+### Track 2: Reliability
+- **Reaper task shutdown handler**: Added `@app.on_event("shutdown")` to
+  cancel the background reaper task. Previously the reaper leaked on
+  server shutdown.
+- **Timeout consistency**: Reaper timeout changed from 300s to 180s
+  (3x heartbeat interval of 60s). This is well below the job execution
+  timeout (600s), preventing the race where a slow worker is reaped
+  while still legitimately processing.
+- **State-transition guard in `complete()`**: Both `InMemoryFederationState`
+  and `RedisFederationState` now reject completions for jobs already in
+  "done" or "error" state. Prevents stale workers from overwriting
+  results after a reaper re-queue.
+- **CLR cache save() lock**: Added `threading.Lock` to `CLRResultCache`
+  and `VerifiedTrajectoryStore` `save()` methods. Prevents concurrent
+  autosave calls from racing on the atomic write.
+- **ShadowVectorStore retry tracking**: Failed secondary writes are now
+  tracked in `_failed_writes` set. `reconcile_failed_writes()` method
+  for periodic reconciliation. `failed_write_count` property for
+  monitoring.
+- **Z3 value type validation**: `_translate_logic_constraints` now
+  validates that values are numeric (int/float/bool) before returning.
+  Non-numeric values (e.g. "seven") are dropped with a warning instead
+  of causing a confusing Z3 substitution error.
+
+### Track 3: Operational maturity
+- **Structured logging module** (`vt_logging.py`): Component-based
+  loggers with consistent format (timestamp, level, component, message).
+  Level control via `VIBE_THINKER_LOG_LEVEL` env var (default INFO).
+  Existing `print()` statements can be incrementally migrated.
+- **Config module** (`vt_config.py`): Centralized hardcoded timeouts,
+  intervals, and limits with env var overrides. Covers federation
+  timing (claim poll, heartbeat, job timeout, reaper timeout), sandbox
+  timeout, HTTP timeouts, hardware guardrail parameters, and input
+  validation limits. All overridable via `VIBE_THINKER_*` env vars.
+- **Shared embedding model singleton** (`get_shared_embedding_model`):
+  `CLRResultCache`, `VerifiedTrajectoryStore`, and `EmbeddingRouter` now
+  share a single `SentenceTransformer` instance per model name, reducing
+  memory usage by ~200-600MB. Cache clearable via
+  `_clear_embedding_model_cache()` (for tests).
+- **Connection pooling**: `FederatedJobQueue` now creates a shared
+  `aiohttp.ClientSession` in `start()` and reuses it in the claim loop,
+  avoiding TCP handshake overhead on every poll. Closed in `stop()`.
+- **Shared serialization utility** (`serialization.py`):
+  `serialize_for_json()` and `serialize_result_dict()` extracted from
+  duplicated code in `web/app.py` and `federated_queue.py`.
+- **Mutation operator refactor**: `_swap_constants` in
+  `verifiers/mutation.py` refactored from unreadable one-liners to
+  clear multi-line logic with proper indentation and comments.

@@ -33,6 +33,7 @@ Requires the optional ``z3-solver`` package:
 
 from __future__ import annotations
 
+import ast
 from typing import Any, Dict, List, Optional
 
 from verifiers.base import VerificationResult
@@ -252,16 +253,23 @@ class LogicVerifier:
     def _parse_constraint(expr_str: str, z3_vars: Dict[str, Any]):
         """Parse a constraint string into a Z3 boolean expression.
 
-        Uses z3.parse_smt2_string when possible; otherwise evals in a
-        restricted namespace containing only the Z3 variables.
+        Uses a safe AST-based evaluator instead of eval() to prevent
+        code injection via Python introspection (e.g. accessing builtins
+        through ``().__class__.__base__.__subclasses__()``).
+
+        Only allows:
+          - Names referencing Z3 variables or whitelisted Z3 functions
+          - Arithmetic (+, -, *, /, unary -)
+          - Comparisons (==, !=, <, >, <=, >=)
+          - Boolean ops (and, or, not)
+          - Calls to whitelisted Z3 functions (And, Or, Not, Implies, etc.)
+          - Integer, float, and boolean literals
+
+        Attribute access (``.``), subscripts (``[]``), comprehensions,
+        lambdas, imports, and any other constructs are rejected.
         """
-        # Build a namespace with the Z3 vars + common Z3 boolean ops.
         namespace = {
             **z3_vars,
-            "z3": z3,
-            # Expose common Z3 boolean functions directly so constraint
-            # strings like "Implies(a, b)" and "Not(a)" parse without
-            # requiring a "z3." prefix.
             "And": z3.And,
             "Or": z3.Or,
             "Not": z3.Not,
@@ -271,8 +279,13 @@ class LogicVerifier:
             "True": z3.BoolVal(True),
             "False": z3.BoolVal(False),
         }
-        # z3.Int/Real overloads make arithmetic work directly.
-        return eval(expr_str, {"__builtins__": {}}, namespace)
+        try:
+            tree = ast.parse(expr_str, mode="eval")
+        except SyntaxError as e:
+            raise ValueError(f"invalid constraint syntax: {e}")
+
+        evaluator = _SafeZ3Evaluator(namespace)
+        return evaluator.visit(tree.body)
 
     @staticmethod
     def _make_value(val: Any):
@@ -285,3 +298,156 @@ class LogicVerifier:
             return z3.RealVal(val)
         # Fallback: let Z3 infer.
         return z3.RealVal(str(val))
+
+
+class _SafeZ3Evaluator(ast.NodeVisitor):
+    """Safe AST evaluator for Z3 constraint strings.
+
+    Replaces ``eval()`` with a whitelist-based approach that only allows
+    arithmetic, comparisons, boolean ops, and calls to predefined Z3
+    functions. This prevents code injection through Python's object
+    introspection (e.g. ``().__class__.__base__.__subclasses__()``).
+    """
+
+    # AST node types that are allowed (everything else raises).
+    _ALLOWED_NODES = (
+        ast.Expression,
+        ast.BinOp,
+        ast.UnaryOp,
+        ast.Compare,
+        ast.BoolOp,
+        ast.Name,
+        ast.Constant,
+        ast.Call,
+        ast.Load,
+    )
+
+    # Binary operators supported.
+    _BIN_OPS = {
+        ast.Add: lambda a, b: a + b,
+        ast.Sub: lambda a, b: a - b,
+        ast.Mult: lambda a, b: a * b,
+        ast.Div: lambda a, b: a / b,
+        ast.Mod: lambda a, b: a % b,
+        ast.Pow: lambda a, b: a ** b,
+    }
+
+    # Unary operators. Note: `Not` is handled separately in visit_UnaryOp
+    # because Z3 BoolRef requires z3.Not() rather than Python's `~`.
+    _UNARY_OPS = {
+        ast.UAdd: lambda a: +a,
+        ast.USub: lambda a: -a,
+    }
+
+    # Comparison operators.
+    _CMP_OPS = {
+        ast.Eq: lambda a, b: a == b,
+        ast.NotEq: lambda a, b: a != b,
+        ast.Lt: lambda a, b: a < b,
+        ast.LtE: lambda a, b: a <= b,
+        ast.Gt: lambda a, b: a > b,
+        ast.GtE: lambda a, b: a >= b,
+    }
+
+    # Boolean operators.
+    _BOOL_OPS = {
+        ast.And: all,
+        ast.Or: any,
+    }
+
+    def __init__(self, namespace: Dict[str, Any]):
+        self._ns = namespace
+
+    def visit(self, node: ast.AST) -> Any:
+        if not isinstance(node, self._ALLOWED_NODES):
+            raise ValueError(
+                f"disallowed AST node: {type(node).__name__} — "
+                f"only arithmetic, comparisons, boolean ops, and "
+                f"calls to Z3 functions are allowed"
+            )
+        return super().visit(node)
+
+    def visit_Expression(self, node: ast.Expression) -> Any:
+        return self.visit(node.body)
+
+    def visit_Constant(self, node: ast.Constant) -> Any:
+        if isinstance(node.value, (int, float, bool)):
+            return node.value
+        raise ValueError(
+            f"only int, float, and bool literals are allowed, "
+            f"got {type(node.value).__name__}"
+        )
+
+    def visit_Name(self, node: ast.Name) -> Any:
+        if node.id not in self._ns:
+            raise ValueError(
+                f"undefined name: {node.id!r} — only declared Z3 "
+                f"variables and whitelisted Z3 functions are allowed"
+            )
+        return self._ns[node.id]
+
+    def visit_BinOp(self, node: ast.BinOp) -> Any:
+        left = self.visit(node.left)
+        right = self.visit(node.right)
+        op_fn = self._BIN_OPS.get(type(node.op))
+        if op_fn is None:
+            raise ValueError(f"unsupported binary operator: {type(node.op).__name__}")
+        return op_fn(left, right)
+
+    def visit_UnaryOp(self, node: ast.UnaryOp) -> Any:
+        operand = self.visit(node.operand)
+        if isinstance(node.op, ast.Not):
+            # Z3 BoolRef requires z3.Not(); Python `~` doesn't work.
+            try:
+                import z3 as _z3
+                if isinstance(operand, _z3.BoolRef):
+                    return _z3.Not(operand)
+            except Exception:
+                pass
+            return not operand
+        op_fn = self._UNARY_OPS.get(type(node.op))
+        if op_fn is None:
+            raise ValueError(f"unsupported unary operator: {type(node.op).__name__}")
+        return op_fn(operand)
+
+    def visit_Compare(self, node: ast.Compare) -> Any:
+        left = self.visit(node.left)
+        for op, comparator in zip(node.ops, node.comparators):
+            right = self.visit(comparator)
+            op_fn = self._CMP_OPS.get(type(op))
+            if op_fn is None:
+                raise ValueError(f"unsupported comparison: {type(op).__name__}")
+            left = op_fn(left, right)
+        return left
+
+    def visit_BoolOp(self, node: ast.BoolOp) -> Any:
+        # For Z3, And/Or are functions that accept symbolic BoolRefs.
+        # We use the Z3 functions directly from the namespace when available,
+        # otherwise fall back to Python all()/any().
+        values = [self.visit(v) for v in node.values]
+        if isinstance(node.op, ast.And):
+            # Use z3.And if any value is a Z3 expression, else Python all.
+            try:
+                import z3 as _z3
+                if any(isinstance(v, _z3.BoolRef) for v in values):
+                    return _z3.And(*values)
+            except Exception:
+                pass
+            return all(values)
+        elif isinstance(node.op, ast.Or):
+            try:
+                import z3 as _z3
+                if any(isinstance(v, _z3.BoolRef) for v in values):
+                    return _z3.Or(*values)
+            except Exception:
+                pass
+            return any(values)
+        raise ValueError(f"unsupported boolean operator: {type(node.op).__name__}")
+
+    def visit_Call(self, node: ast.Call) -> Any:
+        func = self.visit(node.func)
+        args = [self.visit(a) for a in node.args]
+        # Keyword args are not allowed (keeps it simple + safe).
+        if node.keywords:
+            raise ValueError("keyword arguments are not allowed in constraints")
+        return func(*args)

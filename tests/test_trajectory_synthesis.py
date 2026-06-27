@@ -6,7 +6,16 @@ import numpy as np
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from persistent_cache import VerifiedTrajectoryStore
+from persistent_cache import VerifiedTrajectoryStore, _clear_embedding_model_cache
+
+
+@pytest.fixture(autouse=True)
+def _clear_model_cache():
+    """Clear the shared embedding model cache before each test so mocks
+    are used instead of cached real models (Phase 5 singleton fix)."""
+    _clear_embedding_model_cache()
+    yield
+    _clear_embedding_model_cache()
 
 
 def _mock_encode(embedding):

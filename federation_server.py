@@ -28,13 +28,26 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 
+# Input validation constants.
+_MAX_QUERY_LEN = 10000
+_MAX_JOB_ID_LEN = 128
+_MAX_WORKER_ID_LEN = 128
+_MAX_ERROR_LEN = 5000
+_MAX_PRIORITY = 1000
+_JOB_ID_RE = re.compile(r"^[a-zA-Z0-9_\-]{1,128}$")
+_WORKER_ID_RE = re.compile(r"^[a-zA-Z0-9_\-\.]{1,128}$")
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+
+from web_security import configure_security
+from vt_config import config as vt_config
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +163,12 @@ class InMemoryFederationState:
         async with self._lock:
             job = self._jobs.get(job_id)
             if not job:
+                return False
+            # State-transition guard: reject completions for jobs that are
+            # already done or errored. This prevents a stale worker from
+            # overwriting a completed job's result (e.g. after a reaper
+            # re-queued and another worker already completed it).
+            if job.status in ("done", "error"):
                 return False
             job.status = "error" if error else "done"
             job.result = result
@@ -519,6 +538,14 @@ class RedisFederationState:
         exists = await self._redis.exists(key)
         if not exists:
             return False
+        # State-transition guard: reject completions for jobs already
+        # done or errored (prevents stale workers from overwriting results).
+        current_status = await self._redis.hget(key, "status")
+        if current_status:
+            if isinstance(current_status, bytes):
+                current_status = current_status.decode()
+            if current_status in ("done", "error"):
+                return False
         status = "error" if error else "done"
         mapping: Dict[str, str] = {
             "status": status,
@@ -653,6 +680,10 @@ def make_federation_state(
 def create_federation_app(
     state: Optional[FederationStateProtocol] = None,
     federation_secret: Optional[str] = None,
+    api_key: Optional[str] = None,
+    allowed_origins: Optional[List[str]] = None,
+    rate_limit_per_minute: int = 0,
+    max_request_body_bytes: int = 0,
 ) -> FastAPI:
     """Create the federation server FastAPI app.
 
@@ -664,10 +695,26 @@ def create_federation_app(
         federation_secret: v3.0 zero-trust encryption secret. When set,
             the server decrypts incoming payloads encrypted with the
             same secret by worker nodes. See FederatedJobQueue.
+        api_key: If set, all requests must include ``X-API-Key`` header.
+            If None, checks ``VIBE_THINKER_API_KEY`` env var. If neither
+            is set, auth is skipped (dev mode only).
+        allowed_origins: CORS allowed origins. None = localhost only.
+        rate_limit_per_minute: Max requests per IP per minute. 0 = disabled.
+        max_request_body_bytes: Max request body size. 0 = disabled.
     """
     app = FastAPI(title="vibe-thinker federation", docs_url="/docs")
     if state is None:
         state = InMemoryFederationState()
+
+    # Security middleware: API key auth, CORS, rate limiting, body size.
+    configure_security(
+        app,
+        api_key=api_key,
+        allowed_origins=allowed_origins,
+        rate_limit_per_minute=rate_limit_per_minute,
+        max_request_body_bytes=max_request_body_bytes,
+        exempt_paths={"/health"},
+    )
 
     # v3.0: Set up decryption if a secret is provided.
     _fernet = None
@@ -716,10 +763,31 @@ def create_federation_app(
     async def submit_job(req: Request):
         body = await req.json()
         body = _decrypt(body)
+        query = body.get("query", "")
+        if not query or not isinstance(query, str):
+            return JSONResponse({"error": "query is required"}, status_code=400)
+        if len(query) > _MAX_QUERY_LEN:
+            return JSONResponse(
+                {"error": f"query too long (max {_MAX_QUERY_LEN} chars)"},
+                status_code=400,
+            )
+        job_id = body.get("job_id", "")
+        if job_id and not _JOB_ID_RE.match(job_id):
+            return JSONResponse(
+                {"error": "job_id must be alphanumeric/underscore/hyphen, "
+                 f"max {_MAX_JOB_ID_LEN} chars"},
+                status_code=400,
+            )
+        priority = body.get("priority", 0)
+        if not isinstance(priority, int) or abs(priority) > _MAX_PRIORITY:
+            return JSONResponse(
+                {"error": f"priority must be an integer in [{-_MAX_PRIORITY}, {_MAX_PRIORITY}]"},
+                status_code=400,
+            )
         job = await state.submit(
-            job_id=body.get("job_id", ""),
-            query=body.get("query", ""),
-            priority=body.get("priority", 0),
+            job_id=job_id,
+            query=query,
+            priority=priority,
             force_route=body.get("force_route"),
             submitted_by=body.get("submitted_by", ""),
         )
@@ -729,6 +797,12 @@ def create_federation_app(
     async def claim_job(req: Request):
         body = await req.json()
         worker_id = body.get("worker_id", "unknown")
+        if not isinstance(worker_id, str) or not _WORKER_ID_RE.match(worker_id):
+            return JSONResponse(
+                {"error": "worker_id must be alphanumeric/underscore/hyphen/dot, "
+                 f"max {_MAX_WORKER_ID_LEN} chars"},
+                status_code=400,
+            )
         job = await state.claim(worker_id)
         if job is None:
             return {"job_id": None, "status": "no_jobs"}
@@ -745,8 +819,17 @@ def create_federation_app(
         body = await req.json()
         body = _decrypt(body)
         job_id = body.get("job_id", "")
+        if not job_id or not isinstance(job_id, str):
+            return JSONResponse({"error": "job_id is required"}, status_code=400)
         result = body.get("result")
         error = body.get("error")
+        if error and not isinstance(error, str):
+            return JSONResponse({"error": "error must be a string"}, status_code=400)
+        if error and len(error) > _MAX_ERROR_LEN:
+            return JSONResponse(
+                {"error": f"error message too long (max {_MAX_ERROR_LEN} chars)"},
+                status_code=400,
+            )
         ok = await state.complete(job_id, result=result, error=error)
         if not ok:
             return JSONResponse({"error": "job not found"}, status_code=404)
@@ -761,7 +844,14 @@ def create_federation_app(
         body = await req.json()
         body = _decrypt(body)
         job_id = body.get("job_id", "")
+        if not job_id or not isinstance(job_id, str):
+            return JSONResponse({"error": "job_id is required"}, status_code=400)
         worker_id = body.get("worker_id", "unknown")
+        if not isinstance(worker_id, str) or not _WORKER_ID_RE.match(worker_id):
+            return JSONResponse(
+                {"error": "invalid worker_id"},
+                status_code=400,
+            )
         ok = await state.heartbeat(job_id, worker_id)
         if not ok:
             return JSONResponse(
@@ -773,7 +863,17 @@ def create_federation_app(
     # Phase 4.2: Background reaper task — periodically scans for stale
     # claims and re-queues them. Runs every claim_timeout / 2 seconds
     # (so a zombie is detected within ~1.5x the timeout).
-    _reaper_claim_timeout = 300.0  # 5 minutes (configurable below)
+    #
+    # Timeout consistency (Phase 5 reliability fix):
+    #   - reaper_claim_timeout = 180s (3x heartbeat interval of 60s)
+    #   - This is well below the job execution timeout (600s in
+    #     FederatedJobQueue), ensuring the reaper re-queues a zombie
+    #     BEFORE the job execution timeout expires. Previously the
+    #     reaper timeout (300s) was close to the job timeout (600s),
+    #     which could cause duplicate work if a slow worker was
+    #     mistakenly reaped.
+    _reaper_claim_timeout = vt_config.reaper_claim_timeout  # 3x heartbeat
+    _reaper_task: Optional[asyncio.Task] = None
 
     @app.on_event("startup")
     async def _start_reaper():
@@ -792,7 +892,21 @@ def create_federation_app(
                 except Exception as e:
                     print(f"[Federation] Reaper error: {e}")
 
-        asyncio.create_task(_reaper_loop())
+        # Store the task so the shutdown handler can cancel it.
+        nonlocal _reaper_task
+        _reaper_task = asyncio.create_task(_reaper_loop())
+
+    @app.on_event("shutdown")
+    async def _stop_reaper():
+        """Cancel the reaper task on shutdown to prevent resource leaks."""
+        nonlocal _reaper_task
+        if _reaper_task is not None:
+            _reaper_task.cancel()
+            try:
+                await _reaper_task
+            except asyncio.CancelledError:
+                pass
+            _reaper_task = None
 
     @app.get("/jobs")
     async def list_jobs():
@@ -902,15 +1016,46 @@ def main():
         "--no-redis", action="store_true",
         help="Force in-memory state even if --redis-url is set (dev/testing).",
     )
+    parser.add_argument(
+        "--api-key", default="",
+        help="API key for authenticating federation requests. If not set, "
+             "checks VIBE_THINKER_API_KEY env var. If neither is set, "
+             "auth is disabled (dev mode only — NOT for production).",
+    )
+    parser.add_argument(
+        "--rate-limit", type=int, default=0,
+        help="Max requests per IP per minute. 0 = disabled (default).",
+    )
+    parser.add_argument(
+        "--max-body-bytes", type=int, default=0,
+        help="Max request body size in bytes. 0 = disabled (default).",
+    )
     args = parser.parse_args()
 
     redis_url = "" if args.no_redis else (args.redis_url or "").strip()
     state = make_federation_state(redis_url=redis_url)
     backend = "redis" if redis_url else "in-memory"
-    app = create_federation_app(state=state)
+    app = create_federation_app(
+        state=state,
+        api_key=args.api_key or None,
+        rate_limit_per_minute=args.rate_limit,
+        max_request_body_bytes=args.max_body_bytes,
+    )
     print(f"[Federation] State backend: {backend}")
 
     if args.no_tls or not args.mtls_cert:
+        import warnings
+        warnings.warn(
+            "Federation server running WITHOUT TLS — this is insecure. "
+            "Use --mtls-cert/--mtls-key/--mtls-ca for production.",
+            stacklevel=2,
+        )
+        if not (args.api_key or os.environ.get("VIBE_THINKER_API_KEY")):
+            warnings.warn(
+                "No API key configured — federation endpoints are "
+                "unauthenticated. Set --api-key or VIBE_THINKER_API_KEY.",
+                stacklevel=2,
+            )
         print(f"[Federation] Running WITHOUT TLS (dev mode) on {args.host}:{args.port}")
         uvicorn.run(app, host=args.host, port=args.port)
         return

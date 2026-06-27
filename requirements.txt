@@ -1,9 +1,9 @@
 # Core async HTTP + env config (required)
-aiohttp>=3.9,<4
+aiohttp>=3.10.11,<4
 python-dotenv>=1.0,<2
 
 # Optional: web UI + federation server
-fastapi>=0.100,<1
+fastapi>=0.109.1,<1
 uvicorn>=0.23,<1
 
 # Optional: HA federation (Redis-backed coordinator state + web UI Pub/Sub
@@ -36,7 +36,7 @@ llama-cpp-python>=0.2.70,<1
 # Only needed for SLSA L2 compliant provenance (Ed25519Signer). Without it,
 # the audit log uses HMAC-SHA256 (symmetric, stdlib) — the v0.3.8 default.
 # Install with: pip install cryptography
-cryptography>=42,<46
+cryptography>=43.0.1,<46
 
 # Optional: free factual retrieval backends (v3.1).
 # When paid Serper/SearchApi keys are absent, the FactualVerifier falls back

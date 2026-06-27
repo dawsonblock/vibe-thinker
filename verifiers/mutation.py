@@ -159,8 +159,8 @@ def _swap_constants(source: str) -> Optional[Tuple[str, str]]:
     # the same line at different columns.
     line1 = lines[l1 - 1]
     line2 = lines[l2 - 1]
-    # Replace v1 with v2 and v2 with v1. Use a placeholder to avoid
-    # double-replacement when both are on the same line.
+    # Use a unique placeholder to avoid double-replacement when both
+    # constants appear on the same line.
     placeholder = "\x00SWAP\x00"
     if l1 == l2:
         # Same line: replace by column position.
@@ -171,8 +171,30 @@ def _swap_constants(source: str) -> Optional[Tuple[str, str]]:
             line1 = line1[:col] + line1[col:].replace(old_v, new_v, 1)
         lines[l1 - 1] = line1
     else:
-        lines[l1 - 1] = line1[:c1] + line1[c1:].replace(v1, placeholder, 1).replace(v2, v1, 1).replace(placeholder, v2, 1) if v2 in line1 else line1[:c1] + line1[c1:].replace(v1, v2, 1)
-        lines[l2 - 1] = line2[:c2] + line2[c2:].replace(v2, placeholder, 1).replace(v1, v2, 1).replace(placeholder, v1, 1) if v1 in line2 else line2[:c2] + line2[c2:].replace(v2, v1, 1)
+        # Different lines: use placeholder to swap v1→v2 on line 1 and
+        # v2→v1 on line 2, handling the case where the other constant
+        # also appears on the same line.
+        if v2 in line1:
+            line1 = (
+                line1[:c1]
+                + line1[c1:].replace(v1, placeholder, 1)
+                .replace(v2, v1, 1)
+                .replace(placeholder, v2, 1)
+            )
+        else:
+            line1 = line1[:c1] + line1[c1:].replace(v1, v2, 1)
+        lines[l1 - 1] = line1
+
+        if v1 in line2:
+            line2 = (
+                line2[:c2]
+                + line2[c2:].replace(v2, placeholder, 1)
+                .replace(v1, v2, 1)
+                .replace(placeholder, v1, 1)
+            )
+        else:
+            line2 = line2[:c2] + line2[c2:].replace(v2, v1, 1)
+        lines[l2 - 1] = line2
     mutated = "".join(lines)
     return mutated, f"swapped constants {v1} and {v2}"
 

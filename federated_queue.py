@@ -54,33 +54,18 @@ import os
 from typing import Any, Callable, Dict, List, Optional, Protocol, runtime_checkable
 
 from rfsn_job_queue import Job, JobStatus, JobQueue
+from serialization import serialize_result_dict
+from vt_config import config as vt_config
 
 
 def _serialize_result(result) -> Dict[str, Any]:
     """Serialize an OrchestratorResult to a JSON-safe dict for federation.
 
-    Handles nested non-serializable objects (e.g. CLRResult in raw_traces)
-    by falling back to str() for anything json.dumps can't handle —
-    mirroring the pattern in HybridReasoningOrchestrator.log_to_memory.
+    Delegates to the shared ``serialization.serialize_result_dict`` utility
+    (Phase 5 dedup). Handles nested non-serializable objects by falling
+    back to str() for anything json.dumps can't handle.
     """
-    if result is None:
-        return {}
-    if hasattr(result, "__dict__"):
-        raw = dict(result.__dict__)
-    elif isinstance(result, dict):
-        raw = result
-    else:
-        return {"result": str(result)}
-    # Round-trip through json.dumps with default=str to ensure
-    # everything is JSON-serializable. Non-serializable values
-    # (e.g. nested dataclasses, datetime, etc.) become strings.
-    try:
-        json.dumps(raw, default=str)
-        return raw
-    except (TypeError, ValueError):
-        # Fallback: convert all values to strings if needed.
-        return {k: v if isinstance(v, (str, int, float, bool, type(None))) else str(v)
-                for k, v in raw.items()}
+    return serialize_result_dict(result)
 
 
 @runtime_checkable
@@ -310,12 +295,11 @@ class FederatedJobQueue:
                     hashlib.sha256(federation_secret.encode()).digest()
                 )
                 self._fernet = Fernet(key)
-                print("[FederatedQueue] Zero-trust encryption enabled "
-                      "(Fernet AEAD)")
+                print("[FederatedQueue] Federation encryption enabled")
             except ImportError:
-                print("[FederatedQueue] Warning: federation_secret provided "
+                print("[FederatedQueue] Warning: encryption configured "
                       "but cryptography package not installed — payloads "
-                      "will be sent in plaintext")
+                      "will be sent unencrypted")
 
         # Local fallback queue — always present. When the federation is
         # down, all jobs run here. When it's up, this node's spare
@@ -548,7 +532,7 @@ class FederatedJobQueue:
         timeout = aiohttp.ClientTimeout(total=10.0)
         while True:
             try:
-                await asyncio.sleep(2.0)  # poll interval
+                await asyncio.sleep(vt_config.claim_poll_interval)
                 if not self._federation_configured():
                     continue
                 # Try each HA coordinator URL (sticky-first) until one
@@ -559,7 +543,10 @@ class FederatedJobQueue:
                 claimed = False
                 for url in self._federation_url_order():
                     try:
-                        async with aiohttp.ClientSession(timeout=timeout) as session:
+                        # Phase 5: use shared session for connection pooling
+                        # when available; fall back to a temporary session.
+                        session = getattr(self, "_http_session", None)
+                        if session is not None and not session.closed:
                             async with session.post(
                                 f"{url}/claim",
                                 json={"worker_id": self._node_id},
@@ -584,15 +571,42 @@ class FederatedJobQueue:
                                 )
                                 print(f"[FederatedQueue] Claimed job {remote_job_id} "
                                       f"from federation ({url}), running locally as {job.job_id}")
-                                # NOTE: _claim_and_report creates its own
-                                # session because this one closes at the
-                                # end of the `async with` block.
                                 asyncio.create_task(
                                     self._claim_and_report(
                                         ctx, remote_job_id, job.job_id, url,
                                     )
                                 )
                                 break  # claimed one; done this poll cycle
+                        else:
+                            # Fallback: create a temporary session.
+                            async with aiohttp.ClientSession(timeout=timeout) as tmp_session:
+                                async with tmp_session.post(
+                                    f"{url}/claim",
+                                    json={"worker_id": self._node_id},
+                                    ssl=ctx,
+                                ) as resp:
+                                    if resp.status >= 400:
+                                        continue
+                                    data = await resp.json()
+                                    data = self._decrypt_payload(data)
+                                    if not data.get("job_id"):
+                                        continue
+                                    self._mark_url_success(url)
+                                    claimed = True
+                                    remote_job_id = data["job_id"]
+                                    job = self._local.submit(
+                                        data["query"],
+                                        priority=data.get("priority", 0),
+                                        force_route=data.get("force_route"),
+                                    )
+                                    print(f"[FederatedQueue] Claimed job {remote_job_id} "
+                                          f"from federation ({url}), running locally as {job.job_id}")
+                                    asyncio.create_task(
+                                        self._claim_and_report(
+                                            ctx, remote_job_id, job.job_id, url,
+                                        )
+                                    )
+                                    break
                     except Exception:
                         continue
                 # `claimed` is informational; the loop polls regardless.
@@ -633,7 +647,7 @@ class FederatedJobQueue:
         # is 300s, so 60s gives a 5x safety margin). The loop stops when
         # the job completes or the heartbeat POST fails 3 times in a row
         # (the coordinator may have re-queued the job already).
-        heartbeat_interval = 60.0
+        heartbeat_interval = vt_config.heartbeat_interval
         heartbeat_failures = 0
         heartbeat_stop = asyncio.Event()
 
@@ -668,7 +682,7 @@ class FederatedJobQueue:
         heartbeat_task = asyncio.create_task(_heartbeat_loop())
 
         try:
-            result = await self._local.wait_for(local_job_id, timeout=600.0)
+            result = await self._local.wait_for(local_job_id, timeout=vt_config.job_execution_timeout)
             payload = self._encrypt_payload({
                 "job_id": remote_job_id,
                 "result": _serialize_result(result),
@@ -727,6 +741,11 @@ class FederatedJobQueue:
     async def start(self) -> None:
         await self._local.start()
         if self._federation_configured():
+            # Phase 5: create a shared HTTP session for connection pooling.
+            # This avoids TCP handshake overhead on every request.
+            self._http_session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=vt_config.http_timeout)
+            )
             print(f"[FederatedQueue] Started (node={self._node_id}, "
                   f"federation={self._federation_url})")
             # Start the claim loop — this node will pull jobs from the
@@ -743,6 +762,10 @@ class FederatedJobQueue:
                 await self._claim_task
             except asyncio.CancelledError:
                 pass
+        # Phase 5: close the shared HTTP session.
+        if hasattr(self, "_http_session") and self._http_session is not None:
+            await self._http_session.close()
+            self._http_session = None
         await self._local.stop()
 
     def submit(

@@ -153,7 +153,8 @@ class EmbeddingRouter:
             )
 
         print(f"[EmbeddingRouter] Loading {model_name} with cache_size={cache_size}")
-        self.model = SentenceTransformer(model_name)
+        from persistent_cache import get_shared_embedding_model
+        self.model = get_shared_embedding_model(model_name)
         self.cache_size = cache_size
         self.model_name = model_name
 
@@ -2123,6 +2124,15 @@ class HybridReasoningOrchestrator:
             values = result.get("values", {})
             if not isinstance(values, dict):
                 values = {}
+            # Phase 5: validate that values are numeric (int/float/bool).
+            # Non-numeric values (e.g. "seven") would fail at Z3 substitution
+            # time with a confusing error. Fail-closed here instead.
+            for k, v in values.items():
+                if not isinstance(v, (int, float, bool)):
+                    print(f"[CLR] Logic constraint translation: non-numeric "
+                          f"value for {k!r}: {v!r} — dropping values")
+                    values = {}
+                    break
             return {
                 "constraints": constraints,
                 "variables": variables,

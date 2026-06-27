@@ -24,26 +24,20 @@ from fastapi.staticfiles import StaticFiles
 
 from hybrid_orchestrator import HybridReasoningOrchestrator
 from sandbox.network_allowlist import NetworkAllowList
+from serialization import serialize_for_json
+from web_security import configure_security
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _serialize(obj: Any) -> Any:
-    """Recursively convert dataclasses / sets / bytes to JSON-safe values."""
-    if is_dataclass(obj) and not isinstance(obj, type):
-        return {k: _serialize(v) for k, v in asdict(obj).items()}
-    if isinstance(obj, dict):
-        return {k: _serialize(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_serialize(v) for v in obj]
-    if isinstance(obj, set):
-        return [_serialize(v) for v in obj]
-    if isinstance(obj, bytes):
-        return obj.decode("utf-8", errors="replace")
-    if isinstance(obj, (int, float, str, bool, type(None))):
-        return obj
-    return str(obj)
+    """Recursively convert dataclasses / sets / bytes to JSON-safe values.
+
+    Delegates to the shared ``serialization.serialize_for_json`` utility
+    (Phase 5 dedup). Kept as a thin wrapper for backward compatibility.
+    """
+    return serialize_for_json(obj)
 
 
 def _load_jsonl(path: str) -> List[Dict]:
@@ -339,6 +333,10 @@ def create_app(
     orchestrator: HybridReasoningOrchestrator,
     redis_url: Optional[str] = None,
     redis_client: Any = None,
+    api_key: Optional[str] = None,
+    allowed_origins: Optional[List[str]] = None,
+    rate_limit_per_minute: int = 0,
+    max_request_body_bytes: int = 0,
 ) -> FastAPI:
     """Create the vibe-thinker web UI FastAPI app.
 
@@ -351,8 +349,22 @@ def create_app(
             sent only to this server's local clients (pre-v1.2 behavior).
         redis_client: optional pre-built async Redis client (for testing
             with fakeredis). When provided, redis_url is ignored.
+        api_key: If set, all HTTP requests must include ``X-API-Key``.
+            If None, checks ``VIBE_THINKER_API_KEY`` env var.
+        allowed_origins: CORS allowed origins. None = localhost only.
+        rate_limit_per_minute: Max requests per IP per minute. 0 = disabled.
+        max_request_body_bytes: Max request body size. 0 = disabled.
     """
     app = FastAPI(title="vibe-thinker UI", docs_url="/api/docs")
+    # Security middleware: API key auth, CORS, rate limiting, body size.
+    configure_security(
+        app,
+        api_key=api_key,
+        allowed_origins=allowed_origins,
+        rate_limit_per_minute=rate_limit_per_minute,
+        max_request_body_bytes=max_request_body_bytes,
+        exempt_paths={"/", "/api/health"},
+    )
     # AppState defaults to a LocalBroadcaster. When redis_url is set,
     # swap in a RedisBroadcaster after the state exists (it needs the
     # state's _send_to_local_clients as the subscriber callback).
@@ -412,6 +424,11 @@ def create_app(
         query = body.get("query", "").strip()
         if not query:
             return JSONResponse({"error": "query is required"}, status_code=400)
+        if len(query) > 10000:
+            return JSONResponse(
+                {"error": "query too long (max 10000 chars)"},
+                status_code=400,
+            )
         force_route = body.get("force_route") or None
         job_id = uuid.uuid4().hex[:12]
         state.add_job(job_id, query, force_route)
@@ -439,11 +456,14 @@ def create_app(
             await state.broadcast({"type": "job_update", "job": state.jobs[job_id]})
         except Exception as e:
             duration_ms = int((time.time() - t0) * 1000)
+            # Log full error server-side; send a generic message to clients
+            # to avoid leaking internal details (file paths, library versions).
+            print(f"[WebUI] Job {job_id} failed: {e}")
             state.update_job(
                 job_id,
                 status="error",
                 finished_at=time.time(),
-                error=str(e),
+                error="internal error — see server logs for details",
                 duration_ms=duration_ms,
             )
             await state.broadcast({"type": "job_update", "job": state.jobs[job_id]})

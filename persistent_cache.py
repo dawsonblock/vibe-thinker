@@ -25,6 +25,7 @@ Design notes:
 import json
 import os
 import tempfile
+import threading
 import uuid as _uuid
 from collections import OrderedDict
 from datetime import datetime, timezone
@@ -41,6 +42,38 @@ try:
     EMBEDDINGS_AVAILABLE = True
 except ImportError:
     EMBEDDINGS_AVAILABLE = False
+
+
+# ====================================================================== #
+# Shared embedding model singleton (Phase 5 — reduce 3x memory usage)
+# ====================================================================== #
+# Previously, CLRResultCache, VerifiedTrajectoryStore, and EmbeddingRouter
+# each loaded their own SentenceTransformer instance (~100-300MB each).
+# This singleton ensures only one instance per model name is loaded.
+_EMBEDDING_MODELS: Dict[str, "SentenceTransformer"] = {}
+
+
+def get_shared_embedding_model(model_name: str = "all-MiniLM-L6-v2"):
+    """Get a shared SentenceTransformer instance for the given model name.
+
+    Returns a cached instance if one was already loaded for this model
+    name, or loads a new one on first call. This reduces memory usage
+    by ~200-600MB when multiple components use the same model.
+    """
+    if not EMBEDDINGS_AVAILABLE:
+        raise ImportError(
+            "Embeddings need: pip install sentence-transformers "
+            "scikit-learn numpy"
+        )
+    if model_name not in _EMBEDDING_MODELS:
+        print(f"[EmbeddingModel] Loading shared model: {model_name}")
+        _EMBEDDING_MODELS[model_name] = SentenceTransformer(model_name)
+    return _EMBEDDING_MODELS[model_name]
+
+
+def _clear_embedding_model_cache() -> None:
+    """Clear the shared embedding model cache (for testing)."""
+    _EMBEDDING_MODELS.clear()
 
 
 # ====================================================================== #
@@ -354,9 +387,10 @@ class CLRResultCache:
         self.max_entries = max_entries
         self.autosave = autosave
 
-        self.model = SentenceTransformer(model_name)
+        self.model = get_shared_embedding_model(model_name)
         self.entries: List[Dict[str, Any]] = []
         self._embeddings_matrix: Optional[Any] = None  # np.ndarray, rebuilt on load
+        self._save_lock = threading.Lock()  # Phase 5: prevent concurrent save races
 
         # Vector store backend (v0.3.9). When provided, similarity search
         # is delegated to it (AgentDB sidecar) instead of the in-memory
@@ -402,11 +436,12 @@ class CLRResultCache:
         )
 
     def save(self) -> None:
-        data = {
-            "model_name": self.model_name,
-            "entries": self.entries,
-        }
-        _atomic_write_json(self.path, data)
+        with self._save_lock:
+            data = {
+                "model_name": self.model_name,
+                "entries": self.entries,
+            }
+            _atomic_write_json(self.path, data)
 
     # ----------------------- lookup ----------------------- #
     def lookup(self, problem: str, allow_weak_cache: bool = False) -> Optional[Dict[str, Any]]:
@@ -620,9 +655,10 @@ class VerifiedTrajectoryStore:
         self.max_few_shot = max_few_shot
         self.autosave = autosave
 
-        self.model = SentenceTransformer(model_name)
+        self.model = get_shared_embedding_model(model_name)
         self.entries: List[Dict[str, Any]] = []
         self._embeddings_matrix: Optional[Any] = None
+        self._save_lock = threading.Lock()  # Phase 5: prevent concurrent save races
 
         # Vector store backend (v0.3.9). See CLRResultCache.__init__ for
         # the same pattern: when provided, similarity search is delegated
@@ -670,12 +706,13 @@ class VerifiedTrajectoryStore:
         )
 
     def save(self) -> None:
-        data = {
-            "model_name": self.model_name,
-            "schema_version": CURRENT_CACHE_SCHEMA_VERSION,
-            "entries": self.entries,
-        }
-        _atomic_write_json(self.path, data)
+        with self._save_lock:
+            data = {
+                "model_name": self.model_name,
+                "schema_version": CURRENT_CACHE_SCHEMA_VERSION,
+                "entries": self.entries,
+            }
+            _atomic_write_json(self.path, data)
 
     # ----------------------- retrieval ----------------------- #
     def retrieve(self, query: str, task_type: Optional[str] = None) -> List[Dict[str, Any]]:

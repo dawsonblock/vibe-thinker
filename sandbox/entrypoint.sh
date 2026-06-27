@@ -61,11 +61,27 @@ if [ -n "$IPTABLES_RULES_B64" ]; then
         RULES=$(echo "$IPTABLES_RULES_B64" | base64 -d)
         while IFS= read -r rule; do
             [ -z "$rule" ] && continue
-            # Apply the rule. Errors here are fatal — fail-closed.
-            eval "$rule" || {
-                echo "[vt-entrypoint] FATAL: iptables rule failed: $rule" >&2
-                exit 1
-            }
+            # Validate the rule: must start with 'iptables ' and contain
+            # no shell metacharacters (prevents command injection via
+            # the VT_IPTABLES_RULES env var).
+            case "$rule" in
+                iptables\ *)
+                    # Check for dangerous shell metacharacters.
+                    if printf '%s' "$rule" | grep -qE '[;|&`$(){}\\<>]'; then
+                        echo "[vt-entrypoint] FATAL: iptables rule contains shell metacharacters: $rule" >&2
+                        exit 1
+                    fi
+                    # Safe to execute directly (no eval needed).
+                    $rule || {
+                        echo "[vt-entrypoint] FATAL: iptables rule failed: $rule" >&2
+                        exit 1
+                    }
+                    ;;
+                *)
+                    echo "[vt-entrypoint] FATAL: invalid iptables rule (must start with 'iptables '): $rule" >&2
+                    exit 1
+                    ;;
+            esac
         done <<< "$RULES"
     fi
 
