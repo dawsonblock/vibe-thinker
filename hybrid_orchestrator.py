@@ -57,7 +57,7 @@ from math_solver import solve as solve_math
 _UNSET = object()
 
 
-def select_verifier(task_type: str, llm_judge=None):
+def select_verifier(task_type: str, llm_judge=None, prefer_encoder_nli: bool = False):
     """Select a deterministic verifier based on the detected task type.
 
     Returns None if no verifier applies (conversation, summarization, etc.).
@@ -70,12 +70,37 @@ def select_verifier(task_type: str, llm_judge=None):
         llm_judge: optional async callable (prompt -> response str) used
             by FactualVerifier as an NLI judge. Typically the
             orchestrator's ``_call_generalist``.
+        prefer_encoder_nli: when True and the optional ``transformers``+
+            ``torch`` deps are installed, prefer an
+            :class:`EncoderNLIJudge` (encoder-only NLI model, robust to
+            fabrication) over the LLM judge for factual tasks. Default
+            False (opt-in) — the encoder model is downloaded from
+            HuggingFace on first use, so it's not enabled by default.
+            Fail-closed: if the encoder judge can't be constructed, falls
+            back to the LLM judge. The orchestrator wires this to the
+            ``--prefer-encoder-nli`` CLI flag / ``VIBE_THINKER_PREFER_ENCODER_NLI``
+            env var.
     """
     if task_type == "math":
         return MathVerifier()
     if task_type == "code":
         return CodeVerifier()
     if task_type == "factual":
+        # v1.1: prefer the encoder-only NLI judge (no fabrication risk)
+        # when the optional nli extra is installed. Fail-closed fallback
+        # to the LLM judge when it's not.
+        if prefer_encoder_nli:
+            try:
+                from verifiers.nli_encoder import EncoderNLIJudge, is_available
+                if is_available():
+                    return FactualVerifier(
+                        llm_judge=EncoderNLIJudge()
+                    )
+            except Exception as e:
+                # Encoder judge unavailable (deps missing, model load
+                # failed) — fall back to the LLM judge. Never raise.
+                print(f"[select_verifier] encoder NLI unavailable ({e}), "
+                      f"falling back to LLM judge")
         return FactualVerifier(llm_judge=llm_judge)
     if task_type == "schema":
         return SchemaVerifier()
@@ -278,6 +303,7 @@ class HybridReasoningOrchestrator:
         local_specialist_n_ctx: int = 4096,
         local_specialist_n_threads: int = 8,
         local_specialist_pool_size: int = 1,
+        local_pool_kind: str = "thread",
         agentdb_url: Optional[str] = None,
         retrieval_backend: Optional["RetrievalBackend"] = _UNSET,
         network_allowlist: Optional["NetworkAllowList"] = None,
@@ -285,6 +311,11 @@ class HybridReasoningOrchestrator:
         sandbox_image: Optional[str] = None,
         proxy_egress: Optional[str] = None,
         use_structured_output: bool = False,
+        specialist_transport: str = "completion",
+        specialist_api_key: Optional[str] = None,
+        specialist_model_name: Optional[str] = None,
+        max_parse_repairs: int = 2,
+        prefer_encoder_nli: bool = False,
     ):
         self.vibe_endpoint = vibe_endpoint.rstrip("/")
         self.generalist_endpoint = generalist_endpoint.rstrip("/")
@@ -359,6 +390,10 @@ class HybridReasoningOrchestrator:
         else:
             self._warm_pool = None
         self.use_clr = use_clr
+        # v1.1: prefer the encoder-only NLI judge for factual tasks when
+        # the optional nli extra is installed. Opt-in (default False) —
+        # the encoder model is downloaded from HuggingFace on first use.
+        self.prefer_encoder_nli = prefer_encoder_nli
 
         # Shared HTTP session for all generalist/code-specialist calls.
         # Eagerly created in start() (inside the event loop) to avoid a
@@ -378,7 +413,12 @@ class HybridReasoningOrchestrator:
             local_n_ctx=local_specialist_n_ctx,
             local_n_threads=local_specialist_n_threads,
             local_pool_size=local_specialist_pool_size,
+            local_pool_kind=local_pool_kind,
             use_structured_output=use_structured_output,
+            specialist_transport=specialist_transport,
+            specialist_api_key=specialist_api_key,
+            specialist_model_name=specialist_model_name,
+            max_parse_repairs=max_parse_repairs,
         )
 
         self.use_embedding_router = use_embedding_router and EMBEDDINGS_AVAILABLE
@@ -1718,7 +1758,10 @@ class HybridReasoningOrchestrator:
         # This is what allows math/code tasks to exceed the 0.65 cap.
         decision = self.route_structured(query)
         task_type = decision["task_type"]
-        verifier = select_verifier(task_type, llm_judge=self._call_generalist)
+        verifier = select_verifier(
+            task_type, llm_judge=self._call_generalist,
+            prefer_encoder_nli=self.prefer_encoder_nli,
+        )
         verifier_context = await self._build_verifier_context(
             query, task_type,
             compute_limits=decision.get("compute_limits"),

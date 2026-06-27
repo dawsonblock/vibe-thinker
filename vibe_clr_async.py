@@ -35,26 +35,24 @@ import aiohttp
 from scoring import compute_confidence
 
 
-# GBNF grammar for the JSON claim extraction format.
-# Forces the model to output valid JSON with "claims" (array of strings)
-# and "final_answer" (string or null). This prevents small models from
-# producing malformed JSON that causes trajectory scoring to fail.
-_CLAIMS_JSON_GRAMMAR = r"""root ::= "{" ws "\"claims\"" ws ":" ws "[" ws string ("," ws string)* ws "]" ws "," ws "\"final_answer\"" ws ":" ws (string | "null") ws "}"
-string ::= "\"" ([^"\\] | "\\" .)* "\""
-ws ::= [ \t\n]*
-"""
-
-# GBNF grammar for structured specialist output (v0.4.1).
-# Forces the specialist to output JSON with distinct keys for
-# reasoning_steps, boxed_answer, and code_solution — instead of
-# regex-scraping a markdown string. This makes answer extraction
-# robust: no more brittle \boxed{} parsing for structured outputs.
-# When the specialist uses this grammar, the orchestrator extracts
-# the answer directly from the "boxed_answer" or "code_solution" key.
-_STRUCTURED_OUTPUT_GRAMMAR = r"""root ::= "{" ws "\"reasoning_steps\"" ws ":" ws "[" ws string ("," ws string)* ws "]" ws "," ws "\"boxed_answer\"" ws ":" ws (string | "null") ws "," ws "\"code_solution\"" ws ":" ws (string | "null") ws "}"
-string ::= "\"" ([^"\\] | "\\" .)* "\""
-ws ::= [ \t\n]*
-"""
+# GBNF grammars for the JSON claim extraction and structured specialist
+# output formats. These are now defined in format_enforcer.py (the single
+# source of truth) so the FormatEnforcer abstraction can render the same
+# contracts as OpenAI response_format / Anthropic tools. Imported here so
+# the in-process and /completion paths keep using exactly the same grammar
+# strings (identity is preserved — `grammar == _CLAIMS_JSON_GRAMMAR` still
+# works). See format_enforcer.py for the schema definitions and enforcers.
+from format_enforcer import (  # noqa: E402
+    CLAIMS_JSON_GRAMMAR as _CLAIMS_JSON_GRAMMAR,
+)
+from format_enforcer import (  # noqa: E402
+    STRUCTURED_OUTPUT_GRAMMAR as _STRUCTURED_OUTPUT_GRAMMAR,
+)
+from format_enforcer import (  # noqa: E402
+    SchemaKind,
+    make_enforcer,
+    parse_structured_output as _parse_structured_output_shared,
+)
 
 
 @dataclass
@@ -156,6 +154,142 @@ class CLRResult:
     verification_status: str = "self_only"
 
 
+# --------------------------------------------------------------------------- #
+# Process-pool worker functions (v1.1).
+#
+# These MUST be at module level so they are picklable by
+# ProcessPoolExecutor. Each worker process loads one Llama instance into
+# a worker-local global on init, then serves inference calls via
+# _process_pool_worker_call. Llama objects are not picklable, so the
+# model is loaded INSIDE the worker (not passed in). LlamaGrammar is also
+# compiled inside the worker.
+# --------------------------------------------------------------------------- #
+
+# Worker-local state (one Llama + one grammar per worker process).
+_PROCESS_POOL_LLM = None
+_PROCESS_POOL_GRAMMAR_CLAIMS = None  # pre-compiled _CLAIMS_JSON_GRAMMAR
+
+
+def _process_pool_worker_init(
+    model_path: str,
+    n_ctx: int,
+    n_threads: int,
+    use_ruvllm: bool,
+) -> None:
+    """Process-pool worker initializer: load one Llama instance.
+
+    Runs once per worker process at pool startup. Loads the model into a
+    worker-local global so subsequent _process_pool_worker_call invocations
+    can use it without re-loading. Also pre-compiles the claims grammar
+    (LlamaGrammar is not picklable, so it must be compiled inside the
+    worker).
+    """
+    global _PROCESS_POOL_LLM, _PROCESS_POOL_GRAMMAR_CLAIMS
+    if use_ruvllm:
+        from ruvllm_adapter import RuvLLMBinding
+        _PROCESS_POOL_LLM = RuvLLMBinding(
+            model_path=model_path, n_ctx=n_ctx, n_threads=n_threads,
+        )
+        _PROCESS_POOL_GRAMMAR_CLAIMS = _CLAIMS_JSON_GRAMMAR  # raw string
+    else:
+        from llama_cpp import Llama, LlamaGrammar
+        if os.path.exists(model_path):
+            _PROCESS_POOL_LLM = Llama(
+                model_path=model_path, n_ctx=n_ctx, n_threads=n_threads,
+                verbose=False,
+            )
+        elif "/" in model_path and model_path.endswith(".gguf"):
+            repo_id, filename = model_path.split("/", 1)
+            _PROCESS_POOL_LLM = Llama.from_pretrained(
+                repo_id=repo_id, filename=filename,
+                n_ctx=n_ctx, n_threads=n_threads, verbose=False,
+            )
+        else:
+            _PROCESS_POOL_LLM = Llama.from_pretrained(
+                repo_id=model_path, n_ctx=n_ctx, n_threads=n_threads,
+                verbose=False,
+            )
+        _PROCESS_POOL_GRAMMAR_CLAIMS = LlamaGrammar.from_string(
+            _CLAIMS_JSON_GRAMMAR
+        )
+
+
+def _process_pool_worker_call(
+    prompt: str,
+    max_tokens: int,
+    temperature: float,
+    stop_tokens: list,
+    grammar_str: Optional[str],
+) -> str:
+    """Process-pool worker call: run inference on the worker-local Llama.
+
+    Returns the generated text. Raises RuntimeError on any failure (the
+    parent process catches it). The grammar is resolved inside the worker
+    (the pre-compiled claims grammar for _CLAIMS_JSON_GRAMMAR, or compiled
+    on demand for any other grammar).
+    """
+    global _PROCESS_POOL_LLM, _PROCESS_POOL_GRAMMAR_CLAIMS
+    if _PROCESS_POOL_LLM is None:
+        raise RuntimeError("process-pool worker LLM not initialized")
+
+    # Resolve the grammar object inside the worker.
+    grammar_obj = None
+    if grammar_str is not None:
+        if grammar_str == _CLAIMS_JSON_GRAMMAR and _PROCESS_POOL_GRAMMAR_CLAIMS is not None:
+            grammar_obj = _PROCESS_POOL_GRAMMAR_CLAIMS
+        elif isinstance(_PROCESS_POOL_GRAMMAR_CLAIMS, str):
+            # RuvLLM mode: grammar is a raw GBNF string.
+            grammar_obj = grammar_str if grammar_str != _CLAIMS_JSON_GRAMMAR else _PROCESS_POOL_GRAMMAR_CLAIMS
+        else:
+            try:
+                from llama_cpp import LlamaGrammar
+                grammar_obj = LlamaGrammar.from_string(grammar_str)
+            except Exception as e:
+                print(f"[CLR] Warning: process-pool grammar compile failed: {e}")
+
+    resp = _PROCESS_POOL_LLM(
+        prompt,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        stop=stop_tokens,
+        grammar=grammar_obj,
+    )
+    # Parse the response (same logic as _parse_inprocess_response).
+    choices = (resp or {}).get("choices") or []
+    if not choices:
+        raise RuntimeError("In-process specialist returned empty content")
+    text = choices[0].get("text", "") if isinstance(choices[0], dict) else ""
+    if not text:
+        raise RuntimeError("In-process specialist returned empty content")
+    return text
+
+
+def _estimate_model_ram_mb(model_path: str) -> Optional[int]:
+    """Estimate the RAM cost of loading a model from a .gguf file path.
+
+    Returns the file size in MB (a lower bound on RAM — the actual load
+    adds KV cache and runtime overhead, but the file size is a reasonable
+    first approximation for the guardrail). Returns None if the path is
+    not a local file (e.g. a HuggingFace repo_id — can't estimate without
+    a network fetch, so skip the guardrail).
+    """
+    if not os.path.exists(model_path):
+        return None
+    return int(os.path.getsize(model_path) / (1024 * 1024))
+
+
+def _available_ram_mb() -> Optional[int]:
+    """Return available RAM in MB, or None if it can't be determined."""
+    try:
+        import psutil
+        return int(psutil.virtual_memory().available / (1024 * 1024))
+    except ImportError:
+        # No psutil — use a conservative static cap (4GB) so the guardrail
+        # still prevents egregious OOM on small machines. The user can
+        # override by installing psutil for accurate measurement.
+        return 4096
+
+
 class VibeThinkerCLRAsync:
     def __init__(
         self,
@@ -172,6 +306,11 @@ class VibeThinkerCLRAsync:
         local_n_threads: int = 8,
         local_pool_size: int = 1,
         use_structured_output: bool = False,
+        specialist_transport: str = "completion",
+        specialist_api_key: Optional[str] = None,
+        specialist_model_name: Optional[str] = None,
+        max_parse_repairs: int = 2,
+        local_pool_kind: str = "thread",
     ):
         self.server_url = server_url.rstrip("/")
         self.k = k
@@ -214,10 +353,24 @@ class VibeThinkerCLRAsync:
         # true parallel inference (a single Llama instance is not thread-safe).
         # For a 0.5B model (~398MB), 4 instances cost ~1.6GB — cheap on 16GB RAM.
         self._local_llm = None  # single-instance mode (pool_size=1)
-        self._local_llm_pool: Optional[queue.Queue] = None  # pool mode
+        self._local_llm_pool: Optional[queue.Queue] = None  # pool mode (thread)
         self._local_pool_size = max(1, local_pool_size)
         self._local_grammar = None
         self._local_lock = threading.Lock()  # used only in single-instance mode
+        # Pool kind (v1.1): "thread" (default) uses a queue.Queue of Llama
+        # instances + ThreadPoolExecutor — the historical path. "process"
+        # uses a ProcessPoolExecutor where each worker loads its own Llama
+        # instance (worker-local global), giving each worker its own GIL.
+        # This eliminates Python-side lock contention under extreme
+        # concurrency, BUT: (1) Llama objects are not picklable, so each
+        # worker must load its own instance — RAM multiplies by pool_size;
+        # (2) LlamaGrammar must be compiled inside each worker; (3) for a
+        # 3B model on 16GB RAM, pool_size=4 likely OOMs. The guardrail in
+        # _init_local_backend refuses process mode when the estimated RAM
+        # cost exceeds available memory, falling back to thread mode.
+        # Default "thread" — process mode is opt-in.
+        self._local_pool_kind = local_pool_kind
+        self._local_process_pool = None  # ProcessPoolExecutor (process mode)
         # Structured output mode (v0.4.1): when enabled, trajectory
         # generation uses _STRUCTURED_OUTPUT_GRAMMAR to force JSON output
         # with reasoning_steps, boxed_answer, and code_solution keys.
@@ -227,6 +380,26 @@ class VibeThinkerCLRAsync:
         # --structured-output or the constructor parameter.
         self.use_structured_output = use_structured_output
         self.backend = "http"
+        # Specialist transport (v1.1): which HTTP API shape the specialist
+        # server speaks. The default "completion" is the llama-server /
+        # RuvLLM /completion endpoint (the historical path). "openai_chat"
+        # and "anthropic" target the OpenAI-compatible /v1/chat/completions
+        # endpoint and Anthropic's /v1/messages endpoint respectively —
+        # needed because OpenAI and Anthropic have no /completion endpoint
+        # and do not accept the llama-server "grammar" payload field. The
+        # FormatEnforcer abstraction (format_enforcer.py) maps the structured
+        # output contract to each transport's native enforcement mechanism.
+        # Ignored when the in-process backend is active (it has its own path).
+        self.specialist_transport = specialist_transport
+        self.specialist_api_key = specialist_api_key
+        self.specialist_model_name = specialist_model_name
+        # Parse-repair loop (v1.1): when a structured-output call returns
+        # malformed JSON (common on APIs without native grammar enforcement),
+        # feed the malformed text + the parse error back to the model for a
+        # corrected attempt. Bounded by max_parse_repairs (0 disables).
+        # Mirrors the code-specialist max_repair_attempts pattern. Fail-closed:
+        # if no repair parses, the caller falls back to regex extraction.
+        self.max_parse_repairs = max(0, max_parse_repairs)
         if local_model:
             self._init_local_backend(local_model, local_n_ctx, local_n_threads)
 
@@ -303,7 +476,80 @@ class VibeThinkerCLRAsync:
             )
 
         try:
-            if self._local_pool_size > 1:
+            # --- Process-pool mode (v1.1, opt-in) ---
+            # Each worker loads its own Llama instance (worker-local
+            # global), giving each worker its own GIL. This eliminates
+            # Python-side lock contention under extreme concurrency.
+            # BUT: RAM multiplies by pool_size (each worker loads a full
+            # model copy). The guardrail below refuses process mode when
+            # the estimated RAM cost exceeds available memory, falling
+            # back to thread mode. Default is "thread" — process mode is
+            # opt-in via --local-specialist-pool-kind process.
+            if (self._local_pool_size > 1
+                    and self._local_pool_kind == "process"):
+                # RAM guardrail: estimate the model size and refuse if
+                # pool_size * model_size would exceed available RAM. This
+                # prevents the OOM that the original plan flagged.
+                model_mb = _estimate_model_ram_mb(local_model)
+                avail_mb = _available_ram_mb()
+                if model_mb is not None and avail_mb is not None:
+                    # Conservative: model file size * pool_size * 1.5x
+                    # (KV cache + runtime overhead). If this exceeds
+                    # available RAM, fall back to thread mode.
+                    est_total = int(model_mb * self._local_pool_size * 1.5)
+                    if est_total > avail_mb:
+                        print(
+                            f"[CLR] Warning: process-pool mode refused — "
+                            f"estimated RAM {est_total}MB (model {model_mb}MB "
+                            f"x {self._local_pool_size} workers x 1.5 overhead) "
+                            f"exceeds available {avail_mb}MB. Falling back to "
+                            f"thread pool mode. Install psutil for accurate "
+                            f"measurement, or reduce --local-specialist-pool-size."
+                        )
+                        self._local_pool_kind = "thread"
+                    else:
+                        print(
+                            f"[CLR] Process-pool RAM check OK: estimated "
+                            f"{est_total}MB <= {avail_mb}MB available."
+                        )
+                elif model_mb is None:
+                    # Can't estimate (HuggingFace repo_id, not a local
+                    # file). Proceed but warn — the user is responsible.
+                    print(
+                        f"[CLR] Warning: process-pool RAM guardrail skipped "
+                        f"(model '{local_model}' is not a local file — "
+                        f"can't estimate size). Monitor RAM manually."
+                    )
+
+            if (self._local_pool_size > 1
+                    and self._local_pool_kind == "process"):
+                # Process-pool mode: ProcessPoolExecutor with worker init.
+                from concurrent.futures import ProcessPoolExecutor
+                per_inst_threads = max(1, n_threads // self._local_pool_size)
+                print(
+                    f"[CLR] Starting process pool with {self._local_pool_size} "
+                    f"workers (process mode, {n_threads} threads -> "
+                    f"{per_inst_threads}/worker) from {local_model}..."
+                )
+                self._local_process_pool = ProcessPoolExecutor(
+                    max_workers=self._local_pool_size,
+                    initializer=_process_pool_worker_init,
+                    initargs=(
+                        local_model, n_ctx, per_inst_threads, use_ruvllm,
+                    ),
+                )
+                self._local_llm = None
+                self._local_llm_pool = None
+                self.backend = "in-process-process-pool"
+                print(
+                    f"[CLR] Process pool ready (backend={self.backend}, "
+                    f"{self._local_pool_size} workers, n_ctx={n_ctx}). "
+                    f"HTTP at {self.server_url} is bypassed."
+                )
+                # Grammar is compiled inside each worker — no shared
+                # grammar object in process mode.
+                self._local_grammar = None
+            elif self._local_pool_size > 1:
                 # Pool mode: load N instances into a thread-safe queue.
                 # Divide threads across instances so they don't oversubscribe
                 # the CPU when all N run concurrently.
@@ -366,7 +612,15 @@ class VibeThinkerCLRAsync:
             # string directly (no LlamaGrammar object). When use_ruvllm is
             # True, we store the raw grammar string instead of a compiled
             # LlamaGrammar. _call_model_inprocess handles both cases.
-            if use_ruvllm:
+            #
+            # Process-pool mode (v1.1): grammar is compiled inside each
+            # worker process (LlamaGrammar is not picklable). Skip the
+            # shared compilation — _local_grammar stays None, and
+            # _call_model_inprocess dispatches to the worker function
+            # which compiles its own grammar.
+            if self._local_process_pool is not None:
+                pass  # grammar handled per-worker
+            elif use_ruvllm:
                 # RuvLLM takes the raw GBNF string; no pre-compilation needed.
                 self._local_grammar = _CLAIMS_JSON_GRAMMAR  # type: ignore
             else:
@@ -380,6 +634,12 @@ class VibeThinkerCLRAsync:
             self._local_llm = None
             self._local_llm_pool = None
             self._local_grammar = None
+            if self._local_process_pool is not None:
+                try:
+                    self._local_process_pool.shutdown(wait=False, cancel_futures=True)
+                except Exception:
+                    pass
+                self._local_process_pool = None
             self.backend = "http"
 
     def adjust_max_k_for_queue_load(self, queue_load: float) -> None:
@@ -425,7 +685,7 @@ class VibeThinkerCLRAsync:
         grammar: Optional[str] = None,
     ) -> str:
         """Call the specialist model. Routes to the in-process backend when
-        available, otherwise falls back to the HTTP /completion endpoint.
+        available, otherwise to the configured HTTP transport.
 
         Raises RuntimeError on any failure — callers must handle the exception
         rather than silently proceeding with an empty string.
@@ -437,11 +697,26 @@ class VibeThinkerCLRAsync:
                 When set, the model physically cannot output invalid JSON.
                 Enforced natively by llama-server (HTTP) or LlamaGrammar
                 (in-process). Used for claim extraction to prevent small models
-                from producing malformed JSON.
+                from producing malformed JSON. For OpenAI/Anthropic chat
+                transports, the grammar is mapped to that transport's native
+                structured-output mechanism (response_format / tool_choice) —
+                see _call_model_chat.
         """
-        if self._local_llm is not None or self._local_llm_pool is not None:
+        if (self._local_llm is not None
+                or self._local_llm_pool is not None
+                or self._local_process_pool is not None):
             return await self._call_model_inprocess(
                 prompt, max_tokens, temperature, stop, grammar
+            )
+        if self.specialist_transport == "openai_chat":
+            return await self._call_model_chat(
+                session, prompt, max_tokens, temperature, stop, grammar,
+                transport="openai_chat",
+            )
+        if self.specialist_transport == "anthropic":
+            return await self._call_model_chat(
+                session, prompt, max_tokens, temperature, stop, grammar,
+                transport="anthropic",
             )
         return await self._call_model_http(
             session, prompt, max_tokens, temperature, stop, grammar
@@ -472,6 +747,26 @@ class VibeThinkerCLRAsync:
         loop = asyncio.get_running_loop()
         stop_tokens = stop if stop is not None else ["<|im_end|>"]
 
+        # --- Process-pool mode (v1.1) ---
+        # Dispatch to the ProcessPoolExecutor. The grammar is resolved
+        # INSIDE the worker (LlamaGrammar is not picklable, so we pass
+        # the raw grammar string and let the worker compile it). The
+        # worker function handles the full inference + response parsing.
+        if self._local_process_pool is not None:
+            future = self._local_process_pool.submit(
+                _process_pool_worker_call,
+                prompt, max_tokens, temperature, stop_tokens, grammar,
+            )
+            try:
+                return await loop.run_in_executor(None, future.result)
+            except RuntimeError:
+                raise
+            except Exception as e:
+                raise RuntimeError(
+                    f"In-process process-pool call failed: {e}"
+                ) from e
+
+        # --- Thread-pool and single-instance modes ---
         # Resolve the grammar object: reuse the pre-compiled claims grammar when
         # the caller asked for it; compile any other grammar on demand.
         #
@@ -597,6 +892,276 @@ class VibeThinkerCLRAsync:
             except Exception as e:
                 raise RuntimeError(f"Unexpected error calling {self.server_url}: {e}") from e
 
+    async def _call_model_chat(
+        self,
+        session: aiohttp.ClientSession,
+        prompt: str,
+        max_tokens: int,
+        temperature: float,
+        stop: Optional[List[str]],
+        grammar: Optional[str],
+        transport: str = "openai_chat",
+    ) -> str:
+        """Chat-completions backend for OpenAI-compatible / Anthropic APIs.
+
+        The specialist's raw prompt is a ChatML-formatted string
+        (``<|im_start|>user\\n...<|im_end|>\\n<|im_start|>assistant\\n``) because
+        the historical /completion endpoint expects a raw prompt. The chat
+        transports have no /completion endpoint and want a ``messages`` array,
+        so we strip the ChatML wrapper back into a single user message. Any
+        assistant prefill after the final ``<|im_start|>assistant\\n`` is
+        preserved as a partial assistant message (some few-shot prompts use
+        this).
+
+        Structured output (``grammar``): the GBNF string cannot be sent to
+        OpenAI or Anthropic. When a FormatEnforcer is wired in (S1.1), it
+        maps the schema to ``response_format`` (OpenAI) or a tool definition
+        (Anthropic). Until then, we map the two known grammars by identity:
+        ``_STRUCTURED_OUTPUT_GRAMMAR`` and ``_CLAIMS_JSON_GRAMMAR`` become a
+        JSON-object instruction appended to the user message and, for OpenAI,
+        a ``response_format={"type": "json_object"}`` hint. This is weaker
+        than native GBNF enforcement — the parse-repair loop (S1.3) covers
+        the resulting malformed-JSON cases.
+
+        Args:
+            transport: "openai_chat" (OpenAI-compatible /v1/chat/completions)
+                or "anthropic" (/v1/messages).
+        """
+        user_text, assistant_prefill = self._strip_chatml(prompt)
+        # Build a FormatEnforcer for the requested grammar so the chat
+        # transport applies native structured-output enforcement
+        # (response_format / tool_choice) rather than a weak text hint. The
+        # enforcer also supplies the parser used by the repair loop (S1.3).
+        # When grammar is None (unstructured generation), no enforcer.
+        enforcer = None
+        if grammar is not None:
+            kind = (
+                SchemaKind.STRUCTURED_OUTPUT
+                if grammar == _STRUCTURED_OUTPUT_GRAMMAR
+                else SchemaKind.CLAIMS
+            )
+            enforcer = make_enforcer(kind, transport=transport)
+            # Still append the JSON instruction as a belt-and-suspenders hint
+            # for models that ignore response_format/tool_choice. The native
+            # enforcement is the primary mechanism; this is the fallback.
+            user_text = self._augment_with_json_instruction(user_text, grammar)
+
+        async with self.semaphore:
+            try:
+                if transport == "anthropic":
+                    content = await self._post_anthropic(
+                        session, user_text, assistant_prefill,
+                        max_tokens, temperature, stop, enforcer,
+                    )
+                else:
+                    content = await self._post_openai_chat(
+                        session, user_text, assistant_prefill,
+                        max_tokens, temperature, stop, enforcer,
+                    )
+                if not content:
+                    raise RuntimeError(
+                        f"Specialist at {self.server_url} returned empty content"
+                    )
+                return content
+            except RuntimeError:
+                raise
+            except aiohttp.ClientError as e:
+                raise RuntimeError(
+                    f"Specialist chat call to {self.server_url} failed: {e}"
+                ) from e
+            except Exception as e:
+                raise RuntimeError(
+                    f"Unexpected error calling {self.server_url}: {e}"
+                ) from e
+
+    @staticmethod
+    def _strip_chatml(prompt: str) -> tuple:
+        """Split a ChatML-formatted prompt into (user_text, assistant_prefill).
+
+        The specialist prompts are built as
+        ``<|im_start|>user\\n{q}<|im_end|>\\n<|im_start|>assistant\\n``. The
+        chat transports want ``messages=[{"role":"user",...}]`` plus an
+        optional assistant prefill. Returns (user_text, prefill_or_None).
+        Falls back to returning the whole prompt as a user message if the
+        ChatML markers are absent (defensive — callers may pass a raw string).
+        """
+        text = prompt
+        prefill = None
+        # Extract the user turn(s). We look for the last <|im_start|>user ...
+        # <|im_end|> block and treat everything before the final assistant
+        # marker as user content. Simpler: split on the assistant marker.
+        assistant_marker = "<|im_start|>assistant"
+        if assistant_marker in text:
+            head, _, tail = text.partition(assistant_marker)
+            # Strip a trailing newline left by the marker.
+            prefill = tail.lstrip("\n") or None
+            # Remove the user wrapper markers from head.
+            head = head.replace("<|im_start|>user", "").replace("<|im_end|>", "")
+            user_text = head.strip("\n")
+        else:
+            user_text = text.strip()
+        return user_text, prefill
+
+    @staticmethod
+    def _augment_with_json_instruction(user_text: str, grammar: str) -> str:
+        """Append a JSON-output instruction when a structured grammar is set.
+
+        This is a transitional shim used until the FormatEnforcer (S1.1)
+        supplies a transport-native schema. It does NOT enforce JSON — it
+        only steers the model. The parse-repair loop (S1.3) handles the
+        malformed-JSON cases that result.
+        """
+        if grammar == _STRUCTURED_OUTPUT_GRAMMAR:
+            return (
+                user_text + "\n\nOutput your answer as a JSON object with keys "
+                '"reasoning_steps" (array of strings), "boxed_answer" (string '
+                'or null), and "code_solution" (string or null). Output ONLY '
+                "the JSON object."
+            )
+        if grammar == _CLAIMS_JSON_GRAMMAR:
+            return (
+                user_text + '\n\nOutput ONLY valid JSON in this exact format: '
+                '{"claims": ["claim 1", "claim 2", ...], "final_answer": '
+                '"the answer" or null}.'
+            )
+        return user_text
+
+    async def _post_openai_chat(
+        self,
+        session: aiohttp.ClientSession,
+        user_text: str,
+        assistant_prefill: Optional[str],
+        max_tokens: int,
+        temperature: float,
+        stop: Optional[List[str]],
+        enforcer: Optional[Any],
+    ) -> str:
+        """POST to the OpenAI-compatible /v1/chat/completions endpoint.
+
+        When ``enforcer`` is provided, applies native structured-output
+        enforcement via ``response_format`` (strict json_schema). This is
+        the OpenAI equivalent of llama.cpp's GBNF grammar.
+        """
+        messages = [{"role": "user", "content": user_text}]
+        if assistant_prefill:
+            messages.append({"role": "assistant", "content": assistant_prefill})
+        payload: Dict[str, Any] = {
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": 0.95,
+        }
+        if self.specialist_model_name:
+            payload["model"] = self.specialist_model_name
+        # Native structured-output enforcement via the FormatEnforcer. Falls
+        # back to plain json_object mode if the enforcer is absent but a
+        # grammar was requested (handled by the caller passing an enforcer).
+        if enforcer is not None:
+            payload["response_format"] = enforcer.to_openai_response_format()
+        if stop:
+            payload["stop"] = stop
+        headers = self._auth_headers()
+        async with session.post(
+            f"{self.server_url}/v1/chat/completions",
+            json=payload,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=600),
+        ) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+            return data["choices"][0]["message"]["content"] or ""
+
+    async def _post_anthropic(
+        self,
+        session: aiohttp.ClientSession,
+        user_text: str,
+        assistant_prefill: Optional[str],
+        max_tokens: int,
+        temperature: float,
+        stop: Optional[List[str]],
+        enforcer: Optional[Any],
+    ) -> str:
+        """POST to the Anthropic /v1/messages endpoint.
+
+        Anthropic uses a different auth header (x-api-key + anthropic-version)
+        and a different response shape (content blocks). When ``enforcer`` is
+        provided, structured output is enforced via a tool definition +
+        ``tool_choice`` forcing the model to emit the payload as a tool_use
+        block. The tool_use input is returned as a JSON string so the shared
+        parser can handle it uniformly.
+        """
+        messages = [{"role": "user", "content": user_text}]
+        if assistant_prefill:
+            messages.append({"role": "assistant", "content": assistant_prefill})
+        payload: Dict[str, Any] = {
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        if self.specialist_model_name:
+            payload["model"] = self.specialist_model_name
+        if stop:
+            payload["stop_sequences"] = stop
+        # Native structured-output enforcement via tool_choice. The model is
+        # forced to call the tool with the structured payload; we extract the
+        # tool_use input and return it as a JSON string for the shared parser.
+        if enforcer is not None:
+            tool = enforcer.to_anthropic_tool()
+            payload["tools"] = [tool]
+            payload["tool_choice"] = {"type": "tool", "name": tool["name"]}
+        headers = self._auth_headers()
+        # Anthropic requires these headers even when no api key is set
+        # (some self-hosted Anthropic-compatible servers ignore them).
+        headers.setdefault("anthropic-version", "2023-06-01")
+        async with session.post(
+            f"{self.server_url}/v1/messages",
+            json=payload,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=600),
+        ) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+            blocks = data.get("content", [])
+            if not isinstance(blocks, list):
+                return ""
+            # When tool_choice forces a tool call, the payload is in a
+            # tool_use block. Return its input as a JSON string so the
+            # shared parse_structured_output can handle it like any other.
+            tool_inputs = [
+                b for b in blocks
+                if isinstance(b, dict) and b.get("type") == "tool_use"
+            ]
+            if tool_inputs and enforcer is not None:
+                import json as _json
+                return _json.dumps(tool_inputs[0].get("input", {}))
+            # No tool_use block (e.g. enforcer was None, or the model emitted
+            # text despite tool_choice). Concatenate text blocks.
+            return "".join(
+                b.get("text", "") for b in blocks
+                if isinstance(b, dict) and b.get("type") == "text"
+            )
+
+    def _auth_headers(self) -> Dict[str, str]:
+        """Build auth headers for the chat transports.
+
+        For OpenAI-compatible: ``Authorization: Bearer <key>``.
+        For Anthropic: ``x-api-key: <key>`` (the anthropic-version header is
+        added by _post_anthropic).
+
+        The key is read from specialist_api_key (constructor) or the
+        VIBE_THINKER_SPECIALIST_API_KEY env var. Never logged.
+        """
+        key = self.specialist_api_key or os.environ.get(
+            "VIBE_THINKER_SPECIALIST_API_KEY"
+        )
+        headers: Dict[str, str] = {}
+        if key:
+            if self.specialist_transport == "anthropic":
+                headers["x-api-key"] = key
+            else:
+                headers["Authorization"] = f"Bearer {key}"
+        return headers
+
     async def generate_plain(
         self, session: aiohttp.ClientSession, problem: str, max_tokens: int = 8192
     ) -> str:
@@ -661,7 +1226,8 @@ class VibeThinkerCLRAsync:
 
     @staticmethod
     def parse_structured_output(text: str) -> Optional[Dict[str, Any]]:
-        """Parse a structured specialist output (v0.4.1).
+        """Parse a structured specialist output (v0.4.1, delegated to
+        format_enforcer.parse_structured_output in v1.1).
 
         When the specialist uses the _STRUCTURED_OUTPUT_GRAMMAR, its
         output is a JSON object with:
@@ -671,41 +1237,11 @@ class VibeThinkerCLRAsync:
 
         This method extracts and validates that JSON. Returns None if
         the text is not valid structured output (caller falls back to
-        regex-based extraction).
+        regex-based extraction). The implementation lives in
+        format_enforcer.py so the FormatEnforcer abstraction shares the
+        same parser across all transports.
         """
-        try:
-            text = text.strip()
-            # Strip markdown code fences if present.
-            if text.startswith("```"):
-                lines = text.split("\n")
-                text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
-            # Find the JSON object.
-            start = text.find("{")
-            end = text.rfind("}")
-            if start == -1 or end == -1:
-                return None
-            data = json.loads(text[start:end + 1])
-            if not isinstance(data, dict):
-                return None
-            # Validate required keys.
-            if "reasoning_steps" not in data:
-                return None
-            result: Dict[str, Any] = {
-                "reasoning_steps": data.get("reasoning_steps", []),
-                "boxed_answer": data.get("boxed_answer"),
-                "code_solution": data.get("code_solution"),
-            }
-            # Normalize boxed_answer: "null" string -> None.
-            ba = result["boxed_answer"]
-            if isinstance(ba, str) and ba.strip().lower() in ("null", "none", "", "n/a"):
-                result["boxed_answer"] = None
-            # Normalize code_solution similarly.
-            cs = result["code_solution"]
-            if isinstance(cs, str) and cs.strip().lower() in ("null", "none", "", "n/a"):
-                result["code_solution"] = None
-            return result
-        except (json.JSONDecodeError, ValueError, TypeError):
-            return None
+        return _parse_structured_output_shared(text)
 
     # ------------------------------------------------------------------ #
     # Self-verification
@@ -964,6 +1500,78 @@ class VibeThinkerCLRAsync:
     # ------------------------------------------------------------------ #
     # One full trajectory
     # ------------------------------------------------------------------ #
+    async def _call_model_with_repair(
+        self,
+        session: aiohttp.ClientSession,
+        prompt: str,
+        max_tokens: int,
+        temperature: float,
+        grammar: Optional[str],
+    ) -> tuple:
+        """Call the specialist with a parse-repair loop (v1.1).
+
+        Wraps ``_call_model`` for structured-output calls: after the model
+        responds, parse it with the FormatEnforcer. If parsing fails (the
+        model emitted malformed JSON — common on transports without native
+        grammar enforcement like openai_chat/anthropic), feed the bad text
+        + the parse error back to the model for a corrected attempt at
+        ``temperature=0.0``. Bounded by ``self.max_parse_repairs`` (0
+        disables — the call becomes equivalent to ``_call_model``).
+
+        Returns ``(raw_text, parsed_or_None)``. The caller uses ``parsed``
+        when non-None and falls back to regex extraction on ``None`` —
+        fail-closed, never fakes a successful parse.
+
+        Args:
+            grammar: the GBNF string identifying which schema to enforce.
+                Used to build the matching FormatEnforcer for parsing and
+                repair-prompt construction. When None, no repair is
+                attempted (unstructured generation).
+        """
+        raw = await self._call_model(
+            session, prompt, max_tokens=max_tokens,
+            temperature=temperature, grammar=grammar,
+        )
+        if grammar is None or self.max_parse_repairs <= 0:
+            # No structured contract or repair disabled — caller parses.
+            return raw, self.parse_structured_output(raw) if grammar else None
+
+        kind = (
+            SchemaKind.STRUCTURED_OUTPUT
+            if grammar == _STRUCTURED_OUTPUT_GRAMMAR
+            else SchemaKind.CLAIMS
+        )
+        enforcer = make_enforcer(kind, transport=self.specialist_transport)
+        parsed = enforcer.parse(raw)
+        if parsed is not None:
+            return raw, parsed
+
+        # Parse failed — attempt repairs.
+        from format_enforcer import parse_error_detail
+        for attempt in range(self.max_parse_repairs):
+            error = parse_error_detail(raw)
+            repair_prompt = (
+                "<|im_start|>user\n"
+                + enforcer.repair_prompt(raw, error)
+                + "\n<|im_end|>\n<|im_start|>assistant\n"
+            )
+            try:
+                raw = await self._call_model(
+                    session, repair_prompt, max_tokens=max_tokens,
+                    temperature=0.0, grammar=grammar,
+                )
+            except Exception as e:
+                # Repair call failed — stop repairing, return the last raw
+                # text so the caller's regex fallback can try.
+                print(f"[CLR] parse-repair call {attempt + 1} failed: {e}")
+                break
+            parsed = enforcer.parse(raw)
+            if parsed is not None:
+                print(f"[CLR] parse-repair succeeded on attempt {attempt + 1}")
+                return raw, parsed
+        # All repairs failed — fail-closed. Caller falls back to regex.
+        return raw, None
+
     async def _generate_one_trajectory(
         self, session: aiohttp.ClientSession, problem: str, max_tokens: int
     ) -> Dict:
@@ -976,6 +1584,11 @@ class VibeThinkerCLRAsync:
         uses _STRUCTURED_OUTPUT_GRAMMAR to force JSON output with
         reasoning_steps, boxed_answer, and code_solution keys. The answer
         is extracted directly from the JSON — no \boxed{} regex scraping.
+
+        v1.1: structured calls now go through ``_call_model_with_repair``,
+        which feeds malformed-JSON errors back to the model for a corrected
+        attempt (bounded by ``max_parse_repairs``). This matters most for
+        the openai_chat / anthropic transports, which lack GBNF enforcement.
         """
         if self.use_structured_output:
             # Structured mode: force JSON output with distinct keys.
@@ -989,12 +1602,10 @@ class VibeThinkerCLRAsync:
                 '  "code_solution": "the code" or null\n'
                 "<|im_end|>\n<|im_start|>assistant\n"
             )
-            raw_trace = await self._call_model(
-                session, reasoning_prompt, max_tokens=max_tokens,
+            raw_trace, structured = await self._call_model_with_repair(
+                session, reasoning_prompt, max_tokens, temperature=1.0,
                 grammar=_STRUCTURED_OUTPUT_GRAMMAR,
             )
-            # Parse the structured output directly — no regex needed.
-            structured = self.parse_structured_output(raw_trace)
             if structured is not None:
                 final_answer = structured.get("boxed_answer")
                 # Still extract claims for the full CLR pipeline.
@@ -1002,8 +1613,8 @@ class VibeThinkerCLRAsync:
                 # Override the answer with the structured one (more reliable).
                 parsed["final_answer"] = final_answer
             else:
-                # Fallback: grammar wasn't enforced (e.g., HTTP backend
-                # without grammar support). Fall back to regex extraction.
+                # Fallback: grammar wasn't enforced or all repairs failed.
+                # Fall back to regex extraction (fail-closed).
                 parsed = await self._extract_claims_and_answer(session, raw_trace)
         else:
             reasoning_prompt = (
@@ -1064,12 +1675,12 @@ class VibeThinkerCLRAsync:
                 '  "code_solution": "the code" or null\n'
                 "<|im_end|>\n<|im_start|>assistant\n"
             )
-            raw_trace = await self._call_model(
-                session, reasoning_prompt, max_tokens=max_tokens,
+            # v1.1: parse-repair loop covers malformed JSON from transports
+            # without native grammar enforcement (openai_chat / anthropic).
+            raw_trace, structured = await self._call_model_with_repair(
+                session, reasoning_prompt, max_tokens, temperature=1.0,
                 grammar=_STRUCTURED_OUTPUT_GRAMMAR,
             )
-            # Parse structured output — no regex needed.
-            structured = self.parse_structured_output(raw_trace)
             if structured is not None:
                 final_answer = structured.get("boxed_answer")
             else:

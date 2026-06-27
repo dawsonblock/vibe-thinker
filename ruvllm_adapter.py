@@ -44,6 +44,43 @@ In-Process Backend". The plan's action items:
   1. Run ruvllm as the primary local inference server with TurboQuant.
   2. Update _init_local_backend() to target the RuvLLM API endpoints.
   3. (Optional) Wrap the ruvllm crate via PyO3/maturin for direct binding.
+
+v1.1 direction decision — sync ``__call__``-compatible, NOT async batched:
+  The original integration plan conflated two directions:
+    (a) A sync ``__call__``-compatible binding that drops into the
+        existing ``_init_local_backend`` pool (thread or process) as a
+        Llama replacement. The orchestrator's ``_call_model_inprocess``
+        already runs sync calls in a thread/process executor, so a sync
+        binding gets parallelism for free — no new async surface needed.
+    (b) An async batched engine that exposes ``async def generate_batch``
+        and bypasses the executor entirely, calling the Rust engine's
+        batch API directly.
+
+  Decision: pursue (a), not (b). Rationale:
+    - The existing pool infrastructure (thread queue, process pool with
+      RAM guardrail, per-instance grammar) already handles parallelism.
+      A sync binding reuses all of it — zero new code paths, zero new
+      failure modes.
+    - An async batched engine would require a new ``_call_model_batch``
+      dispatch path, new tests, and a new concurrency model that
+      bypasses the semaphore/executor guardrails. The marginal latency
+      win (avoiding thread context switches) is negligible compared to
+      the inference time itself (100ms+ for a 0.5B model).
+    - The sync binding is a strict subset of the async engine's
+      functionality — if a batched API is needed later, it can be added
+      on top of the sync binding without breaking the pool integration.
+    - The process-pool mode (v1.1) already gives each worker its own
+      GIL, so Python-side lock contention is not a reason to go async.
+
+  What this means for the binding contract:
+    - ``RuvLLMBinding.__call__(prompt, max_tokens, temperature, stop,
+      grammar)`` must return ``{"choices": [{"text": "..."}]}`` — the
+      same dict shape as ``llama_cpp.Llama.__call__``.
+    - The ``grammar`` parameter accepts a raw GBNF string (not a
+      ``LlamaGrammar`` object) — this is already handled in
+      ``_call_model_inprocess`` and ``_process_pool_worker_call``.
+    - No async methods needed. The binding is used identically in
+      thread-pool and process-pool modes.
 """
 
 from __future__ import annotations

@@ -349,6 +349,47 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--vibe",
                    default=os.environ.get("VIBE_THINKER_URL", "http://127.0.0.1:8080"),
                    help="VibeThinker specialist endpoint")
+    p.add_argument("--specialist-transport",
+                   choices=["completion", "openai_chat", "anthropic"],
+                   default=os.environ.get("VIBE_THINKER_SPECIALIST_TRANSPORT", "completion"),
+                   help="Which HTTP API shape the specialist server speaks. "
+                        "'completion' (default) = llama-server/RuvLLM /completion "
+                        "(accepts the 'grammar' GBNF field). 'openai_chat' = "
+                        "OpenAI-compatible /v1/chat/completions (no /completion "
+                        "endpoint; structured output via response_format). "
+                        "'anthropic' = /v1/messages (structured output via tools). "
+                        "Ignored when --local-specialist-model is set.")
+    p.add_argument("--specialist-api-key",
+                   default=os.environ.get("VIBE_THINKER_SPECIALIST_API_KEY", ""),
+                   help="API key for the specialist when using openai_chat or "
+                        "anthropic transports. Sent as 'Authorization: Bearer ' "
+                        "(openai_chat) or 'x-api-key' (anthropic). Never logged.")
+    p.add_argument("--specialist-model-name",
+                   default=os.environ.get("VIBE_THINKER_SPECIALIST_MODEL_NAME", ""),
+                   help="Model name to send in the chat payload for openai_chat / "
+                        "anthropic transports (e.g. 'gpt-4o-mini' or "
+                        "'claude-3-5-sonnet-20241022'). Some self-hosted "
+                        "OpenAI-compatible servers ignore this field.")
+    p.add_argument("--max-parse-repairs", type=int,
+                   default=int(os.environ.get("MAX_PARSE_REPAIRS", "2")),
+                   help="When a structured-output specialist call returns "
+                        "malformed JSON, feed the bad text + parse error back "
+                        "for a corrected attempt. Max repair rounds (default 2, "
+                        "0 disables). Most useful for transports without native "
+                        "grammar enforcement (openai_chat, anthropic). "
+                        "Fail-closed: falls back to regex extraction if no "
+                        "repair parses.")
+    p.add_argument("--prefer-encoder-nli", dest="prefer_encoder_nli",
+                   action="store_true",
+                   help="Prefer an encoder-only NLI model (e.g. DeBERTa-v3) "
+                        "over the LLM judge for factual verification. More "
+                        "robust to fabrication (encoder models can't "
+                        "hallucinate). Requires the optional 'nli' extra: "
+                        "pip install \"vibe-thinker[nli]\". The model is "
+                        "downloaded from HuggingFace on first use. Default "
+                        "off — fail-closed to the LLM judge when unavailable.")
+    p.set_defaults(prefer_encoder_nli=_env_bool(
+        "VIBE_THINKER_PREFER_ENCODER_NLI", False))
     p.add_argument("--generalist",
                    default=os.environ.get("GENERALIST_URL", "http://127.0.0.1:8081"),
                    help="Generalist model endpoint")
@@ -417,6 +458,22 @@ def build_argparser() -> argparse.ArgumentParser:
                         "For a 0.5B model (~398MB each), 4 instances cost ~1.6GB "
                         "and enable 4 concurrent trajectories. Each instance gets "
                         "n_threads/pool_size CPU threads.")
+    p.add_argument("--local-specialist-pool-kind",
+                   dest="local_pool_kind",
+                   choices=["thread", "process"],
+                   default=os.environ.get("VIBE_THINKER_LOCAL_POOL_KIND", "thread"),
+                   help="Pool kind for multi-instance in-process inference "
+                        "(default 'thread'). 'thread' = queue.Queue of Llama "
+                        "instances + ThreadPoolExecutor (the historical path, "
+                        "shared GIL). 'process' = ProcessPoolExecutor where each "
+                        "worker loads its own Llama (separate GIL per worker, "
+                        "eliminates Python-side lock contention). WARNING: "
+                        "process mode multiplies RAM by pool_size (each worker "
+                        "loads a full model copy). A RAM guardrail refuses "
+                        "process mode when estimated RAM exceeds available "
+                        "memory, falling back to thread mode. Opt-in — use only "
+                        "when you have spare RAM and need to bypass GIL "
+                        "contention under extreme concurrency.")
     # --- RuvLLM integration (v0.3.9) ---
     # RuvLLM is a Rust inference engine with TurboQuant KV cache compression.
     # It exposes the same OpenAI-compatible HTTP API as llama-server, so the
@@ -589,6 +646,29 @@ async def _amain() -> None:
     if args.ruvllm_url:
         print(f"[CLI] RuvLLM backend enabled: --vibe overridden to {args.ruvllm_url}")
 
+    # --- Specialist transport (v1.1) ---
+    # Only relevant for the HTTP path; ignored when --local-specialist-model
+    # is set (the in-process backend has its own code path).
+    if not args.local_specialist_model and args.specialist_transport != "completion":
+        print(f"[CLI] Specialist transport: {args.specialist_transport} "
+              f"(endpoint {vibe_endpoint})")
+        if not args.specialist_api_key:
+            print("[CLI] Warning: --specialist-transport is set but no "
+                  "--specialist-api-key is configured. Set VIBE_THINKER_SPECIALIST_API_KEY "
+                  "or --specialist-api-key for authenticated providers.")
+
+    # --- Encoder NLI judge (v1.1) ---
+    if args.prefer_encoder_nli:
+        from verifiers.nli_encoder import is_available as encoder_available
+        if encoder_available():
+            print("[CLI] Encoder NLI judge enabled (factual verification). "
+                  "Model downloads from HuggingFace on first use.")
+        else:
+            print("[CLI] Warning: --prefer-encoder-nli set but the 'nli' "
+                  "extra is not installed. Install with: "
+                  "pip install \"vibe-thinker[nli]\". "
+                  "Falling back to the LLM judge.")
+
     # --- Fast code-specialist preset (v0.3.9) ---
     # Bumps code_candidates to 15 for ultra-fast 0.5B code models.
     code_candidates = args.code_candidates
@@ -616,6 +696,7 @@ async def _amain() -> None:
         local_specialist_n_ctx=args.local_specialist_n_ctx,
         local_specialist_n_threads=args.local_specialist_n_threads,
         local_specialist_pool_size=args.local_specialist_pool_size,
+        local_pool_kind=args.local_pool_kind,
         agentdb_url=args.agentdb_url or None,
         retrieval_backend=_build_retrieval_backend(args),
         network_allowlist=_build_network_allowlist(args),
@@ -623,6 +704,11 @@ async def _amain() -> None:
         sandbox_image=args.sandbox_image or None,
         proxy_egress=args.proxy_egress or None,
         use_structured_output=args.use_structured_output,
+        specialist_transport=args.specialist_transport,
+        specialist_api_key=args.specialist_api_key or None,
+        specialist_model_name=args.specialist_model_name or None,
+        max_parse_repairs=args.max_parse_repairs,
+        prefer_encoder_nli=args.prefer_encoder_nli,
     )
 
     # --- Audit-log signing (v0.3.9) ---

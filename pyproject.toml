@@ -32,6 +32,10 @@ dev = [
     "mypy>=1.0,<2",
     "httpx>=0.24,<1",
 ]
+nli = [
+    "transformers>=4.40,<5",
+    "torch>=2.2,<3",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

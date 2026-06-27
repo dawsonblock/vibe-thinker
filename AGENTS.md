@@ -1,8 +1,11 @@
 # vibe-thinker — project notes for agents
 
 ## Verify / test
-- Full suite: `python3 -m pytest -q` (724 tests, ~130s, no live servers needed)
+- Full suite: `python3 -m pytest -q` (903 tests, ~125s, no live servers needed)
 - Routing + REPL only: `python3 -m pytest tests/test_routing.py tests/test_repl.py -q`
+- Format enforcer + chat transports + repair loop: `python3 -m pytest tests/test_format_enforcer.py -q`
+- Citation-backed NLI factual verifier: `python3 -m pytest tests/test_factual_verifier.py -q`
+- Encoder NLI judge (optional): `python3 -m pytest tests/test_nli_encoder.py -q`
 - Warm pool + code verifier: `python3 -m pytest tests/test_warm_pool.py tests/test_code_verifier.py -q`
 - Trajectory store: `python3 -m pytest tests/test_trajectory_store.py -q`
 - Grammar enforcement: `python3 -m pytest tests/test_clr_scoring.py::TestGrammarEnforcement -q`
@@ -132,15 +135,85 @@ fixes:
    `\\boxed\s*\{` to handle this. Fixed in `verifiers/math_verifier.py`
    (`_extract_boxed`) and `vibe_clr_async.py` (`_extract_boxed_answer`
    and the fallback in `_extract_claims_and_answer`).
-2. **Structured JSON output schema.** A new GBNF grammar
-   (`_STRUCTURED_OUTPUT_GRAMMAR` in `vibe_clr_async.py`) forces the
-   specialist to output JSON with distinct keys: `reasoning_steps`
-   (array), `boxed_answer` (string|null), `code_solution` (string|null).
-   The `parse_structured_output()` static method extracts these keys
-   directly — no regex scraping needed. When the specialist uses this
-   grammar, the orchestrator reads the answer from the `boxed_answer`
-   or `code_solution` key. Falls back to regex extraction for
-   unstructured outputs (backward-compatible).
+2. **Structured JSON output schema.** A GBNF grammar
+   (`STRUCTURED_OUTPUT_GRAMMAR`, now defined in `format_enforcer.py` and
+   re-imported into `vibe_clr_async.py` as `_STRUCTURED_OUTPUT_GRAMMAR`)
+   forces the specialist to output JSON with distinct keys:
+   `reasoning_steps` (array), `boxed_answer` (string|null),
+   `code_solution` (string|null). The `parse_structured_output()` static
+   method delegates to `format_enforcer.parse_structured_output` and
+   extracts these keys directly — no regex scraping needed. When the
+   specialist uses this grammar, the orchestrator reads the answer from
+   the `boxed_answer` or `code_solution` key. Falls back to regex
+   extraction for unstructured outputs (backward-compatible).
+
+## API-agnostic structured outputs (v1.1)
+Decouples the structured-output contract from llama.cpp GBNF so the
+specialist can target any upstream API (OpenAI, Anthropic, vLLM) without
+silently dropping the JSON constraint. Three pieces:
+
+### FormatEnforcer abstraction (`format_enforcer.py`)
+A `FormatEnforcer` protocol maps one structured-output contract to each
+provider's native enforcement mechanism. Two contracts (`SchemaKind`):
+- `STRUCTURED_OUTPUT` — `reasoning_steps`, `boxed_answer`, `code_solution`.
+- `CLAIMS` — `claims`, `final_answer` (the claim-extraction grammar).
+Three enforcers:
+- `LlamaCppEnforcer` — returns the canonical GBNF strings
+  (`CLAIMS_JSON_GRAMMAR`, `STRUCTURED_OUTPUT_GRAMMAR`). These are the
+  single source of truth; `vibe_clr_async.py` imports them back as
+  `_CLAIMS_JSON_GRAMMAR` / `_STRUCTURED_OUTPUT_GRAMMAR` so the
+  in-process and `/completion` paths keep byte-identical behavior
+  (identity is preserved — `grammar == _CLAIMS_JSON_GRAMMAR` still works).
+- `OpenAIEnforcer` — `to_openai_response_format()` returns
+  `{"type":"json_schema","json_schema":{"strict":true,"schema":...}}`.
+  `strict=False` falls back to `{"type":"json_object"}`.
+- `AnthropicEnforcer` — `to_anthropic_tool()` returns a tool definition;
+  the transport sets `tool_choice={"type":"tool","name":...}` to force
+  the payload as a `tool_use` block. The transport extracts the tool
+  `input` and returns it as a JSON string for the shared parser.
+All enforcers share `parse_structured_output()` (the JSON shape is
+provider-independent) and `repair_prompt()` for the parse-repair loop.
+`make_enforcer(kind, transport)` factory.
+
+### Specialist chat-completions transport
+The specialist HTTP path was hardcoded to llama-server's `/completion`
+endpoint, which OpenAI/Anthropic don't have. New `specialist_transport`
+constructor param (CLI `--specialist-transport {completion,openai_chat,anthropic}`,
+env `VIBE_THINKER_SPECIALIST_TRANSPORT`):
+- `completion` (default) — unchanged llama-server/RuvLLM `/completion`.
+- `openai_chat` — POSTs to `/v1/chat/completions` with
+  `response_format` from the enforcer. Auth via `Authorization: Bearer`.
+- `anthropic` — POSTs to `/v1/messages` with `tools` + `tool_choice`
+  from the enforcer. Auth via `x-api-key` + `anthropic-version`.
+ChatML is stripped from the raw prompt into a `messages` array (with
+optional assistant prefill). `--specialist-api-key` /
+`VIBE_THINKER_SPECIALIST_API_KEY` and `--specialist-model-name` /
+`VIBE_THINKER_SPECIALIST_MODEL_NAME` configure auth and model name.
+Ignored when `--local-specialist-model` is set (in-process backend has
+its own path). The key is never logged.
+
+### Parse-repair loop
+On transports without native grammar enforcement, the model can emit
+malformed JSON. `_call_model_with_repair` wraps `_call_model`: after the
+response, it parses with the enforcer; on failure, it feeds the bad text
++ a concrete parse error (`parse_error_detail`) back to the model at
+`temperature=0.0` for a corrected attempt. Bounded by `max_parse_repairs`
+(default 2, 0 disables; CLI `--max-parse-repairs` / `MAX_PARSE_REPAIRS`).
+Fail-closed: if no repair parses, returns `(raw, None)` and the caller
+falls back to regex extraction — never fakes a successful parse. Wired
+into `_generate_one_trajectory` and `_generate_lightweight_trajectory`
+for structured-output calls. Mirrors the code-specialist
+`max_repair_attempts` pattern but is distinct (this repairs JSON
+parsing, not code bugs).
+
+### Tests
+`tests/test_format_enforcer.py` (32 tests): enforcer rendering for all
+three transports, byte-identity of the GBNF strings, shared parser
+(valid/invalid/markdown/claims/nullish), repair-prompt construction,
+the repair loop (recover / cap-respected / disabled / grammar-None),
+and the OpenAI + Anthropic transports (native enforcement applied,
+ChatML stripped, auth headers, tool_use extraction, text fallback).
+Run: `python3 -m pytest tests/test_format_enforcer.py -q`.
 
 ## Iterative code repair (v0.4.0)
 Extends the multi-candidate code loop (`_run_code_specialist_verified`) with
@@ -605,6 +678,111 @@ NLI judge (ENTAILMENT/CONTRADICTION/NEUTRAL). The lexical fallback now
 detects negation polarity mismatches ("Paris is NOT the capital" vs a
 source saying "Paris is the capital") and rejects them. The orchestrator
 wires `self._call_generalist` as the judge automatically.
+
+### Citation-backed NLI (v1.1)
+The LLM-judge NLI path was hardened to prevent a hallucinating judge from
+fabricating support. The judge prompt now requires JSON:
+`{"verdict": "...", "supporting_quote": "..."}`. For an ENTAILMENT
+verdict, the verifier performs a **normalized substring check** — the
+judge's `supporting_quote` must actually appear in the source text (after
+casefolding, whitespace collapse, and quote/punctuation stripping). If
+the quote is absent, the verdict is voided — fail-closed.
+- Citation verified → `nli_citation_backed`, score **0.8** (above the
+  0.75 cache trust threshold — safe because the quote is real).
+- Citation mismatch (fabricated quote) → `nli_citation_mismatch`,
+  score **0.0**.
+- Old-style single-word verdict (no JSON/citation, backward compat) →
+  `nli_llm_judge`, score **0.7** (BELOW the 0.75 cache threshold, so
+  un-cited entailment can no longer poison the CLR cache — this was the
+  v0.4.0 risk: a hallucinating judge at 0.85 could get cached).
+- CONTRADICTION with a quote → `nli_citation_backed`, score 0.0.
+- NEUTRAL / judge error / no judge → unchanged fail-closed paths.
+The normalization is deliberately conservative (no lemmatization, no
+synonym mapping) so a real match is meaningful. Run:
+`python3 -m pytest tests/test_factual_verifier.py -q` (26 tests).
+
+### Encoder-only NLI judge (v1.1, optional)
+`verifiers/nli_encoder.py` provides an alternative to the LLM-judge NLI
+path: a dedicated encoder-only model fine-tuned for Natural Language
+Inference (default `cross-encoder/nli-deberta-v3-base`, override via
+`VIBE_THINKER_NLI_MODEL`). Encoder-only models output fixed probabilities
+for [entailment, neutral, contradiction] — they are not generative, so
+they cannot hallucinate a verdict.
+- **Optional extra**: `pip install "vibe-thinker[nli]"` (transformers +
+  torch). Not a core dependency — follows the project's pattern for
+  `cryptography`, `z3-solver`, `llama-cpp-python`.
+- **Opt-in**: `--prefer-encoder-nli` CLI flag /
+  `VIBE_THINKER_PREFER_ENCODER_NLI` env var. Default off — the model
+  downloads from HuggingFace on first use, so it's not enabled by default.
+- **Fail-closed**: when transformers/torch are absent, or the model can't
+  load, `select_verifier` falls back to the LLM judge (or
+  `nli_unavailable`). `is_available()` checks deps without importing them
+  eagerly. The model loads lazily on first `__call__` (construction is
+  cheap — no network, no RAM).
+- **Honest scoring**: the encoder returns the same JSON shape as the LLM
+  judge but with an empty `supporting_quote` (encoder models classify but
+  don't extract spans). The FactualVerifier treats this as an un-cited
+  verdict — score 0.7, below the 0.75 cache threshold. An encoder NLI
+  verdict is stronger than self-claims but does not carry a verifiable
+  citation, so it does not get the 0.8 citation-backed score.
+- **Determinism**: on CPU the encoder is deterministic. The constructor
+  sets `torch.manual_seed(0)` and enables deterministic algorithms when
+  `deterministic=True` (default). On GPU/MPS, set seeds explicitly for
+  true reproducibility.
+- **Low-confidence downgrade**: verdicts below `threshold` (default 0.6)
+  are downgraded to NEUTRAL (honest uncertainty → fail-closed).
+Run: `python3 -m pytest tests/test_nli_encoder.py -q` (17 tests, no model
+download — inference is mocked).
+
+### Process-pool mode for in-process specialist (v1.1, opt-in)
+The in-process specialist pool historically used a `queue.Queue` of Llama
+instances + `ThreadPoolExecutor` (shared GIL). A new `local_pool_kind`
+param adds a `ProcessPoolExecutor` option where each worker loads its own
+Llama instance (worker-local global), giving each worker its own GIL.
+This eliminates Python-side lock contention under extreme concurrency.
+- **Opt-in**: `--local-specialist-pool-kind process` CLI flag /
+  `VIBE_THINKER_LOCAL_POOL_KIND` env var. Default `thread` (unchanged).
+- **RAM guardrail**: before starting the process pool, estimates the
+  model size from the GGUF file (`_estimate_model_ram_mb`) and compares
+  `model_mb * pool_size * 1.5` (KV cache + runtime overhead) against
+  available RAM (`_available_ram_mb`, uses psutil if installed, else a
+  conservative 4GB cap). If the estimate exceeds available RAM, falls
+  back to thread mode with a warning. This prevents the OOM the original
+  plan flagged. For HuggingFace repo IDs (not local files), the guardrail
+  is skipped with a warning — the user monitors RAM manually.
+- **Worker functions** (`_process_pool_worker_init`, `_process_pool_worker_call`):
+  module-level functions (picklable). The init function loads one Llama
+  + compiles one `LlamaGrammar` per worker (LlamaGrammar is not
+  picklable, so it can't be shared across processes). The call function
+  resolves the grammar inside the worker (pre-compiled claims grammar or
+  on-demand compile) and runs inference.
+- **Dispatch**: `_call_model` checks `_local_process_pool` in addition to
+  `_local_llm` and `_local_llm_pool`. `_call_model_inprocess` has a
+  process-pool branch that submits to the executor and awaits the future.
+- **Backend tag**: `in-process-process-pool` (distinct from
+  `in-process-pool` for thread mode and `in-process` for single-instance).
+- **RuvLLM compatible**: the worker init function handles both
+  `llama-cpp-python` and `RuvLLMBinding` (passes the raw GBNF string).
+- **Fail-closed**: on any worker error, raises `RuntimeError` (caller
+  handles). On pool construction failure, falls back to HTTP.
+Run: `python3 -m pytest tests/test_clr_scoring.py::TestProcessPool -q`
+(8 tests, mock-based — no real model load, no worker processes spawned).
+
+### RuvLLM direction decision (v1.1)
+The original integration plan conflated two RuvLLM integration directions:
+(a) a sync `__call__`-compatible binding that drops into the existing
+pool as a Llama replacement, and (b) an async batched engine that
+bypasses the executor. **Decision: pursue (a), not (b).** The existing
+pool infrastructure (thread queue, process pool with RAM guardrail,
+per-instance grammar) already handles parallelism — a sync binding
+reuses all of it with zero new code paths. An async batched engine would
+require a new dispatch path, new tests, and a new concurrency model
+bypassing the semaphore/executor guardrails, for negligible latency win.
+The process-pool mode (above) already gives each worker its own GIL, so
+Python-side lock contention is not a reason to go async. The binding
+contract: `__call__(prompt, max_tokens, temperature, stop, grammar)`
+returns `{"choices": [{"text": "..."}]}`, grammar is a raw GBNF string.
+Documented in `ruvllm_adapter.py` module docstring.
 
 ### Session init race fix
 `_get_session()` is now async with a double-checked `asyncio.Lock`. The

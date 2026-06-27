@@ -1,4 +1,16 @@
-"""Pytest tests for the factual verifier (NLI judge, fail-closed v0.4.0)."""
+"""Pytest tests for the factual verifier (citation-backed NLI, v1.1).
+
+v1.1 changes:
+  - The judge prompt now requires JSON: {"verdict", "supporting_quote"}.
+  - ENTAILMENT with a verified quote → nli_citation_backed, score 0.8.
+  - ENTAILMENT with a fabricated quote → nli_citation_mismatch, score 0.0.
+  - Old-style single-word verdicts (no citation) still parse but score
+    0.7 (below the 0.75 cache threshold) so un-cited entailment cannot
+    poison the CLR cache.
+  - Fail-closed paths (no judge, judge error, all NEUTRAL) unchanged.
+"""
+
+import json
 
 import pytest
 from unittest.mock import AsyncMock
@@ -63,9 +75,162 @@ class TestFactualVerifierNoJudge:
         assert result.method == "nli_unavailable"
 
 
-class TestFactualVerifierNLI:
+class TestFactualVerifierCitationBacked:
+    """v1.1: citation-backed NLI — the judge provides a supporting quote
+    that is verified to actually appear in the source."""
+
     @pytest.mark.asyncio
-    async def test_nli_entailment_verifies(self, nli_verifier):
+    async def test_entailment_with_verified_quote_succeeds(self, nli_verifier):
+        """JSON verdict + quote that exists in source → verified, 0.8."""
+        verifier, judge = nli_verifier
+        judge.return_value = json.dumps({
+            "verdict": "ENTAILMENT",
+            "supporting_quote": "Paris is the capital of France.",
+        })
+        result = await verifier.verify(
+            "What is the capital of France?",
+            "The capital of France is Paris.",
+            context={"sources": ["Paris is the capital of France."]},
+        )
+        assert result.verified is True
+        assert result.method == "nli_citation_backed"
+        assert result.score == 0.8
+        assert result.evidence["quote"] == "Paris is the capital of France."
+
+    @pytest.mark.asyncio
+    async def test_entailment_with_normalized_quote_succeeds(self, nli_verifier):
+        """Quote with different casing/whitespace still matches after
+        normalization."""
+        verifier, judge = nli_verifier
+        judge.return_value = json.dumps({
+            "verdict": "ENTAILMENT",
+            "supporting_quote": "  PARIS  is the  Capital  of France.  ",
+        })
+        result = await verifier.verify(
+            "What is the capital of France?",
+            "The capital of France is Paris.",
+            context={"sources": ["Paris is the capital of France."]},
+        )
+        assert result.verified is True
+        assert result.method == "nli_citation_backed"
+        assert result.score == 0.8
+
+    @pytest.mark.asyncio
+    async def test_entailment_with_fabricated_quote_fails_closed(self, nli_verifier):
+        """JSON verdict + quote NOT in source → nli_citation_mismatch, 0.0.
+
+        This is the key v1.1 hardening: a hallucinating judge cannot
+        fabricate support because the quote must exist in the source.
+        """
+        verifier, judge = nli_verifier
+        judge.return_value = json.dumps({
+            "verdict": "ENTAILMENT",
+            "supporting_quote": "Berlin is the capital of Germany.",
+        })
+        result = await verifier.verify(
+            "What is the capital of France?",
+            "The capital of France is Berlin.",
+            context={"sources": ["Paris is the capital of France."]},
+        )
+        assert result.verified is False
+        assert result.method == "nli_citation_mismatch"
+        assert result.score == 0.0
+        assert "citation verification failed" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_entailment_with_paraphrased_quote_fails_closed(self, nli_verifier):
+        """A paraphrased quote (not a verbatim substring) does NOT match —
+        fail-closed. The citation check requires a real substring, not a
+        semantic approximation."""
+        verifier, judge = nli_verifier
+        judge.return_value = json.dumps({
+            "verdict": "ENTAILMENT",
+            "supporting_quote": "The French capital is Paris.",
+        })
+        result = await verifier.verify(
+            "What is the capital of France?",
+            "The capital of France is Paris.",
+            context={"sources": ["Paris is the capital of France."]},
+        )
+        assert result.verified is False
+        assert result.method == "nli_citation_mismatch"
+        assert result.score == 0.0
+
+    @pytest.mark.asyncio
+    async def test_entailment_empty_quote_falls_back_to_uncited(self, nli_verifier):
+        """JSON verdict with empty quote → old-style un-cited path, 0.7
+        (below the 0.75 cache threshold)."""
+        verifier, judge = nli_verifier
+        judge.return_value = json.dumps({
+            "verdict": "ENTAILMENT",
+            "supporting_quote": "",
+        })
+        result = await verifier.verify(
+            "What is the capital of France?",
+            "The capital of France is Paris.",
+            context={"sources": ["Paris is the capital of France."]},
+        )
+        assert result.verified is True
+        assert result.method == "nli_llm_judge"
+        assert result.score == 0.7
+
+    @pytest.mark.asyncio
+    async def test_contradiction_with_quote_rejects(self, nli_verifier):
+        """CONTRADICTION with a quote → rejected, nli_citation_backed."""
+        verifier, judge = nli_verifier
+        judge.return_value = json.dumps({
+            "verdict": "CONTRADICTION",
+            "supporting_quote": "Paris is the capital of France.",
+        })
+        result = await verifier.verify(
+            "What is the capital of France?",
+            "The capital of France is Berlin.",
+            context={"sources": ["Paris is the capital of France."]},
+        )
+        assert result.verified is False
+        assert result.method == "nli_citation_backed"
+        assert "contradicts" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_neutral_fails_closed(self, nli_verifier):
+        """All sources NEUTRAL → fail-closed (no lexical fallback)."""
+        verifier, judge = nli_verifier
+        judge.return_value = json.dumps({
+            "verdict": "NEUTRAL",
+            "supporting_quote": "",
+        })
+        result = await verifier.verify(
+            "What is the capital of France?",
+            "The capital of France is Paris, a major European city.",
+            context={"sources": ["Paris is the capital and largest city of France."]},
+        )
+        assert result.verified is False
+        assert result.method == "nli_neutral"
+        assert result.score == 0.0
+
+    @pytest.mark.asyncio
+    async def test_judge_failure_fails_closed(self, nli_verifier):
+        """LLM judge failure → fail-closed (no lexical fallback)."""
+        verifier, judge = nli_verifier
+        judge.side_effect = RuntimeError("LLM unavailable")
+        result = await verifier.verify(
+            "What is the capital of France?",
+            "The capital of France is Paris, a major European city.",
+            context={"sources": ["Paris is the capital and largest city of France."]},
+        )
+        assert result.verified is False
+        assert result.method == "nli_judge_error"
+        assert result.score == 0.0
+
+
+class TestFactualVerifierBackwardCompat:
+    """Old-style single-word verdicts (no JSON/citation) still parse for
+    backward compatibility with judges that don't output JSON. They score
+    0.7 — below the 0.75 cache threshold — so un-cited entailment cannot
+    poison the CLR cache (v1.1 hardening)."""
+
+    @pytest.mark.asyncio
+    async def test_old_style_entailment_scores_below_cache_threshold(self, nli_verifier):
         verifier, judge = nli_verifier
         judge.return_value = "ENTAILMENT"
         result = await verifier.verify(
@@ -75,10 +240,10 @@ class TestFactualVerifierNLI:
         )
         assert result.verified is True
         assert result.method == "nli_llm_judge"
-        assert result.score == 0.85
+        assert result.score == 0.7  # below the 0.75 cache threshold
 
     @pytest.mark.asyncio
-    async def test_nli_contradiction_rejects(self, nli_verifier):
+    async def test_old_style_contradiction_rejects(self, nli_verifier):
         verifier, judge = nli_verifier
         judge.return_value = "CONTRADICTION"
         result = await verifier.verify(
@@ -91,8 +256,7 @@ class TestFactualVerifierNLI:
         assert "contradicts" in (result.error or "")
 
     @pytest.mark.asyncio
-    async def test_nli_neutral_fails_closed(self, nli_verifier):
-        """v0.4.0: all sources NEUTRAL → fail-closed (no lexical fallback)."""
+    async def test_old_style_neutral_fails_closed(self, nli_verifier):
         verifier, judge = nli_verifier
         judge.return_value = "NEUTRAL"
         result = await verifier.verify(
@@ -100,27 +264,12 @@ class TestFactualVerifierNLI:
             "The capital of France is Paris, a major European city.",
             context={"sources": ["Paris is the capital and largest city of France."]},
         )
-        # All sources NEUTRAL → fail-closed (lexical fallback removed in v0.4.0)
         assert result.verified is False
         assert result.method == "nli_neutral"
         assert result.score == 0.0
 
     @pytest.mark.asyncio
-    async def test_nli_judge_failure_fails_closed(self, nli_verifier):
-        """v0.4.0: LLM judge failure → fail-closed (no lexical fallback)."""
-        verifier, judge = nli_verifier
-        judge.side_effect = RuntimeError("LLM unavailable")
-        result = await verifier.verify(
-            "What is the capital of France?",
-            "The capital of France is Paris, a major European city.",
-            context={"sources": ["Paris is the capital and largest city of France."]},
-        )
-        assert result.verified is False
-        assert result.method == "nli_judge_error"
-        assert result.score == 0.0
-
-    @pytest.mark.asyncio
-    async def test_nli_parses_lowercase_verdict(self, nli_verifier):
+    async def test_lowercase_verdict_parses(self, nli_verifier):
         verifier, judge = nli_verifier
         judge.return_value = "entailment"
         result = await verifier.verify(
@@ -132,7 +281,7 @@ class TestFactualVerifierNLI:
         assert result.method == "nli_llm_judge"
 
     @pytest.mark.asyncio
-    async def test_nli_unparseable_response_treated_as_neutral(self, nli_verifier):
+    async def test_unparseable_response_treated_as_neutral(self, nli_verifier):
         verifier, judge = nli_verifier
         judge.return_value = "I think the answer is correct."
         result = await verifier.verify(
@@ -140,6 +289,62 @@ class TestFactualVerifierNLI:
             "The capital of France is Berlin.",
             context={"sources": ["London is the capital of England."]},
         )
-        # Unparseable → NEUTRAL → fail-closed (v0.4.0: no lexical fallback)
         assert result.verified is False
         assert result.method == "nli_neutral"
+
+    @pytest.mark.asyncio
+    async def test_malformed_json_treated_as_old_style(self, nli_verifier):
+        """Malformed JSON falls back to the single-word parser."""
+        verifier, judge = nli_verifier
+        judge.return_value = '{"verdict": "ENTAILMENT", broken'
+        result = await verifier.verify(
+            "What is the capital of France?",
+            "The capital of France is Paris.",
+            context={"sources": ["Paris is the capital of France."]},
+        )
+        # The broken JSON has "ENTAILMENT" in the text, so the fallback
+        # single-word parser picks it up as an un-cited verdict (0.7).
+        assert result.verified is True
+        assert result.method == "nli_llm_judge"
+        assert result.score == 0.7
+
+
+class TestNormalization:
+    """Unit tests for the citation normalization helpers."""
+
+    def test_normalize_collapses_whitespace(self):
+        assert FactualVerifier._normalize_span("  a    b  ") == "a b"
+
+    def test_normalize_casefolds(self):
+        assert FactualVerifier._normalize_span("PARIS") == "paris"
+
+    def test_normalize_strips_quotes_and_punctuation(self):
+        assert FactualVerifier._normalize_span('"Paris."') == "paris"
+
+    def test_verify_quote_exact_match(self):
+        assert FactualVerifier._verify_quote_in_source(
+            "Paris is the capital", "Paris is the capital of France."
+        )
+
+    def test_verify_quote_case_insensitive(self):
+        assert FactualVerifier._verify_quote_in_source(
+            "PARIS IS THE CAPITAL", "paris is the capital of france."
+        )
+
+    def test_verify_quote_whitespace_tolerant(self):
+        assert FactualVerifier._verify_quote_in_source(
+            "Paris   is   the   capital", "Paris is the capital of France."
+        )
+
+    def test_verify_quote_paraphrase_fails(self):
+        assert not FactualVerifier._verify_quote_in_source(
+            "The French capital is Paris", "Paris is the capital of France."
+        )
+
+    def test_verify_quote_empty_fails(self):
+        assert not FactualVerifier._verify_quote_in_source("", "anything")
+
+    def test_verify_quote_not_in_source_fails(self):
+        assert not FactualVerifier._verify_quote_in_source(
+            "Berlin is the capital", "Paris is the capital of France."
+        )
