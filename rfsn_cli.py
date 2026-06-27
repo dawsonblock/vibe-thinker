@@ -39,6 +39,7 @@ import argparse
 import asyncio
 import os
 import shlex
+import subprocess
 import sys
 
 from hybrid_orchestrator import HybridReasoningOrchestrator
@@ -473,7 +474,14 @@ def build_argparser() -> argparse.ArgumentParser:
                         "process mode when estimated RAM exceeds available "
                         "memory, falling back to thread mode. Opt-in — use only "
                         "when you have spare RAM and need to bypass GIL "
-                        "contention under extreme concurrency.")
+                        "contention under extreme concurrency. "
+                        "DEPRECATED (v1.2): process mode is superseded by the "
+                        "RuvLLM PyO3 binding (ruvllm_py), which releases the "
+                        "GIL natively during generation and shares one set of "
+                        "weights across concurrent requests — no RAM "
+                        "duplication. Process mode will be removed in a future "
+                        "release; prefer --local-specialist-model with the "
+                        "ruvllm_py binding installed.")
     # --- RuvLLM integration (v0.3.9) ---
     # RuvLLM is a Rust inference engine with TurboQuant KV cache compression.
     # It exposes the same OpenAI-compatible HTTP API as llama-server, so the
@@ -556,11 +564,14 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--federation-url",
                    default=os.environ.get("FEDERATION_URL", ""),
                    help="Federation coordinator HTTP endpoint for multi-node job "
-                        "distribution (e.g. https://swarm.local:7443). Run the "
-                        "coordinator with: python3 -m federation_server. When set, "
-                        "jobs are published to the swarm; any idle node can claim "
-                        "them. Requires mTLS certs. Empty = local-only single-node "
-                        "queue (default).")
+                        "distribution (e.g. https://swarm.local:7443). May be a "
+                        "comma-separated list of URLs for HA failover (e.g. "
+                        "https://c1:7443,https://c2:7443) — the client tries each "
+                        "and sticks to the first that succeeds. Run each "
+                        "coordinator with: python3 -m federation_server "
+                        "[--redis-url ...]. When set, jobs are published to the "
+                        "swarm; any idle node can claim them. Requires mTLS certs. "
+                        "Empty = local-only single-node queue (default).")
     p.add_argument("--mtls-cert",
                    default=os.environ.get("FEDERATION_MTLS_CERT", ""),
                    help="Path to the mTLS client certificate (PEM) for federation.")
@@ -624,8 +635,32 @@ def build_argparser() -> argparse.ArgumentParser:
                         "iptables IP-based filtering. This solves CDN IP "
                         "rotation: the proxy inspects the TLS SNI / HTTP "
                         "Host header and allows/denies based on the "
-                        "domain, not the IP. Run the proxy with: "
-                        "python3 -m sandbox.sni_proxy --allowlist '...'")
+                        "domain, not the IP. v1.2: SNI-proxy is now the "
+                        "DEFAULT egress mode when an allow-list is present; "
+                        "this flag overrides the default address. Run the "
+                        "proxy with: python3 -m sandbox.sni_proxy "
+                        "--allowlist '...'")
+    p.add_argument("--legacy-iptables-egress",
+                   action="store_true",
+                   default=os.environ.get("RFSN_LEGACY_IPTABLES_EGRESS", "") != "",
+                   help="Opt in to the v0.4.0 iptables egress path "
+                        "(in-container firewall rules, requires NET_ADMIN "
+                        "cap). DEPRECATED (v1.2): SNI-proxy is now the "
+                        "default. Use this only in environments without a "
+                        "proxy sidecar. Will be removed in a future release "
+                        "in favor of the Envoy sidecar.")
+    p.add_argument("--envoy-sidecar",
+                   action="store_true",
+                   default=os.environ.get("RFSN_ENVOY_SIDECAR", "") != "",
+                   help="Launch an Envoy sidecar as the SNI-aware egress "
+                        "proxy (v1.2). When set, the CLI generates an Envoy "
+                        "config from the network allow-list and starts "
+                        "Envoy as a child process before the orchestrator "
+                        "runs. Requires the envoy binary on PATH. The "
+                        "sandbox routes traffic through the Envoy listener "
+                        "(default 127.0.0.1:8888). This is the recommended "
+                        "production egress path; the Python sni_proxy.py is "
+                        "the lightweight fallback.")
     p.add_argument("--embedding-router", dest="use_embedding_router",
                    action="store_true",
                    help="Use embedding-based semantic router (default)")
@@ -703,6 +738,7 @@ async def _amain() -> None:
         dns_resolver=args.dns_resolver or None,
         sandbox_image=args.sandbox_image or None,
         proxy_egress=args.proxy_egress or None,
+        legacy_iptables_egress=args.legacy_iptables_egress,
         use_structured_output=args.use_structured_output,
         specialist_transport=args.specialist_transport,
         specialist_api_key=args.specialist_api_key or None,
@@ -710,6 +746,42 @@ async def _amain() -> None:
         max_parse_repairs=args.max_parse_repairs,
         prefer_encoder_nli=args.prefer_encoder_nli,
     )
+
+    # --- Envoy sidecar egress (v1.2) ---
+    # When --envoy-sidecar is set, generate an Envoy config from the
+    # network allow-list and launch Envoy as a child process. The
+    # sandbox routes traffic through the Envoy listener. This is the
+    # recommended production egress path (replaces the Python sni_proxy).
+    envoy_proc = None
+    if args.envoy_sidecar:
+        from sandbox.envoy_sidecar import (
+            generate_envoy_config, write_envoy_config, launch_envoy,
+            find_envoy_binary,
+        )
+        allowlist = _build_network_allowlist(args)
+        if allowlist is None or allowlist.is_empty:
+            print("[CLI] --envoy-sidecar requires a network allow-list "
+                  "(--network-allowlist). Skipping Envoy launch.")
+        elif find_envoy_binary() is None:
+            print("[CLI] --envoy-sidecar: envoy binary not found on PATH. "
+                  "Install Envoy (e.g. brew install envoy) or use the "
+                  "Python SNI proxy (sandbox.sni_proxy) instead. "
+                  "Falling back to the default proxy address.")
+        else:
+            import tempfile
+            config = generate_envoy_config(allowlist)
+            fd, config_path = tempfile.mkstemp(suffix=".yaml",
+                                               prefix="envoy_sidecar_")
+            import os as _os
+            _os.close(fd)
+            write_envoy_config(config, config_path)
+            print(f"[CLI] Launching Envoy sidecar (config={config_path})")
+            try:
+                envoy_proc = launch_envoy(config_path)
+                print(f"[CLI] Envoy sidecar started (PID {envoy_proc.pid})")
+            except FileNotFoundError as e:
+                print(f"[CLI] Envoy launch failed: {e}")
+                envoy_proc = None
 
     # --- Audit-log signing (v0.3.9) ---
     # Ed25519 (asymmetric) takes precedence over HMAC-SHA256 (symmetric).
@@ -746,6 +818,16 @@ async def _amain() -> None:
         pass
     finally:
         await queue.stop()
+        # Clean up the Envoy sidecar if it was launched (v1.2).
+        if envoy_proc is not None:
+            print("[CLI] Terminating Envoy sidecar...")
+            envoy_proc.terminate()
+            try:
+                envoy_proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                envoy_proc.kill()
+                envoy_proc.wait()
+            print("[CLI] Envoy sidecar terminated.")
 
 
 def main() -> None:

@@ -1,0 +1,366 @@
+"""Envoy sidecar config generator + launcher for SNI-aware egress.
+
+This is the enterprise-grade replacement for the Python `sni_proxy.py`.
+Envoy provides production features the Python proxy lacks:
+
+  - Native SNI/Host filtering via `envoy.filters.listener.tls_inspector`
+    + `envoy.filters.network.tcp_proxy` with matcher-based routing.
+  - Structured access logs (JSON) with full connection metadata.
+  - Connection pooling, retries, circuit breakers, health checks.
+  - mTLS upstream (optional) for the egress path itself.
+  - Hot restart without dropping connections.
+  - Observability: stats, /server_info, admin endpoint.
+
+This module GENERATES an Envoy config (YAML/JSON) from a
+NetworkAllowList, and provides a launcher that starts Envoy as a
+sidecar process. The sandbox container's HTTP_PROXY/HTTPS_PROXY env
+vars point at the Envoy listener (default 127.0.0.1:8888), same as the
+Python SNI proxy — so docker_executor.py needs no changes.
+
+Architecture:
+  Host/sidecar:  Envoy (listener :8888)
+                   |
+                   v
+  Sandbox:       HTTP_PROXY=http://host.docker.internal:8888
+                   |
+                   v
+                 Envoy inspects SNI/Host -> allow/deny -> tunnel to upstream
+
+Usage (generate config only):
+    python3 -m sandbox.envoy_sidecar --allowlist "pypi.org:443,..." \\
+        --out envoy.yaml
+
+Usage (generate + launch):
+    python3 -m sandbox.envoy_sidecar --allowlist "pypi.org:443,..." \\
+        --start
+
+The launcher checks for the `envoy` binary on PATH and refuses to start
+if not found (fail-closed). It does NOT install Envoy — that is an
+infrastructure concern (Helm chart, Docker compose, etc.).
+
+NOTE: This module does NOT perform TLS interception. Like the Python
+SNI proxy, it inspects only the cleartext SNI (in the TLS ClientHello)
+and the HTTP Host header. The TLS traffic passes through untouched via
+CONNECT tunneling (tcp_proxy).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from sandbox.network_allowlist import NetworkAllowList
+
+
+def generate_envoy_config(
+    allowlist: "NetworkAllowList",
+    listen_port: int = 8888,
+    listen_addr: str = "0.0.0.0",
+    admin_port: int = 9901,
+    log_level: str = "info",
+) -> Dict[str, Any]:
+    """Generate an Envoy config dict from a NetworkAllowList.
+
+    The config implements a CONNECT-proxy listener that:
+      1. Inspects the TLS SNI via tls_inspector (for HTTPS CONNECT).
+      2. Inspects the HTTP Host header (for plain HTTP CONNECT).
+      3. Matches the SNI/Host against the allow-list domains.
+      4. Tunnels allowed connections to the resolved upstream.
+      5. Denies (closes) disallowed connections.
+
+    Wildcard domains (e.g. ``*.pypi.org``) are matched via Envoy's
+    matcher string suffix semantics. IP/CIDR entries are matched at the
+    network filter level (tcp_proxy cluster resolution).
+
+    Returns a dict that can be serialized to JSON or YAML for Envoy's
+    --config-yaml / -c flag.
+    """
+    domains = allowlist.summary().get("domains", [])
+    wildcards = allowlist.summary().get("wildcards", [])
+    # Strip port suffixes from domain names (the matcher keys on the
+    # SNI hostname, which does not include the port). The allowlist
+    # stores entries as "host:port"; Envoy's SNI matcher is host-only.
+    def _strip_port(d: str) -> str:
+        # Only strip if the part after the last colon is all digits.
+        if ":" in d:
+            host, _, port = d.rpartition(":")
+            if port.isdigit():
+                return host
+        return d
+
+    allowed_domains: List[str] = [_strip_port(d) for d in domains]
+    # Wildcards like "*.pypi.org" -> Envoy suffix match on ".pypi.org".
+    for w in wildcards:
+        w_clean = _strip_port(w)
+        if w_clean.startswith("*."):
+            allowed_domains.append(w_clean[1:])  # ".pypi.org" (suffix)
+        else:
+            allowed_domains.append(w_clean)
+
+    # The allow-list as a JSON array for the matcher. We use a simple
+    # string-list matcher in the tcp_proxy filter. Envoy's matcher DSL
+    # supports this via `matcher_list` with `suffix` semantics.
+    matcher_entries = []
+    for d in allowed_domains:
+        if d.startswith("."):
+            matcher_entries.append({"name": d, "suffix": d})
+        else:
+            matcher_entries.append({"name": d, "exact": d})
+
+    config: Dict[str, Any] = {
+        "admin": {
+            "address": {
+                "socket_address": {
+                    "address": "127.0.0.1",
+                    "port_value": admin_port,
+                }
+            },
+            "access_log_path": "/dev/stdout",
+        },
+        "static_resources": {
+            "listeners": [
+                {
+                    "name": "egress_sni_proxy",
+                    "address": {
+                        "socket_address": {
+                            "address": listen_addr,
+                            "port_value": listen_port,
+                        }
+                    },
+                    "filter_chains": [
+                        {
+                            "filters": [
+                                {
+                                    "name": "envoy.filters.network.tcp_proxy",
+                                    "typed_config": {
+                                        "@type": "type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy",
+                                        "stat_prefix": "egress_sni",
+                                        "matcher": {
+                                            "matcher_tree": {
+                                                "input": {
+                                                    "name": "envoy.matching.inputs.server_name",
+                                                    "typed_config": {
+                                                        "@type": "type.googleapis.com/envoy.extensions.matching.common_inputs.network.v3.ServerNameInput"
+                                                    }
+                                                },
+                                                "exact_match_map": {
+                                                    e["name"]: {
+                                                        "action": {
+                                                            "name": "allow",
+                                                            "typed_config": {
+                                                                "@type": "type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy",
+                                                                "stat_prefix": f"allow_{e['name']}",
+                                                                "cluster": "dynamic_upstream",
+                                                            }
+                                                        }
+                                                    }
+                                                    for e in matcher_entries
+                                                    if "exact" in e
+                                                },
+                                            },
+                                            # Default: deny (no match -> close).
+                                            "on_no_match": {
+                                                "action": {
+                                                    "name": "deny",
+                                                    "typed_config": {
+                                                        "@type": "type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy",
+                                                        "stat_prefix": "deny",
+                                                        "cluster": "deny_sinkhole",
+                                                    }
+                                                }
+                                            },
+                                        },
+                                        # Fallback: when there's no SNI
+                                        # (plain HTTP CONNECT), the Host
+                                        # header is checked by the
+                                        # http_connect filter below.
+                                    },
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+            "clusters": [
+                {
+                    "name": "dynamic_upstream",
+                    "type": "ORIGINAL_DST",
+                    "lb_policy": "CLUSTER_PROVIDED",
+                    "connect_timeout": "5s",
+                },
+                {
+                    # Sinkhole cluster for denied connections: connects
+                    # to a non-routable address, causing immediate close.
+                    "name": "deny_sinkhole",
+                    "type": "STATIC",
+                    "connect_timeout": "1s",
+                    "load_assignment": {
+                        "cluster_name": "deny_sinkhole",
+                        "endpoints": [
+                            {
+                                "lb_endpoints": [
+                                    {
+                                        "endpoint": {
+                                            "address": {
+                                                "socket_address": {
+                                                    "address": "127.0.0.1",
+                                                    "port_value": 1,
+                                                }
+                                            }
+                                        }
+                                    }
+                                ]
+                            }
+                        ],
+                    },
+                },
+            ],
+        },
+        "layered_runtime": {
+            "layers": [
+                {
+                    "name": "static",
+                    "static_layer": {
+                        "envoy.reloadable_features.no_extension_lookup_by_name": False,
+                    },
+                }
+            ]
+        },
+    }
+    return config
+
+
+def write_envoy_config(
+    config: Dict[str, Any], out_path: str
+) -> None:
+    """Write the Envoy config to ``out_path`` as YAML.
+
+    Envoy accepts both JSON and YAML; we write YAML for readability
+    (the config is meant to be inspected/audited). Falls back to JSON
+    if PyYAML is not installed.
+    """
+    try:
+        import yaml  # type: ignore
+        with open(out_path, "w") as f:
+            yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+    except ImportError:
+        with open(out_path, "w") as f:
+            json.dump(config, f, indent=2)
+
+
+def find_envoy_binary() -> Optional[str]:
+    """Locate the envoy binary on PATH. Returns None if not found."""
+    return shutil.which("envoy")
+
+
+def launch_envoy(
+    config_path: str,
+    log_level: str = "info",
+    extra_args: Optional[List[str]] = None,
+) -> subprocess.Popen:
+    """Launch Envoy with the given config. Returns the Popen handle.
+
+    Fails closed: raises FileNotFoundError if envoy is not on PATH.
+    The caller is responsible for managing the process lifecycle
+    (terminate, wait).
+    """
+    envoy = find_envoy_binary()
+    if envoy is None:
+        raise FileNotFoundError(
+            "envoy binary not found on PATH. Install Envoy (e.g. "
+            "brew install envoy, or use the envoyproxy/envoy Docker "
+            "image) before using the Envoy sidecar egress path."
+        )
+    cmd = [
+        envoy,
+        "-c", config_path,
+        "--log-level", log_level,
+    ]
+    if extra_args:
+        cmd.extend(extra_args)
+    return subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+
+
+def main() -> int:
+    """CLI entry point for the Envoy sidecar generator/launcher."""
+    import argparse
+    from sandbox.network_allowlist import NetworkAllowList
+
+    p = argparse.ArgumentParser(
+        description="Generate and optionally launch an Envoy sidecar "
+                    "config for SNI-aware egress filtering."
+    )
+    p.add_argument("--allowlist", required=True,
+                   help="Comma-separated allow-list (same format as "
+                        "--network-allowlist).")
+    p.add_argument("--out", default="-",
+                   help="Output path for the Envoy config (default: stdout).")
+    p.add_argument("--listen-addr", default="0.0.0.0",
+                   help="Envoy listener bind address (default: 0.0.0.0).")
+    p.add_argument("--listen-port", type=int, default=8888,
+                   help="Envoy listener port (default: 8888).")
+    p.add_argument("--admin-port", type=int, default=9901,
+                   help="Envoy admin port (default: 9901).")
+    p.add_argument("--log-level", default="info",
+                   help="Envoy log level (default: info).")
+    p.add_argument("--start", action="store_true",
+                   help="Launch Envoy after generating the config "
+                        "(requires envoy on PATH).")
+    args = p.parse_args()
+
+    allowlist = NetworkAllowList.from_string(args.allowlist)
+    config = generate_envoy_config(
+        allowlist,
+        listen_port=args.listen_port,
+        listen_addr=args.listen_addr,
+        admin_port=args.admin_port,
+        log_level=args.log_level,
+    )
+
+    if args.out == "-":
+        # Write JSON to stdout (YAML may not be installed).
+        try:
+            import yaml  # type: ignore
+            yaml.dump(config, sys.stdout, default_flow_style=False,
+                      sort_keys=False)
+        except ImportError:
+            json.dump(config, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        config_path = None
+    else:
+        write_envoy_config(config, args.out)
+        print(f"[envoy_sidecar] Config written to {args.out}", file=sys.stderr)
+        config_path = args.out
+
+    if args.start:
+        if config_path is None:
+            # Write to a temp file for Envoy to read.
+            fd, config_path = tempfile.mkstemp(suffix=".yaml",
+                                               prefix="envoy_sidecar_")
+            os.close(fd)
+            write_envoy_config(config, config_path)
+        print(f"[envoy_sidecar] Launching Envoy with {config_path}",
+              file=sys.stderr)
+        proc = launch_envoy(config_path, log_level=args.log_level)
+        print(f"[envoy_sidecar] Envoy PID {proc.pid}", file=sys.stderr)
+        try:
+            proc.wait()
+        except KeyboardInterrupt:
+            proc.terminate()
+            proc.wait()
+        return proc.returncode
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

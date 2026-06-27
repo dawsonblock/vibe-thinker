@@ -6,6 +6,11 @@ python-dotenv>=1.0,<2
 fastapi>=0.100,<1
 uvicorn>=0.23,<1
 
+# Optional: HA federation (Redis-backed coordinator state + web UI Pub/Sub
+# fan-out). Without it, federation_server.py and web/app.py use in-memory
+# single-process state (the default). Install with: pip install redis
+redis>=5.0,<6
+
 # Optional: semantic routing + CLR result cache
 # Install these for the full experience (embedding-based routing + semantic cache).
 # Without them, the orchestrator falls back to keyword routing and skips the CLR cache.

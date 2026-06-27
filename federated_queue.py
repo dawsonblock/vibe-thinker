@@ -235,8 +235,11 @@ class FederatedJobQueue:
     Args:
         orchestrator: a HybridReasoningOrchestrator instance (passed to
             the local fallback queue).
-        federation_url: exo-federation HTTP endpoint (e.g.
+        federation_url: federation coordinator HTTP endpoint (e.g.
             ``https://swarm.local:7443``). When empty, local-only mode.
+            May be a comma-separated list of URLs for HA failover
+            (e.g. ``https://c1:7443,https://c2:7443``); the client tries
+            each in order and sticks to the first that succeeds.
         max_concurrent: max jobs this node runs concurrently.
         mtls_cert: path to the client certificate (PEM).
         mtls_key: path to the client private key (PEM).
@@ -269,7 +272,18 @@ class FederatedJobQueue:
         ed25519_private_key_hex: Optional[str] = None,
         ed25519_public_key_hex: Optional[str] = None,
     ):
-        self._federation_url = federation_url.rstrip("/") if federation_url else ""
+        # HA failover: accept a comma-separated list of coordinator URLs.
+        # The client tries each in order and sticks to the first that
+        # succeeds (sticky). On failure of the sticky URL, it re-tries
+        # the list. This lets a swarm deploy multiple coordinators
+        # behind a load balancer (or listed explicitly) and survive a
+        # single coordinator crash.
+        self._federation_urls: List[str] = [
+            u.strip().rstrip("/") for u in (federation_url or "").split(",")
+            if u.strip()
+        ]
+        # The sticky URL is the first in the list (or empty for local-only).
+        self._federation_url = self._federation_urls[0] if self._federation_urls else ""
         self._mtls_cert = mtls_cert
         self._mtls_key = mtls_key
         self._mtls_ca = mtls_ca
@@ -315,6 +329,26 @@ class FederatedJobQueue:
             and os.path.exists(self._mtls_ca)
         )
 
+    def _federation_url_order(self) -> List[str]:
+        """URLs to try, sticky-first then the rest (HA failover order).
+
+        The sticky URL (``self._federation_url``) is tried first; on
+        failure the remaining URLs from ``self._federation_urls`` are
+        tried in listed order. When a URL succeeds, it becomes the new
+        sticky URL.
+        """
+        if not self._federation_urls:
+            return [self._federation_url] if self._federation_url else []
+        sticky = self._federation_url
+        rest = [u for u in self._federation_urls if u != sticky]
+        order = ([sticky] if sticky else []) + rest
+        return [u for u in order if u]
+
+    def _mark_url_success(self, url: str) -> None:
+        """Make ``url`` the sticky URL for subsequent requests."""
+        if url and url != self._federation_url:
+            self._federation_url = url
+
     def _warn_fallback(self, reason: str) -> None:
         if not self._publish_failed:
             print(
@@ -325,7 +359,7 @@ class FederatedJobQueue:
             self._publish_failed = True
 
     def _publish_to_federation(self, job: Job) -> None:
-        """Publish a job to the exo-federation network (fire-and-forget).
+        """Publish a job to the federation network (fire-and-forget).
 
         This method is called from the synchronous submit() method. To
         avoid blocking the asyncio event loop with synchronous network
@@ -357,7 +391,8 @@ class FederatedJobQueue:
 
         Uses a short-lived aiohttp session with mTLS. This runs as a
         background task — errors are logged but do not propagate to
-        submit().
+        submit(). Tries each HA coordinator URL in turn (sticky-first)
+        and sticks to the first that succeeds.
         """
         try:
             import aiohttp
@@ -372,18 +407,26 @@ class FederatedJobQueue:
             ctx = ssl.create_default_context(cafile=self._mtls_ca)
             ctx.load_cert_chain(self._mtls_cert, self._mtls_key)
             timeout = aiohttp.ClientTimeout(total=5.0)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(
-                    f"{self._federation_url}/submit",
-                    json=payload,
-                    ssl=ctx,
-                    headers={"Content-Type": "application/json"},
-                ) as resp:
-                    if resp.status < 400:
-                        self._federation_available = True
-                        return True
-                    self._warn_fallback(f"HTTP {resp.status}")
-                    return False
+            last_err = "no coordinator reachable"
+            for url in self._federation_url_order():
+                try:
+                    async with aiohttp.ClientSession(timeout=timeout) as session:
+                        async with session.post(
+                            f"{url}/submit",
+                            json=payload,
+                            ssl=ctx,
+                            headers={"Content-Type": "application/json"},
+                        ) as resp:
+                            if resp.status < 400:
+                                self._federation_available = True
+                                self._mark_url_success(url)
+                                return True
+                            last_err = f"HTTP {resp.status} from {url}"
+                except Exception as e:
+                    last_err = f"connection error to {url}: {e}"
+                    continue
+            self._warn_fallback(last_err)
+            return False
         except Exception as e:
             self._warn_fallback(f"connection error: {e}")
             return False
@@ -392,6 +435,7 @@ class FederatedJobQueue:
         """Synchronous federation publish (fallback for non-async contexts).
 
         Uses urllib with mTLS. Only called when no event loop is running.
+        Tries each HA coordinator URL in turn (sticky-first).
         """
         try:
             import urllib.request
@@ -405,18 +449,26 @@ class FederatedJobQueue:
             }).encode("utf-8")
             ctx = ssl.create_default_context(cafile=self._mtls_ca)
             ctx.load_cert_chain(self._mtls_cert, self._mtls_key)
-            req = urllib.request.Request(
-                f"{self._federation_url}/submit",
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, context=ctx, timeout=5.0) as resp:
-                if resp.status < 400:
-                    self._federation_available = True
-                    return True
-                self._warn_fallback(f"HTTP {resp.status}")
-                return False
+            last_err = "no coordinator reachable"
+            for url in self._federation_url_order():
+                try:
+                    req = urllib.request.Request(
+                        f"{url}/submit",
+                        data=payload,
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req, context=ctx, timeout=5.0) as resp:
+                        if resp.status < 400:
+                            self._federation_available = True
+                            self._mark_url_success(url)
+                            return True
+                        last_err = f"HTTP {resp.status} from {url}"
+                except Exception as e:
+                    last_err = f"connection error to {url}: {e}"
+                    continue
+            self._warn_fallback(last_err)
+            return False
         except Exception as e:
             self._warn_fallback(f"connection error: {e}")
             return False
@@ -440,99 +492,121 @@ class FederatedJobQueue:
                 await asyncio.sleep(2.0)  # poll interval
                 if not self._federation_configured():
                     continue
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.post(
-                        f"{self._federation_url}/claim",
-                        json={"worker_id": self._node_id},
-                        ssl=ctx,
-                    ) as resp:
-                        if resp.status >= 400:
-                            continue
-                        data = await resp.json()
-                        if not data.get("job_id"):
-                            continue  # no pending jobs
-                        # We claimed a job — submit it locally for execution.
-                        remote_job_id = data["job_id"]
-                        job = self._local.submit(
-                            data["query"],
-                            priority=data.get("priority", 0),
-                            force_route=data.get("force_route"),
-                        )
-                        print(f"[FederatedQueue] Claimed job {remote_job_id} "
-                              f"from federation, running locally as {job.job_id}")
-                        # Launch a background task to wait for completion
-                        # and POST the result back to the coordinator.
-                        # NOTE: _claim_and_report creates its own session
-                        # because the claim loop's session is closed at the
-                        # end of this `async with` block — the background
-                        # task outlives it.
-                        asyncio.create_task(
-                            self._claim_and_report(
-                                ctx, remote_job_id, job.job_id
-                            )
-                        )
+                # Try each HA coordinator URL (sticky-first) until one
+                # responds. The claim is atomic on the coordinator side,
+                # so trying multiple URLs is safe — a "no_jobs" response
+                # from one coordinator means that coordinator's queue is
+                # empty (in HA Redis mode they share one queue).
+                claimed = False
+                for url in self._federation_url_order():
+                    try:
+                        async with aiohttp.ClientSession(timeout=timeout) as session:
+                            async with session.post(
+                                f"{url}/claim",
+                                json={"worker_id": self._node_id},
+                                ssl=ctx,
+                            ) as resp:
+                                if resp.status >= 400:
+                                    continue
+                                data = await resp.json()
+                                if not data.get("job_id"):
+                                    continue  # no pending jobs at this URL
+                                # We claimed a job — submit it locally.
+                                self._mark_url_success(url)
+                                claimed = True
+                                remote_job_id = data["job_id"]
+                                job = self._local.submit(
+                                    data["query"],
+                                    priority=data.get("priority", 0),
+                                    force_route=data.get("force_route"),
+                                )
+                                print(f"[FederatedQueue] Claimed job {remote_job_id} "
+                                      f"from federation ({url}), running locally as {job.job_id}")
+                                # NOTE: _claim_and_report creates its own
+                                # session because this one closes at the
+                                # end of the `async with` block.
+                                asyncio.create_task(
+                                    self._claim_and_report(
+                                        ctx, remote_job_id, job.job_id, url,
+                                    )
+                                )
+                                break  # claimed one; done this poll cycle
+                    except Exception:
+                        continue
+                # `claimed` is informational; the loop polls regardless.
+                _ = claimed
             except asyncio.CancelledError:
                 break
             except Exception:
                 pass  # silent fail — the claim loop is best-effort
 
     async def _claim_and_report(
-        self, ssl_ctx, remote_job_id: str, local_job_id: str
+        self, ssl_ctx, remote_job_id: str, local_job_id: str,
+        origin_url: Optional[str] = None,
     ):
         """Wait for a claimed job to complete locally, then POST the
         result back to the federation coordinator.
 
         Creates its own aiohttp.ClientSession (v1.0 fix: the claim loop's
         session is closed by the time this background task runs, so we
-        can't reuse it).
+        can't reuse it). Posts to ``origin_url`` (the coordinator that
+        handed out the claim) first; on failure, tries the other HA URLs.
         """
         import aiohttp
+        # URL order: the originating coordinator first (it owns the job
+        # record), then the rest for HA failover.
+        urls = self._federation_url_order()
+        if origin_url and origin_url in urls:
+            urls = [origin_url] + [u for u in urls if u != origin_url]
+        elif origin_url:
+            urls = [origin_url] + urls
         try:
             result = await self._local.wait_for(local_job_id, timeout=600.0)
-            # POST the result back to the coordinator.
             payload = {
                 "job_id": remote_job_id,
                 "result": _serialize_result(result),
             }
-            timeout = aiohttp.ClientTimeout(total=30.0)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(
-                    f"{self._federation_url}/complete",
-                    json=payload, ssl=ssl_ctx,
-                ) as resp:
-                    if resp.status < 400:
-                        print(f"[FederatedQueue] Reported result for "
-                              f"federation job {remote_job_id}")
-                    else:
-                        print(f"[FederatedQueue] Failed to report result for "
-                              f"federation job {remote_job_id}: HTTP {resp.status}")
+            await self._post_to_any_url(urls, "/complete", payload, ssl_ctx,
+                                        success_log=f"Reported result for "
+                                                    f"federation job {remote_job_id}")
         except asyncio.TimeoutError:
-            # Job timed out — report the error.
-            try:
-                timeout = aiohttp.ClientTimeout(total=10.0)
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.post(
-                        f"{self._federation_url}/complete",
-                        json={"job_id": remote_job_id,
-                              "error": "execution timed out (600s)"},
-                        ssl=ssl_ctx,
-                    ) as resp:
-                        pass
-            except Exception:
-                pass
+            await self._post_to_any_url(urls, "/complete",
+                                        {"job_id": remote_job_id,
+                                         "error": "execution timed out (600s)"},
+                                        ssl_ctx)
         except Exception as e:
-            # Job failed — report the error.
+            await self._post_to_any_url(urls, "/complete",
+                                        {"job_id": remote_job_id, "error": str(e)},
+                                        ssl_ctx)
+
+    async def _post_to_any_url(
+        self, urls: List[str], path: str, payload: dict, ssl_ctx,
+        success_log: Optional[str] = None, total_timeout: float = 30.0,
+    ) -> bool:
+        """POST ``payload`` to ``path`` on the first reachable URL.
+
+        Tries each URL in order; on success, marks it sticky and returns
+        True. On total failure, returns False (best-effort reporting).
+        """
+        import aiohttp
+        timeout = aiohttp.ClientTimeout(total=total_timeout)
+        for url in urls:
             try:
-                timeout = aiohttp.ClientTimeout(total=10.0)
                 async with aiohttp.ClientSession(timeout=timeout) as session:
                     async with session.post(
-                        f"{self._federation_url}/complete",
-                        json={"job_id": remote_job_id, "error": str(e)},
-                        ssl=ssl_ctx,
+                        f"{url}{path}", json=payload, ssl=ssl_ctx,
                     ) as resp:
-                        pass
+                        if resp.status < 400:
+                            self._mark_url_success(url)
+                            if success_log:
+                                print(f"[FederatedQueue] {success_log} ({url})")
+                            return True
             except Exception:
-                pass
+                continue
+        if success_log:
+            print(f"[FederatedQueue] Failed to {success_log}: "
+                  f"no coordinator reachable")
+        return False
 
     # ----------------------- BaseJobQueue protocol ----------------------- #
     async def start(self) -> None:
@@ -621,9 +695,10 @@ def make_job_queue(
 
     Args:
         orchestrator: a HybridReasoningOrchestrator instance.
-        federation_url: exo-federation HTTP endpoint. When set, a
+        federation_url: federation coordinator HTTP endpoint. When set, a
             FederatedJobQueue is used (with local-only fallback when the
-            network is unreachable).
+            network is unreachable). May be a comma-separated list of
+            URLs for HA failover.
         max_concurrent: max jobs this node runs concurrently.
         mtls_cert, mtls_key, mtls_ca: mTLS credentials for the federation.
         node_id: this node's ID on the federation.

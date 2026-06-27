@@ -16,7 +16,7 @@ import time
 import uuid
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Protocol, runtime_checkable
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -64,25 +64,225 @@ def _load_jsonl(path: str) -> List[Dict]:
 
 
 # ---------------------------------------------------------------------------
+# Broadcast abstraction (v1.2 — HA web UI fan-out)
+# ---------------------------------------------------------------------------
+
+@runtime_checkable
+class Broadcaster(Protocol):
+    """Fan-out for WebSocket job-update messages.
+
+    Two implementations:
+      - :class:`LocalBroadcaster` — sends directly to this process's
+        WebSocket clients (the pre-v1.2 single-server behavior).
+      - :class:`RedisBroadcaster` — publishes to a Redis Pub/Sub channel;
+        a subscriber task in each UI server re-broadcasts to its local
+        clients. This keeps multiple UI servers behind a load balancer
+        in sync: a job update published by server A reaches the clients
+        connected to server B.
+
+    Lifecycle: ``start()`` launches the subscriber (Redis mode);
+    ``stop()`` tears it down. ``publish(msg)`` is called by
+    ``AppState.broadcast``.
+    """
+
+    async def start(self) -> None: ...
+    async def stop(self) -> None: ...
+    async def publish(self, msg: Dict[str, Any]) -> None: ...
+
+
+class LocalBroadcaster:
+    """Send messages directly to in-process WebSocket clients.
+
+    This is the default and reproduces the exact pre-v1.2 behavior.
+    """
+
+    def __init__(self, send_fn: Callable[[Dict[str, Any]], "asyncio.Future"]):
+        # send_fn is AppState._send_to_local_clients.
+        self._send_fn = send_fn
+
+    async def start(self) -> None:
+        pass  # nothing to do
+
+    async def stop(self) -> None:
+        pass
+
+    async def publish(self, msg: Dict[str, Any]) -> None:
+        await self._send_fn(msg)
+
+
+class RedisBroadcaster:
+    """Publish job updates to a Redis Pub/Sub channel for HA fan-out.
+
+    Each UI server runs a subscriber on the same channel. When any
+    server publishes an update, every server (including the publisher)
+    receives it via the subscriber and forwards it to its local
+    WebSocket clients. This is uniform — no special-casing of the
+    publisher's own clients, and no double-send (the publisher does
+    NOT also call the local send_fn directly; only the subscriber does).
+
+    Requires the ``redis`` package (``pip install redis>=5``).
+    """
+
+    def __init__(
+        self,
+        redis_url: str,
+        channel: str,
+        send_fn: Callable[[Dict[str, Any]], "asyncio.Future"],
+        redis_client: Any = None,
+    ):
+        self._channel = channel
+        self._send_fn = send_fn
+        self._sub_task: Optional[asyncio.Task] = None
+        self._stopping = False
+        if redis_client is not None:
+            self._pub = redis_client
+            self._sub_client = redis_client
+            self._owns_clients = False
+        else:
+            try:
+                import redis.asyncio as aioredis
+            except ImportError as e:
+                raise ImportError(
+                    "RedisBroadcaster requires the 'redis' package: "
+                    "pip install redis>=5"
+                ) from e
+            self._pub = aioredis.from_url(redis_url, decode_responses=False)
+            self._sub_client = aioredis.from_url(redis_url, decode_responses=False)
+            self._owns_clients = True
+
+    async def start(self) -> None:
+        """Launch the subscriber task that forwards messages to local clients."""
+        if self._sub_task is not None:
+            return
+        self._stopping = False
+        self._sub_task = asyncio.create_task(self._subscriber_loop())
+
+    async def stop(self) -> None:
+        """Tear down the subscriber and close Redis connections we own."""
+        self._stopping = True
+        if self._sub_task is not None:
+            self._sub_task.cancel()
+            try:
+                await self._sub_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._sub_task = None
+        if self._owns_clients:
+            try:
+                await self._pub.aclose()
+            except Exception:
+                pass
+            try:
+                await self._sub_client.aclose()
+            except Exception:
+                pass
+
+    async def _subscriber_loop(self) -> None:
+        """Subscribe to the channel and forward messages to local clients."""
+        import redis.asyncio as aioredis  # for PubSubError types
+        backoff = 0.5
+        while not self._stopping:
+            try:
+                pubsub = self._sub_client.pubsub()
+                await pubsub.subscribe(self._channel)
+                backoff = 0.5  # reset backoff after a successful connect
+                while not self._stopping:
+                    msg = await pubsub.get_message(
+                        ignore_subscribe_messages=True, timeout=1.0)
+                    if msg is None:
+                        continue
+                    data = msg.get("data")
+                    if data is None:
+                        continue
+                    if isinstance(data, bytes):
+                        data = data.decode("utf-8", errors="replace")
+                    try:
+                        parsed = json.loads(data)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    try:
+                        await self._send_fn(parsed)
+                    except Exception:
+                        pass  # a dead client is cleaned up by send_fn
+                try:
+                    await pubsub.unsubscribe(self._channel)
+                    await pubsub.aclose()
+                except Exception:
+                    pass
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                # Reconnect with backoff. Redis outages degrade to
+                # single-server broadcasts (publish will also fail and
+                # the local send_fn is called as a fallback there).
+                if self._stopping:
+                    break
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 10.0)
+
+    async def publish(self, msg: Dict[str, Any]) -> None:
+        """Publish to the Redis channel.
+
+        If the publish fails (Redis down), fall back to sending directly
+        to local clients so a Redis outage does not silently drop UI
+        updates on the publishing server.
+        """
+        payload = json.dumps(_serialize(msg), default=str)
+        try:
+            await self._pub.publish(self._channel, payload)
+        except Exception:
+            # Fail-closed-fallback: Redis down -> at least this server's
+            # own clients still see the update.
+            try:
+                await self._send_fn(msg)
+            except Exception:
+                pass
+
+
+def make_broadcaster(
+    redis_url: Optional[str],
+    send_fn: Callable[[Dict[str, Any]], "asyncio.Future"],
+    channel: str = "vt:web:updates",
+    redis_client: Any = None,
+) -> Broadcaster:
+    """Factory: Redis Pub/Sub when redis_url is set, else local-only."""
+    if redis_url and redis_url.strip():
+        return RedisBroadcaster(
+            redis_url=redis_url, channel=channel,
+            send_fn=send_fn, redis_client=redis_client,
+        )
+    return LocalBroadcaster(send_fn=send_fn)
+
+
+# ---------------------------------------------------------------------------
 # App state
 # ---------------------------------------------------------------------------
 
 class AppState:
     """Holds the orchestrator and active jobs."""
 
-    def __init__(self, orchestrator: HybridReasoningOrchestrator):
+    def __init__(
+        self,
+        orchestrator: HybridReasoningOrchestrator,
+        broadcaster: Optional[Broadcaster] = None,
+    ):
         self.orch = orchestrator
         self.jobs: Dict[str, Dict[str, Any]] = {}  # job_id -> job dict
         self.ws_clients: List[WebSocket] = []
         self._started = False
+        # Broadcaster defaults to local-only (pre-v1.2 behavior).
+        self.broadcaster: Broadcaster = broadcaster or LocalBroadcaster(
+            self._send_to_local_clients)
 
     async def ensure_started(self):
         if not self._started:
             await self.orch.start()
+            await self.broadcaster.start()
             self._started = True
 
     async def cleanup(self):
         if self._started:
+            await self.broadcaster.stop()
             await self.orch.cleanup()
             self._started = False
 
@@ -104,8 +304,13 @@ class AppState:
         if job_id in self.jobs:
             self.jobs[job_id].update(kwargs)
 
-    async def broadcast(self, msg: Dict[str, Any]):
-        """Send a message to all connected WebSocket clients."""
+    async def _send_to_local_clients(self, msg: Dict[str, Any]):
+        """Send a message to all connected local WebSocket clients.
+
+        This is the actual wire send. It is called by LocalBroadcaster
+        directly, and by RedisBroadcaster's subscriber loop (so a
+        published message reaches this server's own clients).
+        """
         text = json.dumps(_serialize(msg), default=str)
         dead = []
         for ws in self.ws_clients:
@@ -116,6 +321,15 @@ class AppState:
         for ws in dead:
             self.ws_clients.remove(ws)
 
+    async def broadcast(self, msg: Dict[str, Any]):
+        """Fan out a message to all WebSocket clients.
+
+        Delegates to the broadcaster: local-only by default, or Redis
+        Pub/Sub when a redis_url was supplied to ``create_app`` (so
+        multiple UI servers stay in sync).
+        """
+        await self.broadcaster.publish(msg)
+
 
 # ---------------------------------------------------------------------------
 # App factory
@@ -123,9 +337,32 @@ class AppState:
 
 def create_app(
     orchestrator: HybridReasoningOrchestrator,
+    redis_url: Optional[str] = None,
+    redis_client: Any = None,
 ) -> FastAPI:
+    """Create the vibe-thinker web UI FastAPI app.
+
+    Args:
+        orchestrator: the HybridReasoningOrchestrator instance.
+        redis_url: optional Redis URL for HA multi-server WebSocket
+            fan-out. When set, job updates are published to a Redis
+            Pub/Sub channel so multiple UI servers behind a load
+            balancer stay in sync. When None (default), updates are
+            sent only to this server's local clients (pre-v1.2 behavior).
+        redis_client: optional pre-built async Redis client (for testing
+            with fakeredis). When provided, redis_url is ignored.
+    """
     app = FastAPI(title="vibe-thinker UI", docs_url="/api/docs")
+    # AppState defaults to a LocalBroadcaster. When redis_url is set,
+    # swap in a RedisBroadcaster after the state exists (it needs the
+    # state's _send_to_local_clients as the subscriber callback).
     state = AppState(orchestrator)
+    if redis_url or redis_client:
+        state.broadcaster = make_broadcaster(
+            redis_url=redis_url,
+            send_fn=state._send_to_local_clients,
+            redis_client=redis_client,
+        )
     static_dir = Path(__file__).parent / "static"
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 

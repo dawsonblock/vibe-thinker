@@ -528,12 +528,30 @@ class VibeThinkerCLRAsync:
             if (self._local_pool_size > 1
                     and self._local_pool_kind == "process"):
                 # Process-pool mode: ProcessPoolExecutor with worker init.
+                # DEPRECATED (v1.2): superseded by the ruvllm_py PyO3 binding,
+                # which releases the GIL natively and shares one weight set
+                # across concurrent requests (no RAM duplication). Process
+                # mode will be removed in a future release.
+                import warnings
+                warnings.warn(
+                    "process-pool mode is deprecated (v1.2) and will be "
+                    "removed in a future release. The ruvllm_py PyO3 binding "
+                    "releases the GIL natively during generation and shares "
+                    "one set of weights across concurrent requests, "
+                    "eliminating the RAM duplication that process mode "
+                    "requires. Prefer --local-specialist-model with the "
+                    "ruvllm_py binding installed (build ruvllm_py with "
+                    "--features inference-metal on Apple Silicon).",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
                 from concurrent.futures import ProcessPoolExecutor
                 per_inst_threads = max(1, n_threads // self._local_pool_size)
                 print(
                     f"[CLR] Starting process pool with {self._local_pool_size} "
                     f"workers (process mode, {n_threads} threads -> "
                     f"{per_inst_threads}/worker) from {local_model}..."
+                    f" [DEPRECATED — see ruvllm_py binding]"
                 )
                 self._local_process_pool = ProcessPoolExecutor(
                     max_workers=self._local_pool_size,

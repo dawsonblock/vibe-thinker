@@ -65,6 +65,14 @@ if TYPE_CHECKING:
 SANDBOX_IMAGE = "vibe-thinker-sandbox:latest"
 FALLBACK_IMAGE = "python:3.12-slim"
 
+# Default SNI-proxy egress address (v1.2). When an allow-list is present
+# and legacy iptables egress is NOT enabled, the executor routes traffic
+# through a proxy at this address by default. The proxy inspects the TLS
+# SNI / HTTP Host header (domain-level filtering) instead of IP-based
+# iptables rules — solving CDN IP rotation. Override with --proxy-egress
+# or set --legacy-iptables-egress to restore the v0.4.0 iptables path.
+DEFAULT_PROXY_EGRESS = "127.0.0.1:8888"
+
 
 class DockerSandboxExecutor:
     """Execute Python code in a hardened Docker container.
@@ -84,13 +92,20 @@ class DockerSandboxExecutor:
             `vibe-thinker-sandbox` image with iptables baked in.
         timeout: default execution timeout in seconds.
         allowlist: optional NetworkAllowList for granular egress
-            filtering (v0.4.0). When set, the executor uses
-            --network=default + iptables rules instead of --network=none.
+            filtering. When set, the executor uses domain-level
+            egress filtering via an SNI-aware proxy by default (v1.2),
+            or iptables IP-based filtering when legacy_iptables_egress
+            is True (the v0.4.0 behavior).
         dns_resolver: optional IP address of a DNS resolver to restrict
             DNS queries to (prevents DNS-based data exfiltration). When
             None, DNS is allowed to any resolver (needed for hostname
             resolution in the allow-list). When set, only the specified
             resolver can receive DNS queries.
+        legacy_iptables_egress: when True, use the v0.4.0 iptables path
+            (in-container firewall rules, requires NET_ADMIN cap) instead
+            of the v1.2 default SNI-proxy path. Opt-in for environments
+            without a proxy sidecar. Deprecated; will be removed in a
+            future release in favor of the Envoy sidecar.
     """
 
     name = "docker_sandbox"
@@ -101,12 +116,14 @@ class DockerSandboxExecutor:
         timeout: float = 10.0,
         allowlist: Optional["NetworkAllowList"] = None,
         dns_resolver: Optional[str] = None,
+        legacy_iptables_egress: bool = False,
     ):
         self.image = image
         self.default_timeout = timeout
         self._allowlist = allowlist
         self._dns_resolver = dns_resolver
         self._proxy_egress: Optional[str] = None
+        self._legacy_iptables_egress = legacy_iptables_egress
 
     def set_allowlist(self, allowlist: Optional["NetworkAllowList"]) -> None:
         """Update the network allow-list (e.g. from a CLI flag after init)."""
@@ -125,6 +142,15 @@ class DockerSandboxExecutor:
         domain — solving CDN IP rotation.
         """
         self._proxy_egress = proxy_addr
+
+    def set_legacy_iptables_egress(self, enabled: bool) -> None:
+        """Opt in to the v0.4.0 iptables egress path (deprecated).
+
+        When True, the executor uses in-container iptables rules
+        (requires NET_ADMIN cap) instead of the v1.2 default SNI-proxy
+        path. Deprecated; will be removed in a future release.
+        """
+        self._legacy_iptables_egress = enabled
 
     def _build_firewall_env(self) -> Dict[str, str]:
         """Build environment variables for the entrypoint's firewall setup.
@@ -179,23 +205,39 @@ class DockerSandboxExecutor:
         start = time.monotonic()
 
         # Determine network mode:
-        # - If proxy egress is configured, use --network=default with
-        #   HTTP_PROXY/HTTPS_PROXY env vars (v0.4.1 SNI proxy mode).
-        # - If an allow-list is configured, use --network=default and
-        #   pass firewall rules to the entrypoint (v0.4.0 hardened).
+        # - If an explicit proxy egress is configured, use it (v0.4.1).
+        # - Else if an allow-list is configured AND legacy iptables egress
+        #   is NOT enabled, use the default SNI-proxy address (v1.2 default).
+        #   The proxy inspects TLS SNI / HTTP Host (domain-level filtering),
+        #   solving CDN IP rotation without NET_ADMIN.
+        # - Else if an allow-list is configured AND legacy iptables egress
+        #   IS enabled, use --network=default + iptables rules (v0.4.0 path,
+        #   now opt-in / deprecated).
         # - Otherwise, use the binary --network=none / --network=default
         #   based on the `network` flag (unchanged behavior).
         use_allowlist = self._allowlist is not None and not self._allowlist.is_empty
-        use_proxy = self._proxy_egress is not None
-        firewall_env = self._build_firewall_env() if use_allowlist else {}
+        explicit_proxy = self._proxy_egress is not None
+        # v1.2: SNI-proxy is the default egress mode when an allow-list is
+        # present. Legacy iptables is opt-in via --legacy-iptables-egress.
+        use_proxy = (
+            explicit_proxy
+            or (use_allowlist and not self._legacy_iptables_egress)
+        )
+        # The proxy address: explicit override, else the default.
+        proxy_addr = self._proxy_egress or DEFAULT_PROXY_EGRESS
+        # iptables firewall env is only needed for the legacy path.
+        use_iptables = use_allowlist and self._legacy_iptables_egress and not explicit_proxy
+        firewall_env = self._build_firewall_env() if use_iptables else {}
         rules_hash = self._compute_rules_hash(firewall_env) if firewall_env else ""
 
         if use_proxy:
-            # SNI proxy egress mode (v0.4.1). The container routes traffic
-            # through the proxy via HTTP_PROXY/HTTPS_PROXY env vars. The
-            # proxy inspects the TLS SNI / HTTP Host header and
-            # allows/denies based on the domain — solving CDN IP rotation.
-            # No iptables needed, no NET_ADMIN needed.
+            # SNI proxy egress mode (v0.4.1, v1.2 default). The container
+            # routes traffic through the proxy via HTTP_PROXY/HTTPS_PROXY
+            # env vars. The proxy inspects the TLS SNI / HTTP Host header
+            # and allows/denies based on the domain — solving CDN IP
+            # rotation. No iptables needed, no NET_ADMIN needed.
+            # v1.2: this is now the default when an allow-list is present;
+            # the legacy iptables path is opt-in via --legacy-iptables-egress.
             cmd = [
                 "docker", "run", "--rm",
                 "--init",
@@ -209,7 +251,7 @@ class DockerSandboxExecutor:
                 "--workdir", "/tmp",
             ]
             # Set proxy env vars so HTTP clients in the container use the proxy.
-            proxy_url = f"http://{self._proxy_egress}"
+            proxy_url = f"http://{proxy_addr}"
             proxy_env = {
                 "HTTP_PROXY": proxy_url,
                 "HTTPS_PROXY": proxy_url,
@@ -224,7 +266,7 @@ class DockerSandboxExecutor:
             for key, value in merged_env.items():
                 cmd.extend(["--env", f"{key}={value}"])
             cmd.extend([self.image, "python3", "-c", script])
-        elif use_allowlist:
+        elif use_iptables:
             # The sandbox image's entrypoint handles:
             #   1. Applying iptables rules (as root, from VT_IPTABLES_RULES)
             #   2. Denying IPv6 (ip6tables DROP)

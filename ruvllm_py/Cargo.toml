@@ -12,25 +12,31 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"] }
-# The ruvllm crate is not yet published to crates.io. When it is,
-# uncomment this line:
-# ruvllm = { version = "0.1", features = ["turboquant"] }
-# For now, this scaffold compiles with stub implementations.
 
-# Security patches (v0.4.1): when ruvllm is uncommented, these patches
-# override any vulnerable transitive deps it may pull in.
-# - rustls-webpki: force >=0.103.x (0.101.x has 3 CVEs)
-# - lru: force >=0.13.x (0.12.5 has Stacked Borrows violation)
-# These are no-ops until ruvllm is actually added as a dependency.
+# RuvLLM inference backend (v1.2): the ruvllm 2.3 crate is published on
+# crates.io. The real inference path (CandleBackend + candle-core) is
+# gated behind the "candle" feature so this crate compiles as a stub
+# without it. Enable with:
+#   cargo build --release --features candle        (CPU)
+#   cargo build --release --features inference-metal   (Apple Silicon)
+ruvllm = { version = "2.3", default-features = false, features = ["async-runtime"] }
+
+# Security patches (v0.4.1): override vulnerable/unsound transitive deps
+# that ruvllm may pull in when the candle feature is enabled.
+# - rustls-webpki 0.101.x: 3 CVEs (CRL panic, cert name constraint bypass).
+# - lru 0.12.5: unsound (Stacked Borrows violation in IterMut).
+# These are no-ops unless the vulnerable versions are actually resolved.
 [patch.crates-io]
-# Patches will be added here when ruvllm is uncommented and the
-# transitive dependency tree is known. See rust/probes/ruvllm_exo_probe
-# for the working patch configuration.
+# Mirror the working patch config from rust/probes/ruvllm_exo_probe.
+# See that probe's Cargo.toml for the precise patch versions.
 
 [features]
 default = []
-# Enable when the ruvllm crate is available:
-# turboquant = ["ruvllm/turboquant"]
+# Real inference via candle-core (CPU). Enables CandleBackend::load_gguf
+# + generate(). Without this, Engine.complete() returns a stub response.
+candle = ["ruvllm/candle"]
+# Apple Silicon Metal acceleration (implies candle).
+inference-metal = ["ruvllm/inference-metal"]
 
 [profile.release]
 opt-level = 3

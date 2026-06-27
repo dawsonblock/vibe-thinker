@@ -1,7 +1,7 @@
 # vibe-thinker — project notes for agents
 
 ## Verify / test
-- Full suite: `python3 -m pytest -q` (903 tests, ~125s, no live servers needed)
+- Full suite: `python3 -m pytest -q` (958 tests, ~120s, no live servers needed)
 - Routing + REPL only: `python3 -m pytest tests/test_routing.py tests/test_repl.py -q`
 - Format enforcer + chat transports + repair loop: `python3 -m pytest tests/test_format_enforcer.py -q`
 - Citation-backed NLI factual verifier: `python3 -m pytest tests/test_factual_verifier.py -q`
@@ -1013,3 +1013,63 @@ llama-server -m ~/models/vibethinker-3b-q4_k_m.gguf \
 - The "private o1" framing is aspirational; this is an alpha control-plane prototype
   with hard caps (self-claim confidence ≤0.65; high confidence requires an
   independent verifier). See README "Status: ALPHA SOFTWARE".
+
+## v1.2 remediation (HA federation + RuvLLM binding + enterprise egress)
+
+Three-phase remediation completed. All changes are backward-compatible
+(opt-in via flags); the defaults preserve v0.4.1 behavior unless the
+new flags are used.
+
+### Phase 1: HA federation (federation_server.py + web/app.py + federated_queue.py)
+- **FederationState Protocol**: `InMemoryFederationState` (default) +
+  `RedisFederationState` (atomic Lua claim via sorted-set). Factory
+  `make_federation_state()`. CLI: `--redis-url` / `--no-redis` on
+  `federation_server`. Redis is optional (pip install redis).
+- **Broadcaster Protocol**: `LocalBroadcaster` (default) +
+  `RedisBroadcaster` (Pub/Sub fan-out for multi-UI-server HA). The
+  web UI's WebSocket broadcast now goes through the Broadcaster, so
+  multiple UI servers behind a load balancer stay in sync.
+- **FederatedJobQueue HA failover**: `--federation-url` accepts a
+  comma-separated list of coordinator URLs. The client tries each
+  sticky-first and falls over on failure. `make_job_queue()` factory
+  passes the list through.
+- Tests: `test_redis_federation.py`, `test_web_pubsub.py`, HA failover
+  tests in `test_federated_queue.py`. Run:
+  `python3 -m pytest tests/test_federation_server.py tests/test_redis_federation.py tests/test_federated_queue.py tests/test_web_federation.py tests/test_web_pubsub.py -q`
+
+### Phase 2: RuvLLM PyO3 binding (ruvllm_py/)
+- **ruvllm 2.3.0** crate is published on crates.io and wired into
+  `ruvllm_py/Cargo.toml`. The binding compiles in three modes:
+  - Stub (default, no inference): `cargo check --release`
+  - CPU candle: `cargo check --release --features candle`
+  - Apple Silicon Metal: `cargo check --release --features inference-metal`
+- **`ruvllm_py/src/lib.rs`**: PyO3 0.22 binding wrapping
+  `CandleBackend` + `LlmBackend::generate()`. GIL released during
+  generation (`py.allow_threads`). Backend in `Arc<Mutex<>>` for
+  thread-safe pool mode. Grammar param accepted (API compat) but
+  candle backend doesn't enforce GBNF — the format enforcer handles
+  structured output.
+- **Process-pool mode deprecated**: `DeprecationWarning` emitted when
+  `--local-specialist-pool-kind process` is used. Superseded by the
+  ruvllm_py binding (releases GIL natively, no RAM duplication).
+  Not removed — will be in a future release.
+- NOTE: `ruvllm 2.3.0` has a bug where `pub mod claude_flow`
+  unconditionally uses `tokio` (gated by `async-runtime`). We work
+  around this by enabling `async-runtime` in our Cargo.toml.
+
+### Phase 3: Enterprise egress (sandbox/)
+- **SNI-proxy is the default egress mode** when an allow-list is
+  present. The sandbox routes traffic through a proxy at
+  `DEFAULT_PROXY_EGRESS` (127.0.0.1:8888) via HTTP_PROXY/HTTPS_PROXY
+  env vars. No NET_ADMIN cap needed. Solves CDN IP rotation.
+- **`--legacy-iptables-egress`** flag restores the v0.4.0 iptables
+  path (in-container firewall rules, NET_ADMIN cap). Deprecated.
+- **`sandbox/envoy_sidecar.py`** (new): Envoy config generator +
+  launcher. Generates SNI-aware tcp_proxy config from a
+  NetworkAllowList. Fail-closed if envoy binary not on PATH.
+  `--envoy-sidecar` CLI flag auto-launches Envoy as a child process
+  with cleanup on exit.
+- Tests: `test_envoy_sidecar.py` (16 tests). Integration tests
+  (`test_network_integration.py`) use `legacy_iptables_egress=True`
+  to keep testing the iptables path. Run:
+  `python3 -m pytest tests/test_envoy_sidecar.py tests/test_network_allowlist.py -q`

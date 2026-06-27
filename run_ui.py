@@ -28,6 +28,7 @@ def main():
     # sees them (it doesn't know about these).
     port = 8000
     host = "127.0.0.1"
+    redis_url = ""
     remaining = []
     args = sys.argv[1:]
     i = 0
@@ -36,6 +37,8 @@ def main():
             port = int(args[i + 1]); i += 2; continue
         if args[i] == "--host" and i + 1 < len(args):
             host = args[i + 1]; i += 2; continue
+        if args[i] == "--redis-url" and i + 1 < len(args):
+            redis_url = args[i + 1]; i += 2; continue
         remaining.append(args[i]); i += 1
 
     # Build the orchestrator argparser to parse the remaining flags.
@@ -81,7 +84,9 @@ def main():
     from web.app import create_app
     import uvicorn
 
-    app = create_app(orchestrator)
+    app = create_app(orchestrator, redis_url=redis_url or None)
+    if redis_url:
+        print(f"[UI] HA WebSocket fan-out enabled: Redis Pub/Sub ({redis_url})")
     print(f"\n  vibe-thinker UI running at  http://{host}:{port}\n")
     uvicorn.run(app, host=host, port=port, log_level="info")
 

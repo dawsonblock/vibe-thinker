@@ -310,6 +310,7 @@ class HybridReasoningOrchestrator:
         dns_resolver: Optional[str] = None,
         sandbox_image: Optional[str] = None,
         proxy_egress: Optional[str] = None,
+        legacy_iptables_egress: bool = False,
         use_structured_output: bool = False,
         specialist_transport: str = "completion",
         specialist_api_key: Optional[str] = None,
@@ -373,12 +374,23 @@ class HybridReasoningOrchestrator:
         # routes traffic through the proxy instead of using iptables.
         # This solves CDN IP rotation — the proxy checks the domain (SNI),
         # not the IP. The proxy must be running separately (sandbox.sni_proxy).
-        if proxy_egress and self.code_verifier is not None:
+        # v1.2: SNI-proxy is now the DEFAULT egress mode when an allow-list
+        # is present. The legacy iptables path is opt-in via
+        # --legacy-iptables-egress (deprecated).
+        if self.code_verifier is not None:
             executor = getattr(self.code_verifier, "executor", None)
-            if executor is not None and hasattr(executor, "set_proxy_egress"):
-                executor.set_proxy_egress(proxy_egress)
-                print(f"[Orchestrator] SNI proxy egress enabled: {proxy_egress}"
-                      + (f" (replaces iptables filtering)" if network_allowlist else ""))
+            if executor is not None:
+                if hasattr(executor, "set_legacy_iptables_egress"):
+                    executor.set_legacy_iptables_egress(legacy_iptables_egress)
+                if proxy_egress and hasattr(executor, "set_proxy_egress"):
+                    executor.set_proxy_egress(proxy_egress)
+                    print(f"[Orchestrator] SNI proxy egress enabled: {proxy_egress}"
+                          + (f" (replaces iptables filtering)" if network_allowlist else ""))
+                elif network_allowlist and not legacy_iptables_egress:
+                    # v1.2 default: SNI-proxy egress with the default address.
+                    print(f"[Orchestrator] SNI proxy egress is the default "
+                          f"(v1.2). Use --legacy-iptables-egress to restore "
+                          f"the v0.4.0 iptables path.")
         # If the verifier's executor is a WarmDockerPool, start it eagerly so
         # the first code task doesn't pay the cold-start cost.
         if self.code_verifier is not None and hasattr(self.code_verifier, "executor"):

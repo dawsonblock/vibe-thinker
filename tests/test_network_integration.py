@@ -61,8 +61,16 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture
 def executor():
-    """Create a DockerSandboxExecutor with a longer timeout for integration tests."""
-    return DockerSandboxExecutor(timeout=30.0)
+    """Create a DockerSandboxExecutor with a longer timeout for integration tests.
+
+    v1.2: These integration tests exercise the iptables egress path
+    (in-container firewall rules). The default egress mode changed to
+    SNI-proxy in v1.2, so we set legacy_iptables_egress=True here to
+    keep testing the iptables path. The SNI-proxy path has its own
+    unit tests (test_envoy_sidecar.py) and would need a running proxy
+    for integration testing.
+    """
+    return DockerSandboxExecutor(timeout=30.0, legacy_iptables_egress=True)
 
 
 class TestDenyAllWithEmptyAllowlist:

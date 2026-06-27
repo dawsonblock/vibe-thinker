@@ -31,7 +31,7 @@ import os
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -62,12 +62,46 @@ class FederatedJob:
 # Federation state
 # ---------------------------------------------------------------------------
 
-class FederationState:
+@runtime_checkable
+class FederationStateProtocol(Protocol):
+    """Pluggable federation state backend.
+
+    Implementations:
+      - :class:`InMemoryFederationState` — single-coordinator, asyncio.Lock.
+        The default; identical to the pre-v1.2 behavior.
+      - :class:`RedisFederationState` — multi-coordinator HA backed by Redis.
+        Atomic claim via a Lua script over a sorted set + job hashes.
+
+    All methods are async. ``claim`` MUST be atomic with respect to
+    concurrent coordinators — a naive read-then-write in Python races
+    across processes. The in-memory backend serializes via asyncio.Lock
+    (sufficient within one process); the Redis backend uses a Lua script
+    evaluated atomically inside Redis.
+    """
+
+    async def submit(self, job_id: str, query: str, priority: int = 0,
+                     force_route: Optional[str] = None,
+                     submitted_by: str = "") -> FederatedJob: ...
+
+    async def claim(self, worker_id: str) -> Optional[FederatedJob]: ...
+
+    async def complete(self, job_id: str, result: Optional[Dict] = None,
+                       error: Optional[str] = None) -> bool: ...
+
+    async def list_jobs(self) -> List[Dict[str, Any]]: ...
+
+    async def get_job(self, job_id: str) -> Optional[FederatedJob]: ...
+
+    async def count(self) -> int: ...
+
+
+class InMemoryFederationState:
     """In-memory federation state. Single-coordinator design.
 
     For multi-coordinator deployments, back this with Redis or a shared
-    database. For the typical 2-10 node swarm, a single coordinator
-    with in-memory state is sufficient and far simpler.
+    database (see :class:`RedisFederationState`). For the typical 2-10
+    node swarm, a single coordinator with in-memory state is sufficient
+    and far simpler.
     """
 
     def __init__(self):
@@ -132,19 +166,390 @@ class FederationState:
         async with self._lock:
             return self._jobs.get(job_id)
 
+    async def count(self) -> int:
+        async with self._lock:
+            return len(self._jobs)
+
+
+# Backward-compat alias. Existing tests and callers import
+# ``FederationState`` and instantiate it as the in-memory backend.
+# ``FederationStateProtocol`` is the new structural type for type hints.
+FederationState = InMemoryFederationState
+
+
+# ---------------------------------------------------------------------------
+# Redis-backed HA federation state (v1.2)
+# ---------------------------------------------------------------------------
+
+# Redis key layout:
+#   vt:fed:job:<job_id>        — Redis Hash with all job fields
+#   vt:fed:pending             — Redis Sorted Set; score = priority (negated
+#                                for desc order is done in Lua), tie-break by
+#                                member = "<created_at>:<job_id>" so ZPOPMIN
+#                                yields highest-priority, FIFO-within-priority.
+#   vt:fed:ids                 — Redis Set of all job ids (for list_jobs)
+#
+# Claim atomicity: a single Lua script reads the best member from the
+# sorted set, removes it, and marks the job hash as claimed — all inside
+# one Redis EVAL. This is race-free across coordinators because Redis
+# executes scripts atomically (single-threaded command loop).
+
+_CLAIM_LUA = """
+-- KEYS[1] = vt:fed:pending (sorted set)
+-- ARGV[1] = worker_id
+-- ARGV[2] = claimed_at (float seconds)
+-- ARGV[3] = job hash prefix "vt:fed:job:"
+-- Returns: job_id (string) or nil if no pending jobs.
+local best = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+if not best or #best == 0 then
+    return nil
+end
+local member = best[1]
+-- member is "<created_at>:<job_id>"
+local sep = string.find(member, ':')
+local job_id = string.sub(member, sep + 1)
+redis.call('ZREM', KEYS[1], member)
+local key = ARGV[3] .. job_id
+redis.call('HSET', key, 'status', 'claimed',
+           'claimed_by', ARGV[1],
+           'claimed_at', ARGV[2])
+return job_id
+"""
+
+
+def _job_from_hash(job_id: str, h: Dict[bytes, bytes]) -> Optional[FederatedJob]:
+    """Reconstruct a FederatedJob from a Redis hash (byte keys/values)."""
+    if not h:
+        return None
+
+    def _g(key: str, default: str = "") -> str:
+        v = h.get(key.encode()) or h.get(key)
+        if v is None:
+            return default
+        return v.decode() if isinstance(v, bytes) else str(v)
+
+    def _gf(key: str) -> Optional[float]:
+        v = h.get(key.encode()) or h.get(key)
+        if v is None or v == b"" or v == "":
+            return None
+        try:
+            return float(v.decode() if isinstance(v, bytes) else v)
+        except (ValueError, TypeError):
+            return None
+
+    def _gi(key: str, default: int = 0) -> int:
+        v = h.get(key.encode()) or h.get(key)
+        if v is None or v == b"" or v == "":
+            return default
+        try:
+            return int(v.decode() if isinstance(v, bytes) else v)
+        except (ValueError, TypeError):
+            return default
+
+    def _gd(key: str) -> Optional[Dict[str, Any]]:
+        v = h.get(key.encode()) or h.get(key)
+        if v is None or v == b"" or v == "":
+            return None
+        try:
+            return json.loads(v.decode() if isinstance(v, bytes) else v)
+        except (json.JSONDecodeError, ValueError):
+            return None
+
+    status = _g("status", "pending")
+    return FederatedJob(
+        job_id=job_id,
+        query=_g("query"),
+        priority=_gi("priority"),
+        # force_route is a string in the dataclass; store as plain string.
+        force_route=(_g("force_route") or None),
+        submitted_by=_g("submitted_by"),
+        status=status,
+        claimed_by=_g("claimed_by") or None,
+        result=_gd("result"),
+        error=_g("error") or None,
+        created_at=_gf("created_at") or time.time(),
+        claimed_at=_gf("claimed_at"),
+        completed_at=_gf("completed_at"),
+    )
+
+
+class RedisFederationState:
+    """Multi-coordinator HA federation state backed by Redis.
+
+    Enables deploying multiple ``federation_server.py`` instances behind
+    a load balancer, all sharing one Redis cluster. The claim operation
+    is atomic across coordinators via a Lua script (Redis executes EVAL
+    single-threaded, so two coordinators can never claim the same job).
+
+    Jobs are stored as Redis Hashes (``vt:fed:job:<id>``); the pending
+    queue is a Redis Sorted Set (``vt:fed:pending``) scored so that
+    ``ZRANGE ... 0 0`` returns the highest-priority, FIFO-within-priority
+    job. A Redis Set (``vt:fed:ids``) tracks all job ids for
+    ``list_jobs``.
+
+    Args:
+        redis_url: Redis connection URL (e.g. ``redis://localhost:6379/0``).
+        key_prefix: namespace prefix for all Redis keys (default ``vt:fed``).
+        redis_client: optional pre-built async Redis client (for testing
+            with ``fakeredis.aioredis.FakeRedis``). When provided,
+            ``redis_url`` is ignored.
+
+    Requires the ``redis`` package (``pip install redis>=5``). When Redis
+    is unreachable, methods raise ``ConnectionError`` — the caller
+    (``create_federation_app``) is expected to fail-closed or retry.
+    """
+
+    _CLAIM_RETRIES = 8  # WATCH/MULTI optimistic-locking retry bound.
+
+    def __init__(
+        self,
+        redis_url: str = "redis://localhost:6379/0",
+        key_prefix: str = "vt:fed",
+        redis_client: Any = None,
+    ):
+        self._prefix = key_prefix
+        self._job_prefix = f"{key_prefix}:job:"
+        self._pending_key = f"{key_prefix}:pending"
+        self._ids_key = f"{key_prefix}:ids"
+        self._claim_script_sha: Optional[str] = None
+        if redis_client is not None:
+            self._redis = redis_client
+        else:
+            try:
+                import redis.asyncio as aioredis
+            except ImportError as e:
+                raise ImportError(
+                    "RedisFederationState requires the 'redis' package: "
+                    "pip install redis>=5"
+                ) from e
+            self._redis = aioredis.from_url(redis_url, decode_responses=False)
+
+    async def _ensure_claim_script(self) -> None:
+        """Load the claim Lua script once; cache its SHA for EVALSHA."""
+        if self._claim_script_sha is not None:
+            return
+        self._claim_script_sha = await self._redis.script_load(_CLAIM_LUA)
+
+    async def submit(self, job_id: str, query: str, priority: int = 0,
+                     force_route: Optional[str] = None,
+                     submitted_by: str = "") -> FederatedJob:
+        job = FederatedJob(
+            job_id=job_id or uuid.uuid4().hex[:12],
+            query=query, priority=priority,
+            force_route=force_route,
+            submitted_by=submitted_by,
+        )
+        key = f"{self._job_prefix}{job.job_id}"
+        # Sorted-set member encodes tie-break: "<created_at>:<job_id>".
+        # Score is the priority; we negate in Lua by reading ZRANGE 0 0
+        # only works if higher priority sorts first. Redis sorted sets
+        # order by score ascending, so to get highest-priority-first we
+        # use score = -priority. Within the same score, members sort
+        # lexicographically — and "<created_at>:<job_id>" with a
+        # fixed-precision created_at gives FIFO. We use the float
+        # created_at directly; for sub-second FIFO correctness across
+        # jobs submitted in the same second, the lexicographic compare
+        # of the float string is monotonic for identical precision.
+        member = f"{job.created_at:.6f}:{job.job_id}"
+        score = float(-job.priority)
+        pipe = self._redis.pipeline()
+        pipe.hset(key, mapping={
+            "job_id": job.job_id,
+            "query": job.query,
+            "priority": str(job.priority),
+            "force_route": job.force_route or "",
+            "submitted_by": job.submitted_by,
+            "status": "pending",
+            "claimed_by": "",
+            "result": "",
+            "error": "",
+            "created_at": str(job.created_at),
+            "claimed_at": "",
+            "completed_at": "",
+        })
+        pipe.zadd(self._pending_key, {member: score})
+        pipe.sadd(self._ids_key, job.job_id)
+        await pipe.execute()
+        return job
+
+    async def claim(self, worker_id: str) -> Optional[FederatedJob]:
+        """Atomically claim the highest-priority pending job.
+
+        Two strategies, both race-free across coordinators:
+
+          1. **Lua (preferred on real Redis).** A single EVALSHA script
+             reads the best sorted-set member, removes it, and marks the
+             job hash claimed — all inside one atomic Redis command.
+          2. **WATCH/MULTI fallback.** Used when the Redis server (or
+             ``fakeredis`` in tests) does not support scripting. WATCHes
+             the pending sorted set; if another coordinator modifies it
+             between WATCH and EXEC, EXEC returns nil and we retry
+             (optimistic locking, bounded to ``_CLAIM_RETRIES``).
+
+        Returns ``None`` if no jobs are pending.
+        """
+        # Try the Lua path first.
+        try:
+            await self._ensure_claim_script()
+            job_id = await self._redis.evalsha(
+                self._claim_script_sha, 1, self._pending_key,
+                worker_id, str(time.time()), self._job_prefix,
+            )
+            if not job_id:
+                return None
+            job_id = job_id.decode() if isinstance(job_id, bytes) else job_id
+            h = await self._redis.hgetall(f"{self._job_prefix}{job_id}")
+            return _job_from_hash(job_id, h)
+        except Exception as e:
+            # Scripting unsupported (fakeredis) or NOSCRIPT after flush.
+            # Fall through to the WATCH/MULTI path. Mark the cached SHA
+            # invalid so subsequent claims skip the failed EVALSHA.
+            self._claim_script_sha = None
+            if "NOSCRIPT" not in str(e) and "unknown command" not in str(e) \
+                    and "script" not in str(e).lower():
+                # Unexpected error — don't silently swallow it.
+                raise
+        return await self._claim_via_watch(worker_id)
+
+    async def _claim_via_watch(self, worker_id: str) -> Optional[FederatedJob]:
+        """Optimistic-locking claim fallback (WATCH/MULTI/EXEC).
+
+        Bounded retry: if EXEC is aborted because another coordinator
+        touched the pending set, we retry up to ``_CLAIM_RETRIES`` times.
+        Uses the pipeline's WATCH (not the client's) to avoid the
+        redis-py deprecation warning.
+        """
+        for _ in range(self._CLAIM_RETRIES):
+            pipe = self._redis.pipeline()
+            try:
+                await pipe.watch(self._pending_key)
+                best = await pipe.zrange(
+                    self._pending_key, 0, 0, withscores=True)
+                if not best:
+                    await pipe.unwatch()
+                    return None
+                member = best[0][0]
+                if isinstance(member, bytes):
+                    member_str = member.decode()
+                else:
+                    member_str = str(member)
+                sep = member_str.find(":")
+                job_id = member_str[sep + 1:]
+                pipe.multi()
+                pipe.zrem(self._pending_key, member)
+                pipe.hset(f"{self._job_prefix}{job_id}", mapping={
+                    "status": "claimed",
+                    "claimed_by": worker_id,
+                    "claimed_at": str(time.time()),
+                })
+                result = await pipe.execute()
+                # If EXEC was aborted (nil), result is None — retry.
+                if result is None:
+                    continue
+                h = await self._redis.hgetall(f"{self._job_prefix}{job_id}")
+                return _job_from_hash(job_id, h)
+            except Exception:
+                # WATCH interrupted — retry.
+                continue
+        return None
+
+    async def complete(self, job_id: str, result: Optional[Dict] = None,
+                       error: Optional[str] = None) -> bool:
+        key = f"{self._job_prefix}{job_id}"
+        exists = await self._redis.exists(key)
+        if not exists:
+            return False
+        status = "error" if error else "done"
+        mapping: Dict[str, str] = {
+            "status": status,
+            "completed_at": str(time.time()),
+        }
+        if result is not None:
+            mapping["result"] = json.dumps(result)
+        if error:
+            mapping["error"] = error
+        await self._redis.hset(key, mapping=mapping)
+        return True
+
+    async def list_jobs(self) -> List[Dict[str, Any]]:
+        ids = await self._redis.smembers(self._ids_key)
+        ids = [i.decode() if isinstance(i, bytes) else i for i in ids]
+        if not ids:
+            return []
+        pipe = self._redis.pipeline()
+        for jid in ids:
+            pipe.hgetall(f"{self._job_prefix}{jid}")
+        hashes = await pipe.execute()
+        out: List[Dict[str, Any]] = []
+        for jid, h in zip(ids, hashes):
+            if not h:
+                continue
+            job = _job_from_hash(jid, h)
+            if job is None:
+                continue
+            out.append({
+                "job_id": job.job_id, "query": job.query,
+                "priority": job.priority, "status": job.status,
+                "submitted_by": job.submitted_by,
+                "claimed_by": job.claimed_by,
+                "created_at": job.created_at,
+                "completed_at": job.completed_at,
+                "error": job.error,
+            })
+        return out
+
+    async def get_job(self, job_id: str) -> Optional[FederatedJob]:
+        h = await self._redis.hgetall(f"{self._job_prefix}{job_id}")
+        if not h:
+            return None
+        return _job_from_hash(job_id, h)
+
+    async def count(self) -> int:
+        return int(await self._redis.scard(self._ids_key))
+
+
+def make_federation_state(
+    redis_url: Optional[str] = None,
+    redis_client: Any = None,
+) -> FederationStateProtocol:
+    """Factory: select the federation state backend.
+
+    Precedence:
+      1. ``redis_client`` (testing) or non-empty ``redis_url`` ->
+         :class:`RedisFederationState`.
+      2. Otherwise -> :class:`InMemoryFederationState` (the default,
+         unchanged single-coordinator behavior).
+    """
+    if redis_client is not None or (redis_url and redis_url.strip()):
+        return RedisFederationState(
+            redis_url=redis_url or "redis://localhost:6379/0",
+            redis_client=redis_client,
+        )
+    return InMemoryFederationState()
+
 
 # ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
 
-def create_federation_app() -> FastAPI:
-    """Create the federation server FastAPI app."""
+def create_federation_app(
+    state: Optional[FederationStateProtocol] = None,
+) -> FastAPI:
+    """Create the federation server FastAPI app.
+
+    Args:
+        state: an optional federation state backend. Defaults to
+            :class:`InMemoryFederationState` (the pre-v1.2 single-
+            coordinator behavior). Pass a :class:`RedisFederationState`
+            for multi-coordinator HA deployments.
+    """
     app = FastAPI(title="vibe-thinker federation", docs_url="/docs")
-    state = FederationState()
+    if state is None:
+        state = InMemoryFederationState()
 
     @app.get("/health")
     async def health():
-        return {"status": "ok", "jobs": len(state._jobs)}
+        return {"status": "ok", "jobs": await state.count()}
 
     @app.post("/submit")
     async def submit_job(req: Request):
@@ -216,9 +621,24 @@ def main():
     parser.add_argument("--mtls-key", default="", help="Server private key (PEM)")
     parser.add_argument("--mtls-ca", default="", help="CA certificate for client verification")
     parser.add_argument("--no-tls", action="store_true", help="Disable TLS (dev only)")
+    parser.add_argument(
+        "--redis-url", default="",
+        help="Redis URL for HA multi-coordinator state (e.g. "
+             "redis://localhost:6379/0). When set, the server uses "
+             "RedisFederationState so multiple instances can share state. "
+             "When empty (default), uses in-memory single-coordinator state.",
+    )
+    parser.add_argument(
+        "--no-redis", action="store_true",
+        help="Force in-memory state even if --redis-url is set (dev/testing).",
+    )
     args = parser.parse_args()
 
-    app = create_federation_app()
+    redis_url = "" if args.no_redis else (args.redis_url or "").strip()
+    state = make_federation_state(redis_url=redis_url)
+    backend = "redis" if redis_url else "in-memory"
+    app = create_federation_app(state=state)
+    print(f"[Federation] State backend: {backend}")
 
     if args.no_tls or not args.mtls_cert:
         print(f"[Federation] Running WITHOUT TLS (dev mode) on {args.host}:{args.port}")
