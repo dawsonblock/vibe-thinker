@@ -1603,12 +1603,25 @@ class HybridReasoningOrchestrator:
     # sort), and "values" (name -> numeric, the answer's values).
     _LOGIC_CONSTRAINT_PROMPT = (
         "Translate the following logic problem into Z3 SMT constraints.\n"
-        "Output ONLY a JSON object with these keys:\n"
+        "Output ONLY a JSON object with these keys (no explanation, no markdown):\n"
         '  "constraints": list of Z3 assertion strings (e.g. "x > 0", "x + y == 10")\n'
         '  "variables": object mapping variable names to their Z3 sort ("Int", "Real", or "Bool")\n'
         '  "values": object mapping variable names to the answer\'s numeric values\n'
         "\n"
-        "Example:\n"
+        "Examples:\n"
+        "\n"
+        'Problem: "I have 3 apples and give 1 away. How many do I have?"\n'
+        "Output:\n"
+        '{{"constraints": ["apples == 3", "given == 1", "remaining == apples - given"], '
+        '"variables": {{"apples": "Int", "given": "Int", "remaining": "Int"}}, '
+        '"values": {{"apples": 3, "given": 1, "remaining": 2}}}}\n'
+        "\n"
+        'Problem: "If it is raining then the ground is wet. The ground is not wet. Is it raining?"\n'
+        "Output:\n"
+        '{{"constraints": ["Implies(raining, wet)", "Not(wet)"], '
+        '"variables": {{"raining": "Bool", "wet": "Bool"}}, '
+        '"values": {{"raining": 0}}}}\n'
+        "\n"
         'Problem: "If x is a positive integer and x + y = 10 and y < x, what are x and y?"\n'
         "Output:\n"
         '{{"constraints": ["x > 0", "x + y == 10", "y < x"], '

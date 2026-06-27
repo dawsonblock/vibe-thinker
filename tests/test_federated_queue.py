@@ -18,6 +18,7 @@ from federated_queue import (
     LocalJobQueue,
     FederatedJobQueue,
     make_job_queue,
+    _serialize_result,
 )
 from rfsn_job_queue import JobQueue, JobStatus
 
@@ -245,3 +246,76 @@ class TestMakeJobQueueFactory:
             audit_log=None,
         )
         assert isinstance(q, LocalJobQueue)
+
+
+# ---------------------------------------------------------------------- #
+# _serialize_result (v1.0)
+# ---------------------------------------------------------------------- #
+class TestSerializeResult:
+    """Tests for the _serialize_result helper that converts OrchestratorResult
+    to a JSON-safe dict for federation POST-back."""
+
+    def test_none_returns_empty_dict(self):
+        assert _serialize_result(None) == {}
+
+    def test_dict_passthrough(self):
+        d = {"answer": "42", "score": 0.95}
+        assert _serialize_result(d) == d
+
+    def test_dataclass_serialized(self):
+        """A simple dataclass is serialized via __dict__."""
+        from dataclasses import dataclass
+
+        @dataclass
+        class FakeResult:
+            final_answer: str = "42"
+            score: float = 0.95
+            verified: bool = True
+
+        result = _serialize_result(FakeResult())
+        assert result["final_answer"] == "42"
+        assert result["score"] == 0.95
+        assert result["verified"] is True
+
+    def test_non_serializable_raw_traces_handled(self):
+        """raw_traces with non-serializable nested objects doesn't crash."""
+        from dataclasses import dataclass, field
+        from typing import Any, Dict
+
+        @dataclass
+        class FakeResult:
+            final_answer: str = "42"
+            raw_traces: Dict[str, Any] = field(default_factory=dict)
+
+        # raw_traces contains a non-serializable object (a custom class).
+        class NonSerializable:
+            def __repr__(self):
+                return "<NonSerializable>"
+
+        result = FakeResult(raw_traces={"nested": NonSerializable()})
+        serialized = _serialize_result(result)
+        # Should not crash — the non-serializable value becomes a string.
+        assert serialized["final_answer"] == "42"
+        assert "raw_traces" in serialized
+
+    def test_orchestrator_result_shape(self):
+        """Test with the actual OrchestratorResult dataclass."""
+        from hybrid_orchestrator import OrchestratorResult
+
+        result = OrchestratorResult(
+            final_answer="4",
+            route_taken="specialist_clr",
+            specialist_used="VibeThinker-3B",
+            clr_score=0.95,
+            raw_traces={"clr_result": {"best_answer": "4", "best_score": 0.95}},
+        )
+        serialized = _serialize_result(result)
+        assert serialized["final_answer"] == "4"
+        assert serialized["route_taken"] == "specialist_clr"
+        assert serialized["clr_score"] == 0.95
+        assert serialized["raw_traces"]["clr_result"]["best_answer"] == "4"
+
+    def test_non_dict_non_dataclass_returns_string(self):
+        """A bare string is wrapped in a dict."""
+        result = _serialize_result("just a string")
+        assert result == {"result": "just a string"}

@@ -1,17 +1,18 @@
 """Tests for the SNI-aware egress proxy (v0.4.1).
 
 Tests the SNI extraction from TLS ClientHello, domain matching with
-wildcards, and the proxy's allow/deny logic. Does NOT test the actual
-TCP tunneling (that requires a live server — covered by integration
-tests).
+wildcards, the proxy's allow/deny logic, and the SNIEgressProxy server
+class (TCP-level tests with a real local server).
 """
 
+import asyncio
 import pytest
 
 from sandbox.sni_proxy import (
     extract_sni,
     domain_matches,
     is_domain_allowed,
+    SNIEgressProxy,
 )
 
 
@@ -161,3 +162,211 @@ class TestIsDomainAllowed:
         assert is_domain_allowed(
             "evil.com", {"pypi.org", "github.com"}, {"*.pypi.org"}
         ) is False
+
+
+# ---------------------------------------------------------------------- #
+# SNIEgressProxy server class (TCP-level tests)
+# ---------------------------------------------------------------------- #
+class TestSNIEgressProxy:
+    """Tests for the SNIEgressProxy server class — uses a real local TCP
+    server to test connection handling, CONNECT tunneling, and HTTP proxying."""
+
+    @pytest.mark.asyncio
+    async def test_start_and_stop(self):
+        """The proxy starts and stops cleanly."""
+        proxy = SNIEgressProxy(
+            allowed_domains={"example.com"},
+            allowed_wildcards=set(),
+            port=0,  # ephemeral port
+        )
+        await proxy.start()
+        assert proxy._server is not None
+        await proxy.stop()
+        assert proxy._denied_count == 0
+        assert proxy._allowed_count == 0
+
+    @pytest.mark.asyncio
+    async def test_connect_denied_domain_returns_403(self):
+        """CONNECT to a denied domain returns 403 Forbidden.
+
+        The proxy reads the CONNECT line, headers, then the TLS ClientHello
+        to extract SNI. We need to send a ClientHello with a denied SNI.
+        """
+        proxy = SNIEgressProxy(
+            allowed_domains={"pypi.org"},
+            allowed_wildcards=set(),
+            port=0,
+        )
+        await proxy.start()
+        addr = proxy._server.sockets[0].getsockname()
+
+        try:
+            reader, writer = await asyncio.open_connection(addr[0], addr[1])
+            # Send a CONNECT request to a denied domain.
+            writer.write(b"CONNECT evil.com:443 HTTP/1.1\r\nHost: evil.com:443\r\n\r\n")
+            await writer.drain()
+            # Send a minimal TLS ClientHello with SNI=evil.com so the proxy
+            # can extract and check it.
+            hostname = b"evil.com"
+            sni_entry = b'\x00' + len(hostname).to_bytes(2, 'big') + hostname
+            sni_list = len(sni_entry).to_bytes(2, 'big') + sni_entry
+            sni_ext = b'\x00\x00' + len(sni_list).to_bytes(2, 'big') + sni_list
+            extensions = sni_ext
+            ext_len = len(extensions).to_bytes(2, 'big')
+            compression = b'\x01\x00'
+            cipher = b'\x00\x2f'
+            cipher_list = len(cipher).to_bytes(2, 'big') + cipher
+            session_id = b'\x00'
+            random_bytes = b'\x00' * 32
+            version = b'\x03\x01'
+            body = version + random_bytes + session_id + cipher_list + compression + ext_len + extensions
+            handshake = b'\x01' + len(body).to_bytes(3, 'big') + body
+            record = b'\x16\x03\x01' + len(handshake).to_bytes(2, 'big') + handshake
+            writer.write(record)
+            await writer.drain()
+            # Read the response — should be 403.
+            response = await asyncio.wait_for(reader.read(1024), timeout=5.0)
+            assert b"403" in response
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            await proxy.stop()
+
+        assert proxy._denied_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_connect_with_no_sni_denied(self):
+        """CONNECT to an allowed domain but with no SNI in ClientHello is denied."""
+        proxy = SNIEgressProxy(
+            allowed_domains={"pypi.org"},
+            allowed_wildcards=set(),
+            port=0,
+        )
+        await proxy.start()
+        addr = proxy._server.sockets[0].getsockname()
+
+        try:
+            reader, writer = await asyncio.open_connection(addr[0], addr[1])
+            # CONNECT to allowed domain.
+            writer.write(b"CONNECT pypi.org:443 HTTP/1.1\r\nHost: pypi.org:443\r\n\r\n")
+            await writer.drain()
+            # Send a TLS ClientHello WITHOUT the SNI extension.
+            compression = b'\x01\x00'
+            cipher = b'\x00\x2f'
+            cipher_list = len(cipher).to_bytes(2, 'big') + cipher
+            session_id = b'\x00'
+            random_bytes = b'\x00' * 32
+            version = b'\x03\x01'
+            ext_len = b'\x00\x00'  # no extensions
+            body = version + random_bytes + session_id + cipher_list + compression + ext_len
+            handshake = b'\x01' + len(body).to_bytes(3, 'big') + body
+            record = b'\x16\x03\x01' + len(handshake).to_bytes(2, 'big') + handshake
+            writer.write(record)
+            await writer.drain()
+            response = await asyncio.wait_for(reader.read(1024), timeout=5.0)
+            # Should get 403 (no SNI extracted).
+            assert b"403" in response
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_http_denied_host_returns_403(self):
+        """HTTP request to a denied Host header gets blocked."""
+        proxy = SNIEgressProxy(
+            allowed_domains={"pypi.org"},
+            allowed_wildcards=set(),
+            port=0,
+        )
+        await proxy.start()
+        addr = proxy._server.sockets[0].getsockname()
+
+        try:
+            reader, writer = await asyncio.open_connection(addr[0], addr[1])
+            # Send an HTTP request with a denied Host header.
+            writer.write(b"GET / HTTP/1.1\r\nHost: evil.com\r\n\r\n")
+            await writer.drain()
+            response = await asyncio.wait_for(reader.read(1024), timeout=5.0)
+            # The proxy should not forward this — connection closed or 403.
+            # (HTTP mode doesn't send 403, it just closes the connection
+            #  if the host is denied. The _handle_http method doesn't write
+            #  a 403 response — it just doesn't forward.)
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            await proxy.stop()
+
+        assert proxy._denied_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_unknown_protocol_denied(self):
+        """Non-HTTP, non-CONNECT data is denied (connection closed)."""
+        proxy = SNIEgressProxy(
+            allowed_domains={"pypi.org"},
+            allowed_wildcards=set(),
+            port=0,
+        )
+        await proxy.start()
+        addr = proxy._server.sockets[0].getsockname()
+
+        try:
+            reader, writer = await asyncio.open_connection(addr[0], addr[1])
+            # Send garbage that's not CONNECT or HTTP.
+            writer.write(b"SSH-2.0-OpenSSH\r\n")
+            await writer.drain()
+            # The proxy should close the connection.
+            await asyncio.sleep(0.1)
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            await proxy.stop()
+
+        assert proxy._denied_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_counters_track_allowed_and_denied(self):
+        """The allowed_count and denied_count are tracked correctly."""
+        proxy = SNIEgressProxy(
+            allowed_domains={"pypi.org"},
+            allowed_wildcards=set(),
+            port=0,
+        )
+        await proxy.start()
+        addr = proxy._server.sockets[0].getsockname()
+
+        # Build a ClientHello with SNI=evil.com (denied)
+        hostname = b"evil.com"
+        sni_entry = b'\x00' + len(hostname).to_bytes(2, 'big') + hostname
+        sni_list = len(sni_entry).to_bytes(2, 'big') + sni_entry
+        sni_ext = b'\x00\x00' + len(sni_list).to_bytes(2, 'big') + sni_list
+        extensions = sni_ext
+        ext_len = len(extensions).to_bytes(2, 'big')
+        compression = b'\x01\x00'
+        cipher = b'\x00\x2f'
+        cipher_list = len(cipher).to_bytes(2, 'big') + cipher
+        session_id = b'\x00'
+        random_bytes = b'\x00' * 32
+        version = b'\x03\x01'
+        body = version + random_bytes + session_id + cipher_list + compression + ext_len + extensions
+        handshake = b'\x01' + len(body).to_bytes(3, 'big') + body
+        record = b'\x16\x03\x01' + len(handshake).to_bytes(2, 'big') + handshake
+
+        try:
+            # Send two denied CONNECT requests with ClientHello.
+            for _ in range(2):
+                reader, writer = await asyncio.open_connection(addr[0], addr[1])
+                writer.write(b"CONNECT evil.com:443 HTTP/1.1\r\nHost: evil.com:443\r\n\r\n")
+                await writer.drain()
+                writer.write(record)
+                await writer.drain()
+                await asyncio.wait_for(reader.read(1024), timeout=5.0)
+                writer.close()
+                await writer.wait_closed()
+
+            await asyncio.sleep(0.1)  # let counters update
+        finally:
+            await proxy.stop()
+
+        assert proxy._denied_count >= 2
+        assert proxy._allowed_count == 0

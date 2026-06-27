@@ -104,3 +104,67 @@ class TestMathVerifier:
             context={"expected_answer": "1807"},
         )
         assert result.verified is True
+
+    # --- Space-variant \boxed{} regex tests (v0.4.1 fix) ---
+
+    @pytest.mark.asyncio
+    async def test_boxed_with_space_before_brace(self, verifier):
+        """\\boxed {42} (space before brace) should be extracted correctly."""
+        result = await verifier.verify(
+            "What is 6*7?",
+            "The answer is \\boxed {42}",
+            context={"expected_answer": "42"},
+        )
+        assert result.verified is True
+
+    @pytest.mark.asyncio
+    async def test_boxed_with_multiple_spaces_before_brace(self, verifier):
+        """\\boxed  {42} (multiple spaces) should also work."""
+        result = await verifier.verify(
+            "What is 6*7?",
+            "The answer is \\boxed  {42}",
+            context={"expected_answer": "42"},
+        )
+        assert result.verified is True
+
+    @pytest.mark.asyncio
+    async def test_boxed_with_space_and_nested_braces(self, verifier):
+        """\\boxed {\\frac{7}{2}} (space + nested braces) should work."""
+        result = await verifier.verify(
+            "What is 7/2?",
+            "The answer is \\boxed {\\frac{7}{2}}",
+            context={"expected_answer": "3.5"},
+        )
+        assert result.verified is True
+
+    def test_extract_boxed_no_space(self):
+        """Direct test of _extract_boxed with no space."""
+        from verifiers.math_verifier import MathVerifier
+        assert MathVerifier._extract_boxed("Answer: \\boxed{42}") == "42"
+
+    def test_extract_boxed_single_space(self):
+        """Direct test of _extract_boxed with single space."""
+        from verifiers.math_verifier import MathVerifier
+        assert MathVerifier._extract_boxed("Answer: \\boxed {42}") == "42"
+
+    def test_extract_boxed_multiple_spaces(self):
+        """Direct test of _extract_boxed with multiple spaces."""
+        from verifiers.math_verifier import MathVerifier
+        assert MathVerifier._extract_boxed("Answer: \\boxed   {42}") == "42"
+
+    def test_extract_boxed_nested_braces_with_space(self):
+        """Direct test of _extract_boxed with nested braces and space."""
+        from verifiers.math_verifier import MathVerifier
+        result = MathVerifier._extract_boxed("\\boxed {\\frac{7}{2}}")
+        assert result == "\\frac{7}{2}"
+
+    def test_extract_boxed_no_boxed_returns_none(self):
+        """No \\boxed{} in text returns None."""
+        from verifiers.math_verifier import MathVerifier
+        assert MathVerifier._extract_boxed("The answer is 42") is None
+
+    def test_extract_boxed_takes_last_match(self):
+        """Multiple \\boxed{} — the last one is returned."""
+        from verifiers.math_verifier import MathVerifier
+        text = "First \\boxed{1} then \\boxed{2}"
+        assert MathVerifier._extract_boxed(text) == "2"

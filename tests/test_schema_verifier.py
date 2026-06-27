@@ -401,3 +401,115 @@ class TestLogicConstraintTranslation:
             orch = HybridReasoningOrchestrator.__new__(HybridReasoningOrchestrator)
             result = await orch._translate_logic_constraints("query")
         assert result is None
+
+    @pytest.mark.asyncio
+    async def test_arithmetic_word_problem(self):
+        """Arithmetic word problem: 'I have 3 apples and give 1 away'."""
+        from hybrid_orchestrator import HybridReasoningOrchestrator
+        from unittest.mock import AsyncMock, patch
+
+        generalist_response = json.dumps({
+            "constraints": ["apples == 3", "given == 1", "remaining == apples - given"],
+            "variables": {"apples": "Int", "given": "Int", "remaining": "Int"},
+            "values": {"apples": 3, "given": 1, "remaining": 2},
+        })
+        with patch.object(
+            HybridReasoningOrchestrator, "_call_generalist",
+            new_callable=AsyncMock, return_value=generalist_response,
+        ):
+            orch = HybridReasoningOrchestrator.__new__(HybridReasoningOrchestrator)
+            result = await orch._translate_logic_constraints(
+                "I have 3 apples and give 1 away. How many do I have?"
+            )
+        assert result is not None
+        assert len(result["constraints"]) == 3
+        assert result["values"]["remaining"] == 2
+
+    @pytest.mark.asyncio
+    async def test_boolean_logic_problem(self):
+        """Boolean logic: 'If raining then wet. Not wet. Is it raining?'"""
+        from hybrid_orchestrator import HybridReasoningOrchestrator
+        from unittest.mock import AsyncMock, patch
+
+        generalist_response = json.dumps({
+            "constraints": ["Implies(raining, wet)", "Not(wet)"],
+            "variables": {"raining": "Bool", "wet": "Bool"},
+            "values": {"raining": 0},
+        })
+        with patch.object(
+            HybridReasoningOrchestrator, "_call_generalist",
+            new_callable=AsyncMock, return_value=generalist_response,
+        ):
+            orch = HybridReasoningOrchestrator.__new__(HybridReasoningOrchestrator)
+            result = await orch._translate_logic_constraints(
+                "If it is raining then the ground is wet. The ground is not wet. Is it raining?"
+            )
+        assert result is not None
+        assert "Implies" in result["constraints"][0]
+        assert result["variables"]["raining"] == "Bool"
+
+    @pytest.mark.asyncio
+    async def test_real_arithmetic_problem(self):
+        """Real-valued variables: 'x is between 1.5 and 2.5'."""
+        from hybrid_orchestrator import HybridReasoningOrchestrator
+        from unittest.mock import AsyncMock, patch
+
+        generalist_response = json.dumps({
+            "constraints": ["x > 1.5", "x < 2.5"],
+            "variables": {"x": "Real"},
+            "values": {"x": 2.0},
+        })
+        with patch.object(
+            HybridReasoningOrchestrator, "_call_generalist",
+            new_callable=AsyncMock, return_value=generalist_response,
+        ):
+            orch = HybridReasoningOrchestrator.__new__(HybridReasoningOrchestrator)
+            result = await orch._translate_logic_constraints(
+                "x is a real number between 1.5 and 2.5. What is x?"
+            )
+        assert result is not None
+        assert result["variables"]["x"] == "Real"
+        assert result["values"]["x"] == 2.0
+
+    @pytest.mark.asyncio
+    async def test_extra_text_around_json(self):
+        """Generalist returns JSON with extra text before/after — still parsed."""
+        from hybrid_orchestrator import HybridReasoningOrchestrator
+        from unittest.mock import AsyncMock, patch
+
+        response = (
+            'Sure, here is the translation:\n'
+            '{"constraints": ["a > 0"], "variables": {"a": "Int"}, "values": {"a": 5}}\n'
+            'Hope this helps!'
+        )
+        with patch.object(
+            HybridReasoningOrchestrator, "_call_generalist",
+            new_callable=AsyncMock, return_value=response,
+        ):
+            orch = HybridReasoningOrchestrator.__new__(HybridReasoningOrchestrator)
+            result = await orch._translate_logic_constraints("query")
+        assert result is not None
+        assert result["constraints"] == ["a > 0"]
+
+    @pytest.mark.asyncio
+    async def test_valid_json_but_wrong_z3_syntax(self):
+        """Valid JSON with invalid Z3 syntax is still returned (the verifier
+        will catch the syntax error — translation doesn't validate Z3)."""
+        from hybrid_orchestrator import HybridReasoningOrchestrator
+        from unittest.mock import AsyncMock, patch
+
+        generalist_response = json.dumps({
+            "constraints": ["this is not valid z3"],
+            "variables": {"x": "Int"},
+            "values": {"x": 5},
+        })
+        with patch.object(
+            HybridReasoningOrchestrator, "_call_generalist",
+            new_callable=AsyncMock, return_value=generalist_response,
+        ):
+            orch = HybridReasoningOrchestrator.__new__(HybridReasoningOrchestrator)
+            result = await orch._translate_logic_constraints("query")
+        # Translation returns the constraints as-is — the Z3 verifier will
+        # catch the syntax error and return verified=False.
+        assert result is not None
+        assert result["constraints"] == ["this is not valid z3"]

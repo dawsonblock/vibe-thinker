@@ -57,15 +57,30 @@ from rfsn_job_queue import Job, JobStatus, JobQueue
 
 
 def _serialize_result(result) -> Dict[str, Any]:
-    """Serialize an OrchestratorResult to a JSON-safe dict for federation."""
+    """Serialize an OrchestratorResult to a JSON-safe dict for federation.
+
+    Handles nested non-serializable objects (e.g. CLRResult in raw_traces)
+    by falling back to str() for anything json.dumps can't handle —
+    mirroring the pattern in HybridReasoningOrchestrator.log_to_memory.
+    """
     if result is None:
         return {}
     if hasattr(result, "__dict__"):
-        return {k: v for k, v in result.__dict__.items()
-                if isinstance(v, (str, int, float, bool, list, dict, type(None)))}
-    if isinstance(result, dict):
-        return result
-    return {"result": str(result)}
+        raw = dict(result.__dict__)
+    elif isinstance(result, dict):
+        raw = result
+    else:
+        return {"result": str(result)}
+    # Round-trip through json.dumps with default=str to ensure
+    # everything is JSON-serializable. Non-serializable values
+    # (e.g. nested dataclasses, datetime, etc.) become strings.
+    try:
+        json.dumps(raw, default=str)
+        return raw
+    except (TypeError, ValueError):
+        # Fallback: convert all values to strings if needed.
+        return {k: v if isinstance(v, (str, int, float, bool, type(None))) else str(v)
+                for k, v in raw.items()}
 
 
 @runtime_checkable
@@ -447,9 +462,13 @@ class FederatedJobQueue:
                               f"from federation, running locally as {job.job_id}")
                         # Launch a background task to wait for completion
                         # and POST the result back to the coordinator.
+                        # NOTE: _claim_and_report creates its own session
+                        # because the claim loop's session is closed at the
+                        # end of this `async with` block — the background
+                        # task outlives it.
                         asyncio.create_task(
                             self._claim_and_report(
-                                session, ctx, remote_job_id, job.job_id
+                                ctx, remote_job_id, job.job_id
                             )
                         )
             except asyncio.CancelledError:
@@ -458,11 +477,16 @@ class FederatedJobQueue:
                 pass  # silent fail — the claim loop is best-effort
 
     async def _claim_and_report(
-        self, session, ssl_ctx, remote_job_id: str, local_job_id: str
+        self, ssl_ctx, remote_job_id: str, local_job_id: str
     ):
         """Wait for a claimed job to complete locally, then POST the
         result back to the federation coordinator.
+
+        Creates its own aiohttp.ClientSession (v1.0 fix: the claim loop's
+        session is closed by the time this background task runs, so we
+        can't reuse it).
         """
+        import aiohttp
         try:
             result = await self._local.wait_for(local_job_id, timeout=600.0)
             # POST the result back to the coordinator.
@@ -470,37 +494,43 @@ class FederatedJobQueue:
                 "job_id": remote_job_id,
                 "result": _serialize_result(result),
             }
-            async with session.post(
-                f"{self._federation_url}/complete",
-                json=payload, ssl=ssl_ctx,
-            ) as resp:
-                if resp.status < 400:
-                    print(f"[FederatedQueue] Reported result for "
-                          f"federation job {remote_job_id}")
-                else:
-                    print(f"[FederatedQueue] Failed to report result for "
-                          f"federation job {remote_job_id}: HTTP {resp.status}")
+            timeout = aiohttp.ClientTimeout(total=30.0)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    f"{self._federation_url}/complete",
+                    json=payload, ssl=ssl_ctx,
+                ) as resp:
+                    if resp.status < 400:
+                        print(f"[FederatedQueue] Reported result for "
+                              f"federation job {remote_job_id}")
+                    else:
+                        print(f"[FederatedQueue] Failed to report result for "
+                              f"federation job {remote_job_id}: HTTP {resp.status}")
         except asyncio.TimeoutError:
             # Job timed out — report the error.
             try:
-                async with session.post(
-                    f"{self._federation_url}/complete",
-                    json={"job_id": remote_job_id,
-                          "error": "execution timed out (600s)"},
-                    ssl=ssl_ctx,
-                ) as resp:
-                    pass
+                timeout = aiohttp.ClientTimeout(total=10.0)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.post(
+                        f"{self._federation_url}/complete",
+                        json={"job_id": remote_job_id,
+                              "error": "execution timed out (600s)"},
+                        ssl=ssl_ctx,
+                    ) as resp:
+                        pass
             except Exception:
                 pass
         except Exception as e:
             # Job failed — report the error.
             try:
-                async with session.post(
-                    f"{self._federation_url}/complete",
-                    json={"job_id": remote_job_id, "error": str(e)},
-                    ssl=ssl_ctx,
-                ) as resp:
-                    pass
+                timeout = aiohttp.ClientTimeout(total=10.0)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.post(
+                        f"{self._federation_url}/complete",
+                        json={"job_id": remote_job_id, "error": str(e)},
+                        ssl=ssl_ctx,
+                    ) as resp:
+                        pass
             except Exception:
                 pass
 

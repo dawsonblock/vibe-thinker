@@ -197,6 +197,115 @@ class TestMakeVectorStoreFactory:
 
 
 @skip_no_embeddings
+class TestVectorStoreClustering:
+    """Tests for the cluster() method (v1.0).
+
+    Tests LocalVectorStore.cluster() with real vectors, AgentDBVectorStore
+    fail-closed behavior, and ShadowVectorStore delegation.
+    """
+
+    def test_local_cluster_finds_two_clusters(self):
+        """5 near-identical + 5 near-identical (different direction) = 2 clusters."""
+        import numpy as np
+        s = LocalVectorStore()
+        np.random.seed(42)
+        for i in range(5):
+            s.upsert(f"a_{i}", [1.0 + np.random.randn() * 0.01, 0.01, 0.01, 0.01])
+        for i in range(5):
+            s.upsert(f"b_{i}", [0.01, 1.0 + np.random.randn() * 0.01, 0.01, 0.01])
+        clusters = s.cluster(similarity_threshold=0.85, min_cluster_size=3)
+        assert len(clusters) == 2
+        assert len(clusters[0]) == 5
+        assert len(clusters[1]) == 5
+
+    def test_local_cluster_single_cluster(self):
+        """All similar vectors form one cluster."""
+        import numpy as np
+        s = LocalVectorStore()
+        np.random.seed(42)
+        for i in range(6):
+            s.upsert(f"v_{i}", [1.0 + np.random.randn() * 0.01, 0.01, 0.01])
+        clusters = s.cluster(similarity_threshold=0.85, min_cluster_size=3)
+        assert len(clusters) == 1
+        assert len(clusters[0]) == 6
+
+    def test_local_cluster_dissimilar_no_clusters(self):
+        """Orthogonal vectors don't cluster."""
+        s = LocalVectorStore()
+        s.upsert("a", [1.0, 0.0, 0.0])
+        s.upsert("b", [0.0, 1.0, 0.0])
+        s.upsert("c", [0.0, 0.0, 1.0])
+        clusters = s.cluster(similarity_threshold=0.5, min_cluster_size=2)
+        assert clusters == []
+
+    def test_local_cluster_min_cluster_size_filter(self):
+        """Clusters smaller than min_cluster_size are excluded."""
+        import numpy as np
+        s = LocalVectorStore()
+        np.random.seed(42)
+        # 2 similar (below min_cluster_size=3)
+        s.upsert("a1", [1.0, 0.01, 0.01])
+        s.upsert("a2", [1.0, 0.01, 0.01])
+        # 5 similar (above min_cluster_size=3)
+        for i in range(5):
+            s.upsert(f"b_{i}", [0.01, 1.0 + np.random.randn() * 0.01, 0.01])
+        clusters = s.cluster(similarity_threshold=0.85, min_cluster_size=3)
+        assert len(clusters) == 1
+        assert len(clusters[0]) == 5
+
+    def test_local_cluster_with_filters(self):
+        """Filters narrow the clustering candidates."""
+        import numpy as np
+        s = LocalVectorStore()
+        np.random.seed(42)
+        for i in range(5):
+            s.upsert(f"math_{i}", [1.0 + np.random.randn() * 0.01, 0.01, 0.01, 0.01],
+                     {"task_type": "math"})
+        for i in range(5):
+            s.upsert(f"code_{i}", [0.01, 1.0 + np.random.randn() * 0.01, 0.01, 0.01],
+                     {"task_type": "code"})
+        # Filter to only math
+        math_clusters = s.cluster(
+            similarity_threshold=0.85, min_cluster_size=3,
+            filters={"task_type": "math"},
+        )
+        assert len(math_clusters) == 1
+        assert all("math_" in vid for vid in math_clusters[0])
+
+    def test_local_cluster_empty_store(self):
+        """Empty store returns no clusters."""
+        s = LocalVectorStore()
+        assert s.cluster() == []
+
+    def test_local_cluster_fewer_than_min(self):
+        """Store with fewer entries than min_cluster_size returns no clusters."""
+        s = LocalVectorStore()
+        s.upsert("a", [1.0, 0.0])
+        s.upsert("b", [1.0, 0.0])
+        assert s.cluster(min_cluster_size=3) == []
+
+    def test_agentdb_cluster_fail_closed_when_down(self):
+        """AgentDBVectorStore.cluster() returns [] when sidecar is down."""
+        s = AgentDBVectorStore(base_url="http://127.0.0.1:9999", collection="test")
+        assert s.cluster() == []
+
+    def test_shadow_cluster_delegates_to_primary(self):
+        """ShadowVectorStore.cluster() delegates to the primary store."""
+        import numpy as np
+        primary = LocalVectorStore()
+        secondary = AgentDBVectorStore(
+            base_url="http://127.0.0.1:9999", collection="shadow"
+        )
+        shadow = ShadowVectorStore(primary, secondary)
+        np.random.seed(42)
+        for i in range(5):
+            primary.upsert(f"a_{i}", [1.0 + np.random.randn() * 0.01, 0.01, 0.01])
+        clusters = shadow.cluster(similarity_threshold=0.85, min_cluster_size=3)
+        assert len(clusters) == 1
+        assert len(clusters[0]) == 5
+
+
+@skip_no_embeddings
 class TestCacheIntegration:
     """Tests that CLRResultCache and VerifiedTrajectoryStore accept
     the new vector_store / agentdb_url parameters without breaking."""

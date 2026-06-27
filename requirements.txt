@@ -2,6 +2,10 @@
 aiohttp>=3.9,<4
 python-dotenv>=1.0,<2
 
+# Optional: web UI + federation server
+fastapi>=0.100,<1
+uvicorn>=0.23,<1
+
 # Optional: semantic routing + CLR result cache
 # Install these for the full experience (embedding-based routing + semantic cache).
 # Without them, the orchestrator falls back to keyword routing and skips the CLR cache.
@@ -13,6 +17,7 @@ numpy>=1.24,<2
 pytest>=7.0,<9
 pytest-asyncio>=0.21,<1
 pytest-timeout>=2.0,<3
+httpx>=0.24,<1
 
 # Optional: in-process specialist backend (eliminates HTTP overhead for tiny
 # models like ruvltra-claude-code-0.5b). Only needed when using

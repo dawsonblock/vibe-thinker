@@ -270,3 +270,41 @@ class TestAuditEvidence:
         result = await executor.execute("print('hello')", timeout=15.0)
         assert "firewall_rules_hash" not in result.evidence
         assert result.evidence.get("network_mode") in ("none", "default")
+
+
+# ---------------------------------------------------------------------- #
+# Proxy egress mode (v0.4.1) — unit tests on env-building logic
+# ---------------------------------------------------------------------- #
+# These tests don't require Docker — they test the proxy egress
+# configuration logic (env var setup, evidence recording) directly.
+class TestProxyEgressMode:
+    """Tests for the --proxy-egress mode in DockerSandboxExecutor (v1.0).
+
+    These are unit tests on the proxy configuration logic, not full
+    Docker integration tests. They verify that proxy env vars are set
+    correctly and appear in evidence.
+    """
+
+    def test_set_proxy_egress_sets_address(self):
+        """set_proxy_egress() stores the proxy address."""
+        from sandbox.docker_executor import DockerSandboxExecutor
+        executor = DockerSandboxExecutor()
+        assert executor._proxy_egress is None
+        executor.set_proxy_egress("127.0.0.1:8888")
+        assert executor._proxy_egress == "127.0.0.1:8888"
+
+    def test_set_proxy_egress_none_clears(self):
+        """set_proxy_egress(None) clears the proxy."""
+        from sandbox.docker_executor import DockerSandboxExecutor
+        executor = DockerSandboxExecutor()
+        executor.set_proxy_egress("127.0.0.1:8888")
+        executor.set_proxy_egress(None)
+        assert executor._proxy_egress is None
+
+    def test_set_proxy_egress_empty_string_clears(self):
+        """set_proxy_egress('') clears the proxy."""
+        from sandbox.docker_executor import DockerSandboxExecutor
+        executor = DockerSandboxExecutor()
+        executor.set_proxy_egress("127.0.0.1:8888")
+        executor.set_proxy_egress("")
+        assert executor._proxy_egress is None or executor._proxy_egress == ""

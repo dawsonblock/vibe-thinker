@@ -392,6 +392,154 @@ class TestGrammarEnforcement:
         assert "grammar" not in captured_payload
 
 
+class TestStructuredOutput:
+    """Tests for the _STRUCTURED_OUTPUT_GRAMMAR and parse_structured_output (v1.0).
+
+    The structured output grammar forces the specialist to output JSON with
+    reasoning_steps, boxed_answer, and code_solution keys — eliminating
+    brittle \\boxed{} regex scraping.
+    """
+
+    def test_structured_grammar_constant_exists(self):
+        from vibe_clr_async import _STRUCTURED_OUTPUT_GRAMMAR
+        assert "root ::=" in _STRUCTURED_OUTPUT_GRAMMAR
+        assert "reasoning_steps" in _STRUCTURED_OUTPUT_GRAMMAR
+        assert "boxed_answer" in _STRUCTURED_OUTPUT_GRAMMAR
+        assert "code_solution" in _STRUCTURED_OUTPUT_GRAMMAR
+
+    def test_structured_grammar_requires_all_three_keys(self):
+        from vibe_clr_async import _STRUCTURED_OUTPUT_GRAMMAR
+        # The grammar uses escaped quotes: \"reasoning_steps\"
+        assert 'reasoning_steps' in _STRUCTURED_OUTPUT_GRAMMAR
+        assert 'boxed_answer' in _STRUCTURED_OUTPUT_GRAMMAR
+        assert 'code_solution' in _STRUCTURED_OUTPUT_GRAMMAR
+
+    def test_parse_valid_structured_output(self):
+        """Valid JSON with all keys is parsed correctly."""
+        from vibe_clr_async import VibeThinkerCLRAsync
+        import json
+        output = json.dumps({
+            "reasoning_steps": ["step 1", "step 2", "step 3"],
+            "boxed_answer": "42",
+            "code_solution": None,
+        })
+        result = VibeThinkerCLRAsync.parse_structured_output(output)
+        assert result is not None
+        assert result["reasoning_steps"] == ["step 1", "step 2", "step 3"]
+        assert result["boxed_answer"] == "42"
+        assert result["code_solution"] is None
+
+    def test_parse_markdown_wrapped_json(self):
+        """JSON wrapped in markdown code fences is still parsed."""
+        from vibe_clr_async import VibeThinkerCLRAsync
+        output = '```json\n{"reasoning_steps": ["s1"], "boxed_answer": "5", "code_solution": null}\n```'
+        result = VibeThinkerCLRAsync.parse_structured_output(output)
+        assert result is not None
+        assert result["boxed_answer"] == "5"
+        assert result["reasoning_steps"] == ["s1"]
+
+    def test_parse_null_boxed_answer_normalized(self):
+        """String 'null' in boxed_answer is normalized to None."""
+        from vibe_clr_async import VibeThinkerCLRAsync
+        import json
+        output = json.dumps({
+            "reasoning_steps": [],
+            "boxed_answer": "null",
+            "code_solution": "null",
+        })
+        result = VibeThinkerCLRAsync.parse_structured_output(output)
+        assert result is not None
+        assert result["boxed_answer"] is None
+        assert result["code_solution"] is None
+
+    def test_parse_empty_string_boxed_answer_normalized(self):
+        """Empty string in boxed_answer is normalized to None."""
+        from vibe_clr_async import VibeThinkerCLRAsync
+        import json
+        output = json.dumps({
+            "reasoning_steps": [],
+            "boxed_answer": "",
+            "code_solution": "",
+        })
+        result = VibeThinkerCLRAsync.parse_structured_output(output)
+        assert result is not None
+        assert result["boxed_answer"] is None
+        assert result["code_solution"] is None
+
+    def test_parse_malformed_json_returns_none(self):
+        """Malformed JSON returns None (caller falls back to regex)."""
+        from vibe_clr_async import VibeThinkerCLRAsync
+        assert VibeThinkerCLRAsync.parse_structured_output("not json at all") is None
+        assert VibeThinkerCLRAsync.parse_structured_output("{broken") is None
+        assert VibeThinkerCLRAsync.parse_structured_output("") is None
+
+    def test_parse_missing_reasoning_steps_returns_none(self):
+        """JSON without reasoning_steps key returns None."""
+        from vibe_clr_async import VibeThinkerCLRAsync
+        import json
+        output = json.dumps({"boxed_answer": "42", "code_solution": None})
+        result = VibeThinkerCLRAsync.parse_structured_output(output)
+        assert result is None
+
+    def test_parse_non_dict_json_returns_none(self):
+        """JSON that's not an object (e.g. array) returns None."""
+        from vibe_clr_async import VibeThinkerCLRAsync
+        result = VibeThinkerCLRAsync.parse_structured_output('["not", "an", "object"]')
+        assert result is None
+
+    def test_use_structured_output_flag_accepted(self):
+        """The constructor accepts use_structured_output and stores it."""
+        from vibe_clr_async import VibeThinkerCLRAsync
+        runner = VibeThinkerCLRAsync(use_structured_output=True)
+        assert runner.use_structured_output is True
+        runner2 = VibeThinkerCLRAsync()
+        assert runner2.use_structured_output is False
+
+    @pytest.mark.asyncio
+    async def test_generate_lightweight_with_structured_output_passes_grammar(self):
+        """When use_structured_output=True, _generate_lightweight_trajectory
+        passes _STRUCTURED_OUTPUT_GRAMMAR to _call_model."""
+        from vibe_clr_async import VibeThinkerCLRAsync, _STRUCTURED_OUTPUT_GRAMMAR
+        from unittest.mock import patch, AsyncMock
+        import json
+
+        runner = VibeThinkerCLRAsync(use_structured_output=True)
+        mock_output = json.dumps({
+            "reasoning_steps": ["think"],
+            "boxed_answer": "7",
+            "code_solution": None,
+        })
+        with patch.object(runner, '_call_model', new_callable=AsyncMock,
+                          return_value=mock_output) as mock_call:
+            result = await runner._generate_lightweight_trajectory(
+                None, "What is 3+4?", max_tokens=1024
+            )
+        # The grammar should have been passed.
+        _, kwargs = mock_call.call_args
+        assert kwargs.get("grammar") == _STRUCTURED_OUTPUT_GRAMMAR
+        # The answer should be extracted from the JSON key, not regex.
+        assert result["answer"] == "7"
+        assert result["answer_present"] is True
+
+    @pytest.mark.asyncio
+    async def test_generate_lightweight_structured_falls_back_to_regex(self):
+        """When use_structured_output=True but the model returns unstructured
+        text, parse_structured_output returns None and the regex fallback runs."""
+        from vibe_clr_async import VibeThinkerCLRAsync
+        from unittest.mock import patch, AsyncMock
+
+        runner = VibeThinkerCLRAsync(use_structured_output=True)
+        unstructured = "The answer is \\boxed{42}."
+        with patch.object(runner, '_call_model', new_callable=AsyncMock,
+                          return_value=unstructured):
+            result = await runner._generate_lightweight_trajectory(
+                None, "What is 6*7?", max_tokens=1024
+            )
+        # Should fall back to regex extraction.
+        assert result["answer"] == "42"
+        assert result["answer_present"] is True
+
+
 class TestFastSpecialistPolicy:
     """Tests for the --fast-specialist adaptive profile (up to 3/5/15, capped at k).
 
