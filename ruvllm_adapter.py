@@ -479,17 +479,46 @@ class RuvLLMBinding:
 
 
 def is_ruvllm_binding_available() -> bool:
-    """Check if the ruvllm_py in-process binding is installed AND compiled.
+    """Check if the ruvllm_py in-process binding is installed AND compiled
+    with real inference (the ``candle`` feature).
 
     A bare directory named ``ruvllm_py`` (e.g. the Rust project scaffold)
     is importable but doesn't have the compiled ``Engine`` class. We check
     for the ``Engine`` attribute to distinguish the compiled extension from
     the scaffold.
+
+    v3.2.1: also require ``SUPPORTS_INFERENCE`` to be True. The stub build
+    (``cargo build --release`` without ``--features candle``) exposes an
+    ``Engine`` class that constructs successfully but whose ``generate()``
+    raises — it cannot do real inference. Without this check, the
+    orchestrator would silently prefer the stub over llama-cpp-python and
+    every generation would fail. Rejecting the stub here makes the
+    orchestrator fall back to llama-cpp-python / HTTP instead.
     """
     try:
         import ruvllm_py  # type: ignore  # noqa: F401
         # The compiled extension exposes an Engine class. The Rust
         # scaffold directory does not (it's just source code, not built).
-        return hasattr(ruvllm_py, "Engine")
+        if not hasattr(ruvllm_py, "Engine"):
+            return False
+        # Reject the stub build: Engine exists but generate() raises.
+        # SUPPORTS_INFERENCE is cfg!(feature = "candle") on the Rust side
+        # (True for both CPU `candle` and `inference-metal` builds, since
+        # inference-metal implies candle). Older builds expose the equivalent
+        # SUPPORTS_LOGPROBS flag (same cfg! gate) — fall back to it so a
+        # real-inference build installed before SUPPORTS_INFERENCE was added
+        # is not incorrectly rejected as a stub.
+        supports_inference = getattr(
+            ruvllm_py, "SUPPORTS_INFERENCE",
+            getattr(ruvllm_py, "SUPPORTS_LOGPROBS", False),
+        )
+        if not supports_inference:
+            print("[RuvLLM] ruvllm_py is installed but built WITHOUT the "
+                  "candle feature (stub build — no real inference). Falling "
+                  "back to llama-cpp-python / HTTP. Rebuild with "
+                  "`maturin develop --release --features candle` (CPU) or "
+                  "`--features inference-metal` (Apple Silicon).")
+            return False
+        return True
     except ImportError:
         return False

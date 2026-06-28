@@ -42,22 +42,42 @@ VOLUME ["/data"]
 
 EXPOSE 8088
 
-# Placeholder entrypoint: a 12-line Python HTTP server returning empty results
-# for POST /v1/vector/search and 200 for GET /health. Replace with the real
-# AgentDB binary (see comment above).
+# Placeholder entrypoint: a tiny HTTP server that FAILS LOUD on vector
+# endpoints (HTTP 501 with an explanatory JSON body) so the orchestrator's
+# AgentDBVectorStore fail-closes and logs a clear "sidecar misconfigured"
+# warning instead of silently receiving empty results. GET /health still
+# returns 200 so the compose healthcheck passes and the stack starts.
+#
+# The orchestrator treats HTTP >= 400 as "sidecar down/misconfigured" and
+# falls back to local in-memory numpy (the default, unchanged behavior).
+# Replace this with the real AgentDB binary (see comment above).
 RUN printf '%s\n' \
-    'import http.server, json' \
+    'import http.server, json, sys' \
+    'STUB_MSG = ("AgentDB placeholder: no real vector store is running. " \
+    "Replace docker/agentdb.Dockerfile with the real ruvnet/ruflo AgentDB " \
+    "binary. See the file header for build instructions.")' \
     'class H(http.server.BaseHTTPRequestHandler):' \
+    '    def _stub(self):' \
+    '        body = json.dumps({"error": "not_implemented", "message": STUB_MSG}).encode()' \
+    '        self.send_response(501); self.send_header("Content-Type","application/json")' \
+    '        self.send_header("Content-Length", str(len(body))); self.end_headers()' \
+    '        self.wfile.write(body)' \
     '    def do_GET(self):' \
     '        if self.path == "/health":' \
     '            self.send_response(200); self.end_headers(); self.wfile.write(b"ok")' \
-    '        else: self.send_response(404); self.end_headers()' \
-    '    def do_POST(self):' \
-    '        if self.path == "/v1/vector/search":' \
-    '            self.send_response(200); self.send_header("Content-Type","application/json"); self.end_headers()' \
-    '            self.wfile.write(json.dumps({"results":[]}).encode())' \
-    '        else: self.send_response(404); self.end_headers()' \
+    '        elif self.path == "/" or self.path == "/__stub":' \
+    '            body = json.dumps({"stub": True, "message": STUB_MSG}).encode()' \
+    '            self.send_response(200); self.send_header("Content-Type","application/json")' \
+    '            self.send_header("Content-Length", str(len(body))); self.end_headers()' \
+    '            self.wfile.write(body)' \
+    '        else: self._stub()' \
+    '    def do_POST(self): self._stub()' \
     '    def log_message(self, *a): pass' \
+    'print("========================================================", file=sys.stderr)' \
+    'print("WARNING: AgentDB PLACEHOLDER is running (no real vector store).", file=sys.stderr)' \
+    'print("Vector search endpoints return HTTP 501. Replace this image with", file=sys.stderr)' \
+    'print("the real ruvnet/ruflo AgentDB binary. See docker/agentdb.Dockerfile.", file=sys.stderr)' \
+    'print("========================================================", file=sys.stderr)' \
     'http.server.HTTPServer(("0.0.0.0",8088),H).serve_forever()' \
     > /usr/local/bin/agentdb_placeholder.py
 

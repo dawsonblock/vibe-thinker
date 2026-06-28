@@ -155,16 +155,10 @@ class CLRResult:
     verification_status: str = "self_only"
 
 
-# --------------------------------------------------------------------------- #
-# Process-pool worker functions (v1.1) — REMOVED in v2.0
-#
-# Process-pool mode (ProcessPoolExecutor) was removed in v2.0. It
-# duplicated RAM (400MB+ per worker) and is superseded by the ruvllm_py
-# PyO3 binding, which releases the GIL natively during generation and
-# shares one set of weights across concurrent requests. The thread-pool
-# mode (queue.Queue of Llama instances + ThreadPoolExecutor) remains as
-# the in-process backend.
-# --------------------------------------------------------------------------- #
+# Process-pool mode (ProcessPoolExecutor, v1.1) was removed in v2.0 — it
+# duplicated RAM per worker and is superseded by the ruvllm_py PyO3 binding
+# (GIL-release + shared weights). Thread-pool mode (queue.Queue of Llama
+# instances + ThreadPoolExecutor) remains as the in-process backend.
 
 
 def _estimate_model_ram_mb(model_path: str) -> Optional[int]:

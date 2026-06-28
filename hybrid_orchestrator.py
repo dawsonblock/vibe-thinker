@@ -319,10 +319,29 @@ def _static_analysis_fallback(code: str) -> tuple:
     the "parses + no restricted imports" signal available for local dev
     without letting it influence production confidence.
 
+    v3.2.1: emits a ``DeprecationWarning`` on every call. This function
+    is NOT a security boundary — it can be bypassed by obfuscated code
+    that constructs names at runtime (e.g. ``chr()``-built strings passed
+    to ``getattr`` where the ``__builtins__`` reference itself is also
+    dynamically obtained). The wasmtime/Docker sandbox fallback
+    (``_wasmtime_sandbox_fallback``) is the real security boundary and
+    should be used instead. This function is retained for local-dev
+    convenience only and is on the deprecation path.
+
     Returns (score, issues) where issues is a list of strings describing
     any problems found (empty list if score > 0.0).
     """
     import ast as _ast
+    import warnings
+    warnings.warn(
+        "_static_analysis_fallback is NOT a security boundary and is on "
+        "the deprecation path. It can be bypassed by runtime-constructed "
+        "names (e.g. chr()-built strings in getattr). Use "
+        "_wasmtime_sandbox_fallback (the sandboxed execution path) instead. "
+        "This function is retained for local-dev convenience only.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     issues = []
 
     # 1. Parse check.
@@ -2226,6 +2245,14 @@ class HybridReasoningOrchestrator:
         "  Arithmetic: + - * / == != > < >= <=\n"
         "  Boolean: And(...) Or(...) Not(...) Implies(a, b) If(c, a, b) Xor(a, b)\n"
         "  Every variable referenced in a constraint MUST be declared in \"variables\".\n"
+        "\n"
+        "CRITICAL — \"values\" MUST be JSON numbers or booleans, NEVER words or strings:\n"
+        '  RIGHT: "values": {{"x": 7, "y": 3}}        (integers)\n'
+        '  RIGHT: "values": {{"raining": 0}}          (boolean as 0/1)\n'
+        '  WRONG: "values": {{"x": "seven"}}          (string word — rejected)\n'
+        '  WRONG: "values": {{"x": "7"}}              (quoted number — rejected)\n'
+        "  If a value is unknown, omit it from \"values\" rather than using a word.\n"
+        "  Non-numeric values cause the verifier to fail-closed (drop all values).\n"
         "\n"
         "Examples:\n"
         "\n"

@@ -39,10 +39,15 @@ _MATH_GOLDEN = [
      "integer match without boxed"),
     ("What is 1/3 as a decimal?", "0.333333", {"expected_answer": 0.333333,
      "tolerance": 1e-5}, True, "float within tolerance"),
-    ("What is 100?", "1e2", {"expected_answer": 100}, False,
-     "KNOWN LIMITATION: _extract_numeric doesn't parse scientific notation "
-     "correctly (parses '1e2' as 2.0). Documented here so a future fix to "
-     "the numeric parser flips this to True and we know the case is covered."),
+    ("What is 100?", "1e2", {"expected_answer": 100}, True,
+     "scientific notation (1e2 == 100) — fixed in the numeric parser"),
+    ("What is 0.0015?", "1.5e-3", {"expected_answer": 0.0015,
+     "tolerance": 1e-9}, True,
+     "scientific notation with negative exponent (1.5e-3 == 0.0015)"),
+    ("What is 2000?", "\\boxed{2e3}", {"expected_answer": 2000}, True,
+     "scientific notation inside \\boxed (2e3 == 2000)"),
+    ("What is 123000?", "1.23e5", {"expected_answer": 123000}, True,
+     "scientific notation with positive exponent (1.23e5 == 123000)"),
     # HALLUCINATED answers -> verified=False
     ("What is 6*7?", "\\boxed{43}", {"expected_answer": 42}, False,
      "wrong integer (off by one)"),
@@ -127,11 +132,97 @@ class TestLogicVerifierGoldenSet:
 
 
 # ---------------------------------------------------------------------- #
-# SchemaVerifier golden set (if it has a deterministic path)
+# SchemaVerifier golden set
 # ---------------------------------------------------------------------- #
-# SchemaVerifier typically needs a JSON-schema + a candidate JSON object.
-# Add golden cases once the verifier's deterministic interface is stable.
-# For now, this is a placeholder that documents the expectation.
+# SchemaVerifier is deterministic (no model calls): it parses the answer
+# (JSON/YAML/text) and checks it against a schema/pattern/expected_keys.
+# Each case below represents a class of structural error the verifier must
+# catch or accept. Golden cases guard against regressions where a schema
+# check silently passes a malformed answer (poisoning the flywheel) or
+# rejects a well-formed one.
+import json as _json
+
+_SCHEMA_GOLDEN = [
+    # (query, answer, context, expected_verified, comment)
+    # CORRECT structural conformance -> verified=True
+    ("return a user object",
+     _json.dumps({"name": "Alice", "age": 30}),
+     {"schema": {"type": "object", "required": ["name", "age"],
+                 "properties": {"name": {"type": "string"},
+                                "age": {"type": "integer", "minimum": 0}}}},
+     True, "valid object matching schema"),
+    ("return a user object",
+     _json.dumps({"name": "Alice", "age": 30, "email": "a@b.com"}),
+     {"schema": {"type": "object", "required": ["name", "age"],
+                 "properties": {"name": {"type": "string"},
+                                "age": {"type": "integer", "minimum": 0}},
+                 "additionalProperties": True}},
+     True, "extra properties allowed when additionalProperties not False"),
+    ("return a list of ints", "[1, 2, 3]",
+     {"schema": {"type": "array", "items": {"type": "integer"},
+                 "minItems": 1}}, True, "valid array of integers"),
+    ("match the pattern", "ABC-1234",
+     {"pattern": r"[A-Z]{3}-\d{4}"}, True, "regex fullmatch succeeds"),
+    ("return keys", _json.dumps({"id": 1, "name": "x"}),
+     {"expected_keys": ["id", "name"]}, True, "expected_keys shortcut passes"),
+    # HALLUCINATED / malformed -> verified=False
+    ("return a user object",
+     _json.dumps({"name": "Alice"}),  # missing required "age"
+     {"schema": {"type": "object", "required": ["name", "age"],
+                 "properties": {"name": {"type": "string"},
+                                "age": {"type": "integer"}}}},
+     False, "missing required key"),
+    ("return a user object",
+     _json.dumps({"name": "Alice", "age": "thirty"}),  # age is string not int
+     {"schema": {"type": "object", "required": ["name", "age"],
+                 "properties": {"name": {"type": "string"},
+                                "age": {"type": "integer"}}}},
+     False, "wrong type for property (string instead of integer)"),
+    ("return a user object",
+     _json.dumps({"name": "Alice", "age": -1}),  # violates minimum: 0
+     {"schema": {"type": "object", "required": ["name", "age"],
+                 "properties": {"name": {"type": "string"},
+                                "age": {"type": "integer", "minimum": 0}}}},
+     False, "numeric constraint violated (age < minimum)"),
+    ("return a user object",
+     _json.dumps({"name": "Alice", "age": 30, "x": 1}),
+     {"schema": {"type": "object", "required": ["name", "age"],
+                 "properties": {"name": {"type": "string"},
+                                "age": {"type": "integer"}},
+                 "additionalProperties": False}},
+     False, "additional properties rejected when additionalProperties is False"),
+    ("return a list of ints", "[]",
+     {"schema": {"type": "array", "items": {"type": "integer"},
+                 "minItems": 1}}, False, "array below minItems"),
+    ("return a list of ints", "[1, \"two\", 3]",
+     {"schema": {"type": "array", "items": {"type": "integer"}}},
+     False, "array item with wrong type"),
+    ("match the pattern", "abc-1234",  # lowercase, won't fullmatch
+     {"pattern": r"[A-Z]{3}-\d{4}"}, False, "regex fullmatch fails"),
+    ("return keys", _json.dumps({"id": 1}),  # missing "name"
+     {"expected_keys": ["id", "name"]}, False, "expected_keys missing one key"),
+    ("return a user object", "not json at all",
+     {"schema": {"type": "object"}}, False, "unparseable JSON"),
+    # No criteria -> verified=False (honest, can't verify structure)
+    ("return anything", "{\"x\": 1}", {}, False,
+     "no schema/pattern/expected_keys -> cannot verify"),
+]
+
+
+class TestSchemaVerifierGoldenSet:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "query,answer,context,expected_verified,comment", _SCHEMA_GOLDEN,
+        ids=[c[:40] for _, _, _, _, c in _SCHEMA_GOLDEN],
+    )
+    async def test_schema_golden(self, query, answer, context,
+                                 expected_verified, comment):
+        v = SchemaVerifier()
+        result = await v.verify(query, answer, context)
+        assert result.verified == expected_verified, (
+            f"FAIL [{comment}]: expected verified={expected_verified}, "
+            f"got verified={result.verified}, error={result.error}"
+        )
 
 
 class TestGoldenSetCompleteness:
@@ -152,3 +243,9 @@ class TestGoldenSetCompleteness:
         verified_false = sum(1 for _, _, _, e, _ in _LOGIC_GOLDEN if not e)
         assert verified_true > 0, "logic golden set has no verified=True cases"
         assert verified_false > 0, "logic golden set has no verified=False cases"
+
+    def test_schema_golden_has_both_directions(self):
+        verified_true = sum(1 for _, _, _, e, _ in _SCHEMA_GOLDEN if e)
+        verified_false = sum(1 for _, _, _, e, _ in _SCHEMA_GOLDEN if not e)
+        assert verified_true > 0, "schema golden set has no verified=True cases"
+        assert verified_false > 0, "schema golden set has no verified=False cases"

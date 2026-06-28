@@ -433,9 +433,18 @@ mod backend {
             _temperature: f32,
             _stop: Option<Vec<String>>,
         ) -> pyo3::PyResult<String> {
-            // Stub: return an empty string. The orchestrator's
-            // format-enforcer / regex fallback handles empty output.
-            Ok(String::new())
+            // Stub: FAIL LOUD. Returning an empty string would silently
+            // produce empty model output, which the orchestrator cannot
+            // distinguish from a real (but empty) generation. Raise instead
+            // so the Python RuvLLMBinding wrapper / orchestrator can catch
+            // it and fall back to llama-cpp-python or the HTTP sidecar.
+            Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "ruvllm_py stub generate() called — no real inference is \
+                 available. Rebuild with `maturin develop --release \
+                 --features candle` (CPU) or `--features inference-metal` \
+                 (Apple Silicon), or use the RuvLLM HTTP sidecar via \
+                 --ruvllm-url.",
+            ))
         }
 
         /// Stub: per-token logprobs are not available without the candle
@@ -1390,6 +1399,15 @@ fn ruvllm_py(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // the logprobs capability without constructing an Engine (which requires
     // a model file).
     m.add("SUPPORTS_LOGPROBS", cfg!(feature = "candle"))?;
+    // Module-level flag: True when built with the candle feature (real
+    // inference), False for the stub. The stub's Engine.construct() succeeds
+    // but generate() raises — this flag lets Python callers (e.g.
+    // is_ruvllm_binding_available()) reject the stub BEFORE constructing an
+    // Engine, so the orchestrator falls back to llama-cpp-python / HTTP
+    // instead of silently preferring a stub that can't generate.
+    // `inference-metal` implies `candle` (see Cargo.toml), so this is True
+    // for both CPU and Metal builds.
+    m.add("SUPPORTS_INFERENCE", cfg!(feature = "candle"))?;
     let doc = if cfg!(feature = "candle") {
         "Python bindings for the RuvLLM Rust inference engine (candle backend)."
     } else {

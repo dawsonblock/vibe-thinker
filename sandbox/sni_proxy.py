@@ -22,6 +22,25 @@ interception (no MITM). It only inspects the SNI (which is in
 cleartext in the TLS ClientHello) and the Host header (which is in
 cleartext for HTTP). The actual TLS traffic passes through untouched.
 
+SECURITY WARNING — SNI spoofing (known limitation, no MITM):
+  Because there is no TLS interception, the proxy trusts the SNI value
+  in the ClientHello to decide whether a connection is allowed, then
+  tunnels the raw TCP stream to whatever destination the *client*
+  requests (via the CONNECT target / resolved IP). A malicious
+  in-sandbox process can present an allow-listed SNI (e.g. "pypi.org")
+  while issuing a CONNECT to an attacker-controlled IP, or lying about
+  the SNI while connecting to a disallowed host's IP. The SNI check is
+  therefore an *intent* signal, not a *destination* guarantee. To close
+  this gap you would need either:
+    (a) TLS MITM with a CA trusted by the sandbox (breaks end-to-end
+        TLS, requires cert management), OR
+    (b) DNS pinning + IP allow-listing so the proxy resolves the
+        allow-listed hostname itself and connects only to the resolved
+        IPs (the --dns-resolver / network allow-list path is the
+        primary defense; this SNI proxy is a complementary layer).
+  Treat the SNI proxy as defense-in-depth, NOT a complete egress
+  boundary on its own.
+
 Usage:
     python3 -m sandbox.sni_proxy --port 8888 \\
         --allowlist "pypi.org:443,*.pypi.org:443,files.pythonhosted.org:443"

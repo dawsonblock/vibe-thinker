@@ -333,6 +333,17 @@ class NetworkAllowList:
         #    prevent IPv6 bypass, we set ip6tables OUTPUT policy to DROP
         #    and allow only loopback + established connections. If IPv6
         #    egress is needed, it should be explicitly allow-listed.
+        #
+        #    KNOWN LIMITATION (no IPv6 support): this means the sandbox
+        #    CANNOT reach IPv6-only endpoints (e.g. IPv6-only package
+        #    mirrors or APIs). All allow-listed destinations must be
+        #    reachable over IPv4. This is an intentional trade-off:
+        #    generating ip6tables ACCEPT rules would require IPv6 address
+        #    resolution for every allow-listed host (the current resolver
+        #    path is IPv4-only), and an incomplete IPv6 allow-list is a
+        #    larger bypass risk than the connectivity limitation. If an
+        #    IPv6-only host must be reached, run the SNI egress proxy
+        #    (sandbox/sni_proxy.py) on the host and route through it.
         rules.append("ip6tables -P OUTPUT DROP")
         rules.append("ip6tables -A OUTPUT -o lo -j ACCEPT")
         rules.append(

@@ -22,12 +22,6 @@ touching the cache logic:
     index (HNSW/IVF), dropping lookups from milliseconds to <25µs with
     zero RAM bloat on the Python side. This is the integration plan's
     Phase 1.2 goal.
-  - :class:`ShadowVectorStore`  — writes to both a primary and a
-    secondary store, reads from the primary first and falls back to the
-    secondary. Used during migration: write to both the local JSON file
-    and AgentDB simultaneously, read from local first; once AgentDB
-    recall is verified, cut over to AgentDB-only and deprecate the JSON
-    file. This is the integration plan's "Shadow Mode" rollout step.
 
 The protocol is intentionally minimal:
   - ``upsert(id, embedding, metadata)`` — insert or replace a vector.
@@ -44,9 +38,11 @@ syntax; the local store applies them in Python.
 Integration plan reference: Phase 1.2 — "Replace Persistent Caches with
 RuVector/AgentDB". The RuFlo AgentDB service is an HTTP sidecar from
 ruvnet/ruflo. When it is not running, :class:`AgentDBVectorStore`
-fail-closes (returns empty results) rather than silently degrading —
-the caller decides whether to fall back to the local store via
-:class:`ShadowVectorStore`.
+fail-closes (returns empty results) rather than silently degrading.
+
+v3.2.1: :class:`ShadowVectorStore` (the dual-write migration scaffold)
+has been removed. When ``agentdb_url`` is set, AgentDB is used directly
+with no local fallback — operators must cut over to AgentDB-only mode.
 """
 
 from __future__ import annotations
@@ -120,7 +116,6 @@ class VectorStore(Protocol):
             small N, O(chunk×N) for large N).
           - AgentDBVectorStore: delegates to the AgentDB sidecar's
             /v1/vector/cluster endpoint (built for scale).
-          - ShadowVectorStore: delegates to the primary store.
 
         Fail-closed: returns [] on any error.
         """
@@ -290,10 +285,11 @@ class AgentDBVectorStore:
       - ``upsert`` / ``delete`` print a warning and return
       - ``count`` returns ``0``
 
-    This fail-closed behavior means :class:`ShadowVectorStore` can wrap
-    a local primary + AgentDB secondary: if AgentDB is down, the local
-    store still serves reads, and writes to AgentDB are silently
-    skipped (with a warning) until it comes back.
+    v3.2.1: there is no longer a local fallback when ``agentdb_url`` is
+    set (the :class:`ShadowVectorStore` dual-write wrapper was removed).
+    Callers that need a local fallback should construct a
+    :class:`LocalVectorStore` and pass it via ``vector_store=`` instead
+    of using ``agentdb_url``.
 
     Args:
         base_url: AgentDB HTTP endpoint (e.g. ``http://127.0.0.1:8088``).
@@ -587,150 +583,22 @@ def is_ruvllm_vector_store_available() -> bool:
         return False
 
 
-class ShadowVectorStore:
-    """Dual-write vector store for zero-downtime migration.
-
-    Writes go to BOTH the primary and secondary stores. Reads try the
-    primary first; if the primary returns no results, the secondary is
-    tried. This lets you run AgentDB in shadow mode: writes populate it
-    while the local store still serves reads. Once AgentDB recall is
-    verified, swap the primary and secondary (or drop the local store).
-
-    The integration plan's Step 3 rollout: "Rewrite
-    PersistentRouteCache to write to both the old JSON file and AgentDB
-    simultaneously (Shadow Mode). Once AgentDB recall is verified,
-    deprecate the JSON file."
-
-    Args:
-        primary: the store that serves reads (e.g. LocalVectorStore).
-        secondary: the store that receives shadow writes (e.g.
-            AgentDBVectorStore). Reads fall back to this if the primary
-            returns nothing.
-    """
-
-    def __init__(self, primary: VectorStore, secondary: VectorStore):
-        self._primary = primary
-        self._secondary = secondary
-        # Phase 5: track IDs that failed secondary writes for reconciliation.
-        self._failed_writes: set = set()
-
-    def upsert(
-        self,
-        vector_id: str,
-        embedding: List[float],
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        # Dual-write: primary first (the source of truth), then secondary.
-        # A secondary write failure is non-fatal — it just means the
-        # shadow store won't have this entry until the next sync.
-        # Failed writes are tracked for reconciliation (Phase 5).
-        self._primary.upsert(vector_id, embedding, metadata)
-        try:
-            self._secondary.upsert(vector_id, embedding, metadata)
-            self._failed_writes.discard(vector_id)
-        except Exception as e:
-            self._failed_writes.add(vector_id)
-            print(f"[ShadowVectorStore] secondary upsert failed for {vector_id}: {e}")
-
-    def search(
-        self,
-        query_embedding: List[float],
-        top_k: int = 10,
-        filters: Optional[Dict[str, Any]] = None,
-    ) -> List[Tuple[str, float, Dict[str, Any]]]:
-        results = self._primary.search(query_embedding, top_k, filters)
-        if results:
-            return results
-        # Primary returned nothing — fall back to secondary.
-        return self._secondary.search(query_embedding, top_k, filters)
-
-    def delete(self, vector_id: str) -> bool:
-        deleted_primary = self._primary.delete(vector_id)
-        try:
-            self._secondary.delete(vector_id)
-            self._failed_writes.discard(vector_id)
-        except Exception as e:
-            print(f"[ShadowVectorStore] secondary delete failed for {vector_id}: {e}")
-        return deleted_primary
-
-    def reconcile_failed_writes(self) -> int:
-        """Retry all failed secondary writes. Returns the number retried.
-
-        Phase 5: Call this periodically (e.g. via a background task) to
-        bring the secondary store into sync after transient failures.
-        Successfully retried IDs are removed from the failed set.
-        """
-        ids_to_retry = list(self._failed_writes)
-        retried = 0
-        for vid in ids_to_retry:
-            # We can't retry without the original embedding/metadata,
-            # so we read from the primary and re-write to secondary.
-            try:
-                # Search the primary for this ID to get its data.
-                # This is a best-effort reconciliation — if the primary
-                # no longer has the entry, we drop it from the failed set.
-                results = self._primary.search(
-                    query_embedding=[], top_k=1, filters={"vector_id": vid}
-                )
-                if not results:
-                    self._failed_writes.discard(vid)
-                    continue
-                _, _, metadata = results[0]
-                # We don't have the embedding here; skip entries we
-                # can't reconstruct. A full implementation would cache
-                # the embedding alongside the failed ID.
-                self._failed_writes.discard(vid)
-                retried += 1
-            except Exception:
-                pass
-        return retried
-
-    @property
-    def failed_write_count(self) -> int:
-        """Number of IDs with failed secondary writes (for monitoring)."""
-        return len(self._failed_writes)
-
-    def count(self) -> int:
-        return self._primary.count()
-
-    def cluster(
-        self,
-        similarity_threshold: float = 0.85,
-        min_cluster_size: int = 3,
-        filters: Optional[Dict[str, Any]] = None,
-    ) -> List[List[str]]:
-        """Delegate clustering to the primary store (v0.4.1).
-
-        If the primary is AgentDB, clustering happens server-side. If
-        the primary is Local, the chunked computation handles it. The
-        secondary is not used for clustering (it's a shadow write target).
-        """
-        return self._primary.cluster(
-            similarity_threshold=similarity_threshold,
-            min_cluster_size=min_cluster_size,
-            filters=filters,
-        )
-
-
 def make_vector_store(
     agentdb_url: Optional[str] = None,
     collection: str = "default",
-    shadow_primary: Optional[VectorStore] = None,
     prefer_ruvllm: bool = True,
     dim: Optional[int] = None,
     **kwargs,
 ) -> VectorStore:
     """Factory: build the appropriate vector store from config.
 
-    v3.2 precedence (revised):
-      1. agentdb_url + shadow_primary -> ShadowVectorStore(local, agentdb)
-         (DEPRECATED — emits a warning; see notes below)
-      2. agentdb_url                  -> AgentDBVectorStore (HTTP sidecar)
-      3. prefer_ruvllm + binding avail -> RuvLLMVectorStore (in-process HNSW)
-      4. None                         -> LocalVectorStore (zero-build default)
+    v3.2.1 precedence (ShadowVectorStore removed):
+      1. agentdb_url                  -> AgentDBVectorStore (HTTP sidecar)
+      2. prefer_ruvllm + binding avail -> RuvLLMVectorStore (in-process HNSW)
+      3. None                         -> LocalVectorStore (zero-build default)
 
-    Notes on the v3.2 revision:
-      - RuvLLMVectorStore (Rust HNSW via ruvllm_py) is now PREFERRED over
+    Notes on the v3.2.1 revision:
+      - RuvLLMVectorStore (Rust HNSW via ruvllm_py) is PREFERRED over
         LocalVectorStore when the binding is installed, because it moves
         the embedding matrix into Rust memory (zero Python RAM bloat, ~25us
         lookups). It is opt-out via prefer_ruvllm=False.
@@ -739,21 +607,23 @@ def make_vector_store(
         binding does NOT expose (see RuvLLMVectorStore.delete/cluster).
         Deprecating it would regress those features and force a hard Rust
         build to run the orchestrator at all.
-      - ShadowVectorStore is DEPRECATED (not removed — backward compat).
-        It is a migration scaffold for the local->AgentDB cut-over. New
-        deployments should cut over directly to AgentDB-only mode
-        (--agentdb-only) rather than running shadow mode indefinitely.
-        A DeprecationWarning is emitted when it is selected.
+      - ShadowVectorStore has been REMOVED (v3.2.1). It was a migration
+        scaffold (dual-write local + AgentDB, local-read-with-fallback)
+        for the local->AgentDB cut-over. The deprecation path is complete:
+        when ``agentdb_url`` is set, AgentDB is used DIRECTLY (no local
+        shadow/fallback). Fail-closed: if AgentDB is down, searches return
+        empty. Operators who were running shadow mode must cut over to
+        AgentDB-only (run ``finalize-migration`` first to archive local
+        JSON, then restart with ``--agentdb-url``). The ``shadow_primary``
+        parameter is no longer accepted.
       - ``dim`` is required for RuvLLMVectorStore (HNSW needs the vector
         dimension at construction). If dim is None and RuvLLM would be
         selected, we fall through to LocalVectorStore (which is dim-agnostic).
 
     Args:
-        agentdb_url: AgentDB HTTP endpoint. When set, AgentDB is used.
+        agentdb_url: AgentDB HTTP endpoint. When set, AgentDB is used
+            directly (no local shadow/fallback).
         collection: AgentDB collection/table name.
-        shadow_primary: when provided WITH agentdb_url, wraps the two in
-            a ShadowVectorStore for zero-downtime migration. Typically
-            you'd pass a LocalVectorStore here. DEPRECATED in v3.2.
         prefer_ruvllm: when True (default) and no agentdb_url is set and
             the ruvllm_py HNSW binding is installed and dim is provided,
             use RuvLLMVectorStore. Set False to force LocalVectorStore.
@@ -764,21 +634,8 @@ def make_vector_store(
     Returns:
         A VectorStore instance.
     """
-    import warnings
-
     if agentdb_url:
-        agentdb = AgentDBVectorStore(agentdb_url, collection, **kwargs)
-        if shadow_primary is not None:
-            warnings.warn(
-                "ShadowVectorStore is deprecated (v3.2). It is a migration "
-                "scaffold for the local->AgentDB cut-over. New deployments "
-                "should use --agentdb-only mode after verifying recall, "
-                "rather than running shadow mode indefinitely.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            return ShadowVectorStore(shadow_primary, agentdb)
-        return agentdb
+        return AgentDBVectorStore(agentdb_url, collection, **kwargs)
     # No AgentDB: prefer the in-process Rust HNSW when available + dim is
     # known. Fall back to the zero-build LocalVectorStore otherwise.
     if prefer_ruvllm and dim is not None and is_ruvllm_vector_store_available():

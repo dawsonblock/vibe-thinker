@@ -723,20 +723,22 @@ async def _amain() -> None:
         print("[CLI] Encoder NLI judge disabled (--no-encoder-nli). "
               "Using LLM judge for factual verification.")
 
-    # --- AgentDB vector store mode (Phase 4.3) ---
+    # --- AgentDB vector store mode (v3.2.1) ---
+    # ShadowVectorStore was removed: when --agentdb-url is set, AgentDB is
+    # used directly (no local shadow/fallback). --agentdb-only is kept as
+    # a no-op flag for backward CLI compat — setting --agentdb-url alone
+    # is now always AgentDB-only.
     if args.agentdb_only and not args.agentdb_url:
         print("[CLI] WARNING: --agentdb-only set but --agentdb-url is empty. "
               "AgentDB-only mode requires --agentdb-url. Falling back to "
               "in-memory numpy (default behavior).")
         args.agentdb_only = False
-    elif args.agentdb_url and args.agentdb_only:
-        print(f"[CLI] AgentDB-only mode: vector store is AgentDB at "
-              f"{args.agentdb_url} (no local fallback). Fail-closed: "
-              f"searches return empty if AgentDB is down.")
     elif args.agentdb_url:
-        print(f"[CLI] AgentDB shadow mode: dual-write to local + AgentDB "
-              f"at {args.agentdb_url}. Reads fall back to local if AgentDB "
-              f"is down. Use --agentdb-only after finalize-migration.")
+        print(f"[CLI] AgentDB mode: vector store is AgentDB at "
+              f"{args.agentdb_url} (no local fallback). Fail-closed: "
+              f"searches return empty if AgentDB is down. "
+              f"(--agentdb-only is now a no-op; shadow mode was removed in "
+              f"v3.2.1 — run finalize-migration before relying on this.)")
 
     # --- Fast code-specialist preset (v0.3.9) ---
     # Bumps code_candidates to 15 for ultra-fast 0.5B code models.

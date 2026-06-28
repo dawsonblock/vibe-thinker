@@ -14,8 +14,17 @@ from hybrid_orchestrator import _static_analysis_fallback, _wasmtime_sandbox_fal
 import inspect
 
 
+@pytest.mark.filterwarnings("ignore:.*_static_analysis_fallback.*:DeprecationWarning")
 class TestStaticAnalysisFallback:
-    """Verify the static analysis fallback scoring."""
+    """Verify the static analysis fallback scoring.
+
+    v3.2.1: _static_analysis_fallback emits a DeprecationWarning on every
+    call (it's NOT a security boundary). The existing tests below call it
+    to verify its scoring logic, not to assert anything about the warning.
+    The deprecation warning itself is tested by
+    TestStaticAnalysisEvasionVectors.test_emits_deprecation_warning. We
+    suppress it here to keep test output readable.
+    """
 
     def test_clean_code_gets_partial_score(self):
         """Code that parses cleanly and has no restricted imports
@@ -108,8 +117,13 @@ class TestStaticAnalysisFallback:
         assert score < 0.5  # Below the cache trust threshold
 
 
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
 class TestStaticAnalysisEvasionVectors:
-    """v3.0: Verify dynamic import evasion vectors are caught."""
+    """v3.0: Verify dynamic import evasion vectors are caught.
+
+    v3.2.1: suppresses the _static_analysis_fallback DeprecationWarning
+    except in test_emits_deprecation_warning, which explicitly asserts it.
+    """
 
     def test_dunder_import_call_gets_zero(self):
         """__import__('os') bypasses ast.Import but is caught by ast.Call check."""
@@ -201,6 +215,41 @@ class TestStaticAnalysisEvasionVectors:
         score, issues = _static_analysis_fallback(code)
         assert score == 0.0
         assert any("builtins" in i for i in issues)
+
+    def test_chr_obfuscation_bypass_is_known_limitation(self):
+        """v3.2.1: Document the known bypass — chr()-constructed strings
+        in getattr evade the AST checks. This is WHY static analysis is
+        NOT a security boundary.
+
+        ``getattr(__builtins__, chr(95)*2 + 'import' + chr(95)*2)`` uses
+        a Call (chr) as the getattr argument, not a Name or Constant.
+        The AST check only flags getattr when an arg is a Name referencing
+        __builtins__ — but here the __builtins__ reference IS caught.
+        The truly uncatchable form is when __builtins__ itself is obtained
+        via reflection (no direct Name reference). This test documents
+        that the simple __import__(chr(...)) form IS caught (the function
+        name __import__ is a Name node regardless of its arguments), and
+        that the limitation is the runtime-construction path.
+        """
+        import warnings
+        # __import__(chr(111)+chr(115)) — the function name __import__ is
+        # a Name node, so it IS caught regardless of the argument form.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            score, issues = _static_analysis_fallback(
+                "m = __import__(chr(111) + chr(115))\n"
+            )
+        assert score == 0.0
+        assert any("__import__" in i for i in issues)
+
+    def test_emits_deprecation_warning(self):
+        """v3.2.1: every call emits a DeprecationWarning (NOT a security
+        boundary, on the deprecation path)."""
+        import warnings
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            _static_analysis_fallback("x = 1\n")
+        assert any(issubclass(w.category, DeprecationWarning) for w in caught)
 
 
 # ---------------------------------------------------------------------- #

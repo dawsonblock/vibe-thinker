@@ -3,9 +3,11 @@
 Covers:
   - LocalVectorStore (in-memory numpy + sklearn, default)
   - AgentDBVectorStore (HTTP sidecar, fail-closed when not running)
-  - ShadowVectorStore (dual-write, primary-read-with-fallback)
   - make_vector_store factory
   - Integration with CLRResultCache and VerifiedTrajectoryStore
+
+v3.2.1: ShadowVectorStore (dual-write migration scaffold) was removed.
+When agentdb_url is set, AgentDB is used directly (no local fallback).
 """
 
 import os
@@ -16,7 +18,6 @@ import pytest
 from vector_store import (
     LocalVectorStore,
     AgentDBVectorStore,
-    ShadowVectorStore,
     make_vector_store,
     VectorStore,
 )
@@ -128,53 +129,6 @@ class TestAgentDBVectorStore:
 
 
 @skip_no_embeddings
-class TestShadowVectorStore:
-    """Tests for the dual-write shadow store."""
-
-    def test_dual_write_primary_serves_reads(self):
-        local = LocalVectorStore()
-        agentdb = AgentDBVectorStore("http://127.0.0.1:1", "test")  # down
-        shadow = ShadowVectorStore(local, agentdb)
-        shadow.upsert("a", [1.0, 0.0], {"k": "v"})
-        # Read should come from primary (local)
-        res = shadow.search([1.0, 0.0], top_k=1)
-        assert len(res) == 1
-        assert res[0][0] == "a"
-
-    def test_fallback_to_secondary_when_primary_empty(self):
-        local = LocalVectorStore()  # empty
-        # Use a local store as the "secondary" too (simulating a
-        # reachable AgentDB with data)
-        secondary = LocalVectorStore()
-        secondary.upsert("remote", [1.0, 0.0], {"src": "remote"})
-        shadow = ShadowVectorStore(local, secondary)
-        res = shadow.search([1.0, 0.0], top_k=1)
-        assert len(res) == 1
-        assert res[0][0] == "remote"
-
-    def test_delete_propagates_to_both(self):
-        local = LocalVectorStore()
-        secondary = LocalVectorStore()
-        shadow = ShadowVectorStore(local, secondary)
-        shadow.upsert("a", [1.0, 0.0])
-        assert shadow.delete("a")
-        assert local.count() == 0
-        assert secondary.count() == 0
-
-    def test_count_uses_primary(self):
-        local = LocalVectorStore()
-        secondary = LocalVectorStore()
-        secondary.upsert("x", [1.0])  # only in secondary
-        shadow = ShadowVectorStore(local, secondary)
-        assert shadow.count() == 0  # primary is empty
-
-    def test_protocol_conformance(self):
-        local = LocalVectorStore()
-        secondary = LocalVectorStore()
-        shadow = ShadowVectorStore(local, secondary)
-        assert isinstance(shadow, VectorStore)
-
-
 class TestMakeVectorStoreFactory:
     """Tests for the make_vector_store factory."""
 
@@ -187,26 +141,17 @@ class TestMakeVectorStoreFactory:
         s = make_vector_store(agentdb_url="http://127.0.0.1:1")
         assert isinstance(s, AgentDBVectorStore)
 
-    @skip_no_embeddings
-    def test_url_with_shadow_primary_returns_shadow(self):
-        s = make_vector_store(
-            agentdb_url="http://127.0.0.1:1",
-            shadow_primary=LocalVectorStore(),
-        )
-        assert isinstance(s, ShadowVectorStore)
-
-    @skip_no_embeddings
-    def test_shadow_primary_emits_deprecation_warning(self):
-        """v3.2: ShadowVectorStore is deprecated. Selecting it emits a
-        DeprecationWarning so operators know to migrate to --agentdb-only."""
-        import warnings
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
+    def test_url_ignores_legacy_shadow_primary_kwarg(self):
+        """v3.2.1: shadow_primary was removed. Passing it is rejected
+        (TypeError) rather than silently ignored, so callers learn to
+        migrate rather than getting unexpected behavior. The value is
+        never used (a sentinel is enough — the error comes from
+        AgentDBVectorStore rejecting the unknown kwarg)."""
+        with pytest.raises(TypeError):
             make_vector_store(
                 agentdb_url="http://127.0.0.1:1",
-                shadow_primary=LocalVectorStore(),
+                shadow_primary="legacy sentinel",
             )
-        assert any(issubclass(w.category, DeprecationWarning) for w in caught)
 
     def test_ruvllm_preferred_when_available_and_dim_given(self, monkeypatch):
         """v3.2: when the ruvllm_py HNSW binding is available AND dim is
@@ -257,8 +202,8 @@ class TestMakeVectorStoreFactory:
 class TestVectorStoreClustering:
     """Tests for the cluster() method (v1.0).
 
-    Tests LocalVectorStore.cluster() with real vectors, AgentDBVectorStore
-    fail-closed behavior, and ShadowVectorStore delegation.
+    Tests LocalVectorStore.cluster() with real vectors and AgentDBVectorStore
+    fail-closed behavior.
     """
 
     def test_local_cluster_finds_two_clusters(self):
@@ -346,21 +291,6 @@ class TestVectorStoreClustering:
         s = AgentDBVectorStore(base_url="http://127.0.0.1:9999", collection="test")
         assert s.cluster() == []
 
-    def test_shadow_cluster_delegates_to_primary(self):
-        """ShadowVectorStore.cluster() delegates to the primary store."""
-        import numpy as np
-        primary = LocalVectorStore()
-        secondary = AgentDBVectorStore(
-            base_url="http://127.0.0.1:9999", collection="shadow"
-        )
-        shadow = ShadowVectorStore(primary, secondary)
-        np.random.seed(42)
-        for i in range(5):
-            primary.upsert(f"a_{i}", [1.0 + np.random.randn() * 0.01, 0.01, 0.01])
-        clusters = shadow.cluster(similarity_threshold=0.85, min_cluster_size=3)
-        assert len(clusters) == 1
-        assert len(clusters[0]) == 5
-
 
 @skip_no_embeddings
 class TestCacheIntegration:
@@ -381,10 +311,12 @@ class TestCacheIntegration:
         assert cache._vector_store is vs
 
     def test_clr_cache_accepts_agentdb_url_param(self, cache_path):
+        """v3.2.1: agentdb_url always creates an AgentDBVectorStore
+        directly (no ShadowVectorStore wrapper)."""
         from persistent_cache import CLRResultCache
         cache = CLRResultCache(cache_path, agentdb_url="http://127.0.0.1:1")
         assert cache._vector_store is not None
-        assert isinstance(cache._vector_store, ShadowVectorStore)
+        assert isinstance(cache._vector_store, AgentDBVectorStore)
 
     def test_clr_cache_default_no_vector_store(self, cache_path):
         from persistent_cache import CLRResultCache
@@ -398,20 +330,24 @@ class TestCacheIntegration:
         assert store._vector_store is vs
 
     def test_trajectory_store_accepts_agentdb_url_param(self, cache_path):
+        """v3.2.1: agentdb_url always creates an AgentDBVectorStore
+        directly (no ShadowVectorStore wrapper)."""
         from persistent_cache import VerifiedTrajectoryStore
         store = VerifiedTrajectoryStore(cache_path, agentdb_url="http://127.0.0.1:1")
         assert store._vector_store is not None
-        assert isinstance(store._vector_store, ShadowVectorStore)
+        assert isinstance(store._vector_store, AgentDBVectorStore)
 
     def test_trajectory_store_default_no_vector_store(self, cache_path):
         from persistent_cache import VerifiedTrajectoryStore
         store = VerifiedTrajectoryStore(cache_path)
         assert store._vector_store is None
 
-    # Phase 4.3: agentdb_only mode (post-cut-over, no local fallback)
-    def test_clr_cache_agentdb_only_creates_agentdb_directly(self, cache_path):
-        """Phase 4.3: agentdb_only=True creates an AgentDBVectorStore
-        directly, not wrapped in a ShadowVectorStore."""
+    # v3.2.1: agentdb_only is now a no-op (kept for backward CLI compat).
+    # Setting agentdb_url always means AgentDB-only since ShadowVectorStore
+    # was removed. These tests verify the flag is accepted without error
+    # and produces an AgentDBVectorStore regardless of its value.
+    def test_clr_cache_agentdb_only_true_creates_agentdb(self, cache_path):
+        """agentdb_only=True creates an AgentDBVectorStore directly."""
         from persistent_cache import CLRResultCache
         cache = CLRResultCache(
             cache_path,
@@ -420,20 +356,20 @@ class TestCacheIntegration:
         )
         assert cache._vector_store is not None
         assert isinstance(cache._vector_store, AgentDBVectorStore)
-        assert not isinstance(cache._vector_store, ShadowVectorStore)
 
-    def test_clr_cache_agentdb_only_false_creates_shadow(self, cache_path):
-        """agentdb_only=False (default) still creates a ShadowVectorStore."""
+    def test_clr_cache_agentdb_only_false_also_creates_agentdb(self, cache_path):
+        """v3.2.1: agentdb_only=False now ALSO creates an AgentDBVectorStore
+        (previously created a ShadowVectorStore). The flag is a no-op."""
         from persistent_cache import CLRResultCache
         cache = CLRResultCache(
             cache_path,
             agentdb_url="http://127.0.0.1:1",
             agentdb_only=False,
         )
-        assert isinstance(cache._vector_store, ShadowVectorStore)
+        assert isinstance(cache._vector_store, AgentDBVectorStore)
 
     def test_trajectory_store_agentdb_only_creates_agentdb_directly(self, cache_path):
-        """Phase 4.3: agentdb_only=True for trajectory store."""
+        """agentdb_only=True for trajectory store creates AgentDB directly."""
         from persistent_cache import VerifiedTrajectoryStore
         store = VerifiedTrajectoryStore(
             cache_path,
@@ -442,11 +378,10 @@ class TestCacheIntegration:
         )
         assert store._vector_store is not None
         assert isinstance(store._vector_store, AgentDBVectorStore)
-        assert not isinstance(store._vector_store, ShadowVectorStore)
 
     def test_clr_cache_dual_writes_to_vector_store(self, cache_path):
         """Insert into CLRResultCache should also upsert to the vector store
-        (shadow-mode dual-write)."""
+        (delegated similarity search)."""
         from persistent_cache import CLRResultCache
         vs = LocalVectorStore()
         cache = CLRResultCache(cache_path, vector_store=vs)
@@ -466,7 +401,7 @@ class TestCacheIntegration:
 
     def test_trajectory_store_dual_writes_to_vector_store(self, cache_path):
         """Store into VerifiedTrajectoryStore should also upsert to the vector
-        store (shadow-mode dual-write)."""
+        store (delegated similarity search)."""
         from persistent_cache import VerifiedTrajectoryStore
         vs = LocalVectorStore()
         store = VerifiedTrajectoryStore(cache_path, vector_store=vs)

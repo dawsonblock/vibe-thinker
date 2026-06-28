@@ -127,8 +127,12 @@ class MathVerifier:
                 if n is not None:
                     return n
 
-        # 3. Last standalone number (int, float, fraction)
-        numbers = re.findall(r"-?\d+(?:\.\d+)?(?:/\d+(?:\.\d+)?)?", text)
+        # 3. Last standalone number (int, float, scientific notation, fraction)
+        # The scientific-notation suffix (e.g. "1e2", "1.5e-3") is optional;
+        # without it the regex still matches plain ints/floats/fractions.
+        numbers = re.findall(
+            r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?(?:/\d+(?:\.\d+)?)?", text
+        )
         if numbers:
             n = self._parse_number(numbers[-1])
             if n is not None:

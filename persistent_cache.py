@@ -396,25 +396,17 @@ class CLRResultCache:
         # is delegated to it (AgentDB sidecar) instead of the in-memory
         # numpy matrix. When None, the in-memory matrix is used (default,
         # unchanged behavior). The agentdb_url convenience parameter
-        # builds an AgentDBVectorStore (or ShadowVectorStore wrapping the
-        # local matrix) automatically.
-        # Phase 4.3: when agentdb_only=True, skip the shadow primary and
-        # use AgentDB directly (post-cut-over mode, no local fallback).
+        # builds an AgentDBVectorStore automatically.
+        # v3.2.1: ShadowVectorStore was removed. When agentdb_url is set,
+        # AgentDB is used DIRECTLY (no local shadow/fallback). The
+        # agentdb_only flag is accepted for backward API/CLI compat but is
+        # now a no-op — setting agentdb_url always means AgentDB-only.
         self._vector_store: Optional[VectorStore] = vector_store
         if self._vector_store is None and agentdb_url:
-            if agentdb_only:
-                # AgentDB-only mode (post-cut-over): no local shadow.
-                self._vector_store = make_vector_store(
-                    agentdb_url=agentdb_url,
-                    collection=agentdb_collection,
-                )
-            else:
-                # Shadow mode (migration): local primary + AgentDB secondary.
-                self._vector_store = make_vector_store(
-                    agentdb_url=agentdb_url,
-                    collection=agentdb_collection,
-                    shadow_primary=LocalVectorStore(),
-                )
+            self._vector_store = make_vector_store(
+                agentdb_url=agentdb_url,
+                collection=agentdb_collection,
+            )
 
         self._load()
 
@@ -664,20 +656,15 @@ class VerifiedTrajectoryStore:
         # the same pattern: when provided, similarity search is delegated
         # to the vector store (AgentDB sidecar) instead of the in-memory
         # numpy matrix. Default is None (in-memory, unchanged behavior).
-        # Phase 4.3: when agentdb_only=True, skip the shadow primary.
+        # v3.2.1: ShadowVectorStore was removed — agentdb_url always
+        # produces an AgentDBVectorStore directly. agentdb_only is kept
+        # for backward API/CLI compat but is a no-op.
         self._vector_store: Optional[VectorStore] = vector_store
         if self._vector_store is None and agentdb_url:
-            if agentdb_only:
-                self._vector_store = make_vector_store(
-                    agentdb_url=agentdb_url,
-                    collection=agentdb_collection,
-                )
-            else:
-                self._vector_store = make_vector_store(
-                    agentdb_url=agentdb_url,
-                    collection=agentdb_collection,
-                    shadow_primary=LocalVectorStore(),
-                )
+            self._vector_store = make_vector_store(
+                agentdb_url=agentdb_url,
+                collection=agentdb_collection,
+            )
 
         self._load()
 

@@ -10,7 +10,7 @@
 - v3.2 static-fallback gate: `python3 -m pytest tests/test_static_analysis.py::TestStaticFallbackGate -q`
 - v3.2 CommonMark fence matcher: `python3 -m pytest tests/test_routing.py::TestExtractPythonBlock -q`
 - v3.2 structured-output telemetry: `python3 -m pytest tests/test_clr_scoring.py::TestStructuredOutputTelemetry -q`
-- v3.2 vector-store precedence + ShadowVectorStore deprecation: `python3 -m pytest tests/test_vector_store.py -q`
+- v3.2.1 vector-store precedence + ShadowVectorStore removal: `python3 -m pytest tests/test_vector_store.py -q`
 - Routing + REPL only: `python3 -m pytest tests/test_routing.py tests/test_repl.py -q`
 - Format enforcer + chat transports + repair loop: `python3 -m pytest tests/test_format_enforcer.py -q`
 - Citation-backed NLI factual verifier: `python3 -m pytest tests/test_factual_verifier.py -q`
@@ -81,13 +81,13 @@ orchestrator process into a purpose-built vector index (AgentDB):
   `POST /v1/vector/search`). Fail-closed: returns `[]` when the sidecar
   is down (caller falls back). Moves lookups from ms to <25µs with zero
   RAM bloat on the Python side.
-- `ShadowVectorStore` — dual-write, primary-read-with-fallback. The
-  plan's "Shadow Mode" migration step: write to both local JSON and
-  AgentDB, read from local first; once AgentDB recall is verified, cut
-  over to AgentDB-only.
+- `ShadowVectorStore` — REMOVED in v3.2.1. Was a dual-write,
+  primary-read-with-fallback migration scaffold. When `agentdb_url` is
+  now set, AgentDB is used directly (no local fallback). Operators cut
+  over to AgentDB-only directly (run `finalize-migration` first).
 `CLRResultCache` and `VerifiedTrajectoryStore` accept `vector_store=`
-or `agentdb_url=` (convenience: builds a ShadowVectorStore wrapping the
-local matrix). Default is None = unchanged in-memory behavior.
+or `agentdb_url=` (convenience: builds an AgentDBVectorStore directly).
+Default is None = unchanged in-memory behavior.
 
 ### RuvLLM inference backend (ruvllm_adapter.py)
 Documents and wires the RuvLLM Rust inference engine with TurboQuant KV
@@ -177,7 +177,7 @@ use AgentDB directly (no local shadow/fallback). Fail-closed: searches
 return empty if AgentDB is down. Requires `--agentdb-url` (warns and
 falls back to in-memory numpy if set without it). `agentdb_only`
 parameter is threaded through the orchestrator → CLRResultCache and
-VerifiedTrajectoryStore → `make_vector_store()` (skips shadow_primary).
+VerifiedTrajectoryStore → `make_vector_store()` (AgentDB direct, no shadow).
 
 ### Hardware guardrails (Phase 4.1)
 `hardware_guardrail.py` prevents OOM crashes by checking model size

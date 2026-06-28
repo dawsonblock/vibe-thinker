@@ -104,7 +104,7 @@ python test_full_stack.py
 | `rfsn_job_queue.py` | In-process async priority job queue with concurrency limit |
 | `bitemporal_log.py` | Bi-temporal JSONL audit log (valid_time + transaction_time, hash-chain, strict verification, optional HMAC/Ed25519 signatures) |
 | `signers.py` | Pluggable signer abstraction: HmacSigner (stdlib) + Ed25519Signer (optional cryptography dep, SLSA L2) |
-| `vector_store.py` | Vector store abstraction: LocalVectorStore (in-memory) + AgentDBVectorStore (HTTP sidecar) + ShadowVectorStore (dual-write migration) |
+| `vector_store.py` | Vector store abstraction: LocalVectorStore (in-memory) + AgentDBVectorStore (HTTP sidecar) |
 | `ruvllm_adapter.py` | RuvLLM inference backend: HTTP sidecar docs + TurboQuant config + PyO3 binding contract |
 | `federated_queue.py` | Federated job queue: BaseJobQueue protocol + LocalJobQueue + FederatedJobQueue (exo-federation over mTLS) |
 | `rfsn_cli.py` | Interactive CLI/REPL over the job queue (env var + CLI flag support) |
@@ -464,12 +464,13 @@ python rfsn_cli.py --agentdb-url http://127.0.0.1:8088
 
 | Flag / env | Default | Purpose |
 |---|---|---|
-| `--agentdb-url` / `AGENTDB_URL` | empty | RuFlo/AgentDB HTTP endpoint for vector search (shadow mode) |
+| `--agentdb-url` / `AGENTDB_URL` | empty | RuFlo/AgentDB HTTP endpoint for vector search (AgentDB-only mode) |
 
-When AgentDB is down, reads fall back to the local in-memory store
-(fail-closed). The `ShadowVectorStore` dual-writes to both, enabling
-zero-downtime migration: once AgentDB recall is verified, cut over to
-AgentDB-only and deprecate the JSON file.
+When `--agentdb-url` is set, AgentDB is used directly for similarity
+search (fail-closed: searches return empty if AgentDB is down). The
+`ShadowVectorStore` dual-write migration scaffold was removed in v3.2.1
+— operators cut over to AgentDB-only directly (run `finalize-migration`
+first to archive local JSON, then restart with `--agentdb-url`).
 
 ### RuvLLM inference backend (`ruvllm_adapter.py`)
 
