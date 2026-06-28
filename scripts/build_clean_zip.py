@@ -41,13 +41,15 @@ INCLUDE_FILES = [
     "requirements-legacy-full.txt",
     ".env.example", ".gitignore",
 ]
-# Also include tests/__init__.py, verifiers/__init__.py etc. (handled by dir copy)
+# Also include tests/__init__.py, verifiers/__init__.py etc.
+# (handled by dir copy)
 
 # Patterns to EXCLUDE from the staging dir (runtime junk)
 EXCLUDE_PATTERNS = [
     "__pycache__", ".pyc", ".pyo", ".pytest_cache",
     "route_cache.json", "clr_result_cache.json", "clr_trace.json",
-    "rfsn_jobs.jsonl", "rfsn_jobs_bitemporal.jsonl", "orchestrator_memory.jsonl",
+    "rfsn_jobs.jsonl", "rfsn_jobs_bitemporal.jsonl",
+    "orchestrator_memory.jsonl",
     ".DS_Store", ".git",
 ]
 

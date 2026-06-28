@@ -92,7 +92,8 @@ def build_test_harness(code: str, tests: str) -> tuple[str, str]:
         "    sys.exit(1)\n"
         "try:\n"
         + textwrap.indent(tests_clean, "    ") + "\n"
-        f"    print('{VT_TEST_PASS_PREFIX}' + os.environ['{VT_TEST_NONCE_ENV}'])\n"
+        f"    print('{VT_TEST_PASS_PREFIX}'"
+        f" + os.environ['{VT_TEST_NONCE_ENV}'])\n"
         "except AssertionError as e:\n"
         "    print(f'ASSERTION_FAILED: {e}')\n"
         "    sys.exit(1)\n"
@@ -131,8 +132,13 @@ class ExecutionResult:
 
     @property
     def succeeded(self) -> bool:
-        """True if exit_code == 0 and not timed out and no infrastructure error."""
-        return self.exit_code == 0 and not self.timed_out and self.error is None
+        """True if exit_code == 0 and not timed out and no
+        infrastructure error."""
+        return (
+            self.exit_code == 0
+            and not self.timed_out
+            and self.error is None
+        )
 
 
 @runtime_checkable

@@ -253,7 +253,10 @@ class DockerSandboxExecutor:
         """
         start = time.monotonic()
 
-        use_allowlist = self._allowlist is not None and not self._allowlist.is_empty
+        use_allowlist = (
+            self._allowlist is not None
+            and not self._allowlist.is_empty
+        )
         proxy_addr = self._proxy_egress or DEFAULT_PROXY_EGRESS
         effective_mode = self._effective_network_mode()
 
@@ -317,7 +320,8 @@ class DockerSandboxExecutor:
             # DNS access.
             if self._allowlist is not None:
                 cmd.extend(self._allowlist.generate_add_host_args())
-            # Set proxy env vars so HTTP clients in the container use the proxy.
+            # Set proxy env vars so HTTP clients in the container use
+            # the proxy.
             proxy_url = f"http://{proxy_addr}"
             proxy_env = {
                 "HTTP_PROXY": proxy_url,
@@ -432,7 +436,10 @@ class DockerSandboxExecutor:
         from sandbox.base import VT_TEST_NONCE_ENV, build_test_harness
         script, nonce = build_test_harness(code, tests)
         result = await self.execute(
-            script, timeout=timeout, network=network, memory_limit=memory_limit,
+            script,
+            timeout=timeout,
+            network=network,
+            memory_limit=memory_limit,
             env={VT_TEST_NONCE_ENV: nonce},
         )
         result.evidence["test_nonce"] = nonce

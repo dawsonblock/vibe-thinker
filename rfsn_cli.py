@@ -8,7 +8,8 @@ dispatcher runs in the background.
 
 Usage:
     python rfsn_cli.py
-    python rfsn_cli.py --vibe http://127.0.0.1:8080 --generalist http://127.0.0.1:8081
+    python rfsn_cli.py --vibe http://127.0.0.1:8080 \
+        --generalist http://127.0.0.1:8081
     python rfsn_cli.py --max-concurrent 3 --no-clr
 
 Commands (type `help` in the REPL):
@@ -75,7 +76,8 @@ def _build_retrieval_backend(args) -> "object | None":
     from retrieval import make_retrieval_backend
     serper = args.serper_key or None
     searchapi = args.searchapi_key or None
-    backend = make_retrieval_backend(serper_key=serper, searchapi_key=searchapi)
+    backend = make_retrieval_backend(
+        serper_key=serper, searchapi_key=searchapi)
     if backend is not None:
         print(f"[CLI] Active retrieval enabled: {backend.name} — "
               f"factual tasks will fetch real sources for NLI verification")
@@ -182,8 +184,10 @@ class JobQueueREPL:
         print("RFSN job queue REPL. Type 'help' for commands, 'quit' to exit.")
         while True:
             try:
-                # input() blocks; run it in a thread so the dispatcher keeps going.
-                line = await loop.run_in_executor(None, lambda: input("rfsn> "))
+                # input() blocks; run it in a thread so the dispatcher
+                # keeps going.
+                line = await loop.run_in_executor(
+                    None, lambda: input("rfsn> "))
             except (EOFError, KeyboardInterrupt):
                 print()
                 break
@@ -222,7 +226,8 @@ class JobQueueREPL:
                 force_route=flags.get("force_route"),
             )
             print(f"submitted job {job.job_id} (priority={job.priority}"
-                  + (f", force_route={job.force_route}" if job.force_route else "")
+                  + (f", force_route={job.force_route}"
+                     if job.force_route else "")
                   + ")")
             return
 
@@ -233,7 +238,8 @@ class JobQueueREPL:
                 return
             print(f"{'job_id':14} {'status':10} {'pri':>3} {'route':16} query")
             for j in jobs:
-                q = (j["query"][:48] + "...") if len(j["query"]) > 48 else j["query"]
+                q = (j["query"][:48] + "...") if len(j["query"]) > 48 \
+                    else j["query"]
                 route = j.get("force_route") or "-"
                 print(f"{j['job_id']:14} {j['status']:10} {j['priority']:>3} "
                       f"{route:16} {q}")
@@ -260,7 +266,8 @@ class JobQueueREPL:
                 print(f"no such job: {args[0]}")
                 return
             if job.result is None:
-                print(f"job {job.job_id} has no result yet (status={job.status.value})")
+                print(f"job {job.job_id} has no result yet "
+                      f"(status={job.status.value})")
                 if job.error:
                     print(f"error: {job.error}")
                 return
@@ -305,7 +312,8 @@ class JobQueueREPL:
             for e in rows:
                 extra = e.get("extra", {})
                 tail = f"  {extra}" if extra else ""
-                print(f"  {e['valid_time']}  {e['event']:10} -> {e['status']}{tail}")
+                print(f"  {e['valid_time']}  {e['event']:10} "
+                      f"-> {e['status']}{tail}")
             return
 
         if cmd == "asof":
@@ -333,9 +341,11 @@ class JobQueueREPL:
             if not state:
                 print("(log empty)")
                 return
-            print(f"{'job_id':14} {'status':10} {'event':10} {'valid_time':27} query")
+            print(f"{'job_id':14} {'status':10} {'event':10} "
+                  f"{'valid_time':27} query")
             for jid, e in state.items():
-                q = (e["query"][:40] + "...") if len(e["query"]) > 40 else e["query"]
+                q = (e["query"][:40] + "...") if len(e["query"]) > 40 \
+                    else e["query"]
                 print(f"{jid:14} {e['status']:10} {e['event']:10} "
                       f"{e['valid_time']:27} {q}")
             return
@@ -348,26 +358,38 @@ def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="RFSN job queue REPL.")
     # Precedence: CLI flags > environment variables > defaults
     p.add_argument("--vibe",
-                   default=os.environ.get("VIBE_THINKER_URL", "http://127.0.0.1:8080"),
+                   default=os.environ.get(
+                       "VIBE_THINKER_URL", "http://127.0.0.1:8080"),
                    help="VibeThinker specialist endpoint")
     p.add_argument("--specialist-transport",
                    choices=["completion", "openai_chat", "anthropic"],
-                   default=os.environ.get("VIBE_THINKER_SPECIALIST_TRANSPORT", "completion"),
+                   default=os.environ.get(
+                       "VIBE_THINKER_SPECIALIST_TRANSPORT",
+                       "completion"),
                    help="Which HTTP API shape the specialist server speaks. "
-                        "'completion' (default) = llama-server/RuvLLM /completion "
-                        "(accepts the 'grammar' GBNF field). 'openai_chat' = "
-                        "OpenAI-compatible /v1/chat/completions (no /completion "
+                        "'completion' (default) = llama-server/RuvLLM "
+                        "/completion "
+                        "(accepts the 'grammar' GBNF field). 'openai_chat' "
+                        "= "
+                        "OpenAI-compatible /v1/chat/completions (no "
+                        "/completion "
                         "endpoint; structured output via response_format). "
-                        "'anthropic' = /v1/messages (structured output via tools). "
+                        "'anthropic' = /v1/messages (structured output via "
+                        "tools). "
                         "Ignored when --local-specialist-model is set.")
     p.add_argument("--specialist-api-key",
-                   default=os.environ.get("VIBE_THINKER_SPECIALIST_API_KEY", ""),
+                   default=os.environ.get(
+                       "VIBE_THINKER_SPECIALIST_API_KEY", ""),
                    help="API key for the specialist when using openai_chat or "
-                        "anthropic transports. Sent as 'Authorization: Bearer ' "
-                        "(openai_chat) or 'x-api-key' (anthropic). Never logged.")
+                        "anthropic transports. Sent as 'Authorization: "
+                        "Bearer ' "
+                        "(openai_chat) or 'x-api-key' (anthropic). Never "
+                        "logged.")
     p.add_argument("--specialist-model-name",
-                   default=os.environ.get("VIBE_THINKER_SPECIALIST_MODEL_NAME", ""),
-                   help="Model name to send in the chat payload for openai_chat / "
+                   default=os.environ.get(
+                       "VIBE_THINKER_SPECIALIST_MODEL_NAME", ""),
+                   help="Model name to send in the chat payload for "
+                        "openai_chat / "
                         "anthropic transports (e.g. 'gpt-4o-mini' or "
                         "'claude-3-5-sonnet-20241022'). Some self-hosted "
                         "OpenAI-compatible servers ignore this field.")
@@ -375,8 +397,10 @@ def build_argparser() -> argparse.ArgumentParser:
                    default=int(os.environ.get("MAX_PARSE_REPAIRS", "2")),
                    help="When a structured-output specialist call returns "
                         "malformed JSON, feed the bad text + parse error back "
-                        "for a corrected attempt. Max repair rounds (default 2, "
-                        "0 disables). Most useful for transports without native "
+                        "for a corrected attempt. Max repair rounds (default "
+                        "2, "
+                        "0 disables). Most useful for transports without "
+                        "native "
                         "grammar enforcement (openai_chat, anthropic). "
                         "Fail-closed: falls back to regex extraction if no "
                         "repair parses.")
@@ -399,7 +423,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.set_defaults(prefer_encoder_nli=not _env_bool(
         "VIBE_THINKER_NO_ENCODER_NLI", False))
     p.add_argument("--generalist",
-                   default=os.environ.get("GENERALIST_URL", "http://127.0.0.1:8081"),
+                   default=os.environ.get(
+                       "GENERALIST_URL", "http://127.0.0.1:8081"),
                    help="Generalist model endpoint")
     p.add_argument("--code-specialist",
                    default=os.environ.get("CODE_SPECIALIST_URL", ""),
@@ -420,12 +445,16 @@ def build_argparser() -> argparse.ArgumentParser:
                         "passes.")
     p.add_argument("--no-trajectory-store", dest="use_trajectory_store",
                    action="store_false",
-                   help="Disable the verified-trajectory store (self-improving "
+                   help="Disable the verified-trajectory store "
+                        "(self-improving "
                         "few-shot memory). Enabled by default when embedding "
                         "deps are available.")
-    p.set_defaults(use_trajectory_store=_env_bool("RFSN_USE_TRAJECTORY_STORE", True))
+    p.set_defaults(use_trajectory_store=_env_bool(
+        "RFSN_USE_TRAJECTORY_STORE", True))
     p.add_argument("--trajectory-store-path",
-                   default=os.environ.get("TRAJECTORY_STORE_PATH", "verified_trajectories.json"),
+                   default=os.environ.get(
+                       "TRAJECTORY_STORE_PATH",
+                       "verified_trajectories.json"),
                    help="Path to the verified-trajectory store file.")
     p.add_argument("--max-concurrent", type=int,
                    default=int(os.environ.get("RFSN_MAX_CONCURRENT", "2")),
@@ -448,23 +477,34 @@ def build_argparser() -> argparse.ArgumentParser:
     p.set_defaults(fast_specialist=_env_bool("RFSN_FAST_SPECIALIST", False))
     p.add_argument("--local-specialist-model",
                    default=os.environ.get("VIBE_THINKER_LOCAL_MODEL", ""),
-                   help="Path to a local .gguf (or 'repo_id/filename.gguf') to "
+                   help="Path to a local .gguf (or 'repo_id/filename.gguf') "
+                        "to "
                         "load the specialist in-process via llama-cpp-python, "
                         "bypassing HTTP entirely. Auto-preferred over --vibe "
                         "when set; falls back to HTTP if llama-cpp-python is "
-                        "missing or the load fails. Requires llama-cpp-python.")
+                        "missing or the load fails. Requires "
+                        "llama-cpp-python.")
     p.add_argument("--local-specialist-n-ctx", type=int,
-                   default=int(os.environ.get("VIBE_THINKER_LOCAL_N_CTX", "4096")),
-                   help="Context window for the in-process specialist (default 4096).")
+                   default=int(os.environ.get(
+                       "VIBE_THINKER_LOCAL_N_CTX", "4096")),
+                   help="Context window for the in-process specialist "
+                        "(default 4096).")
     p.add_argument("--local-specialist-n-threads", type=int,
-                   default=int(os.environ.get("VIBE_THINKER_LOCAL_N_THREADS", "8")),
-                   help="CPU threads for the in-process specialist (default 8).")
+                   default=int(os.environ.get(
+                       "VIBE_THINKER_LOCAL_N_THREADS", "8")),
+                   help="CPU threads for the in-process specialist "
+                        "(default 8).")
     p.add_argument("--local-specialist-pool-size", type=int,
-                   default=int(os.environ.get("VIBE_THINKER_LOCAL_POOL_SIZE", "1")),
-                   help="Number of in-process Llama instances to load for true "
-                        "parallel inference (default 1 = single instance + Lock). "
-                        "For a 0.5B model (~398MB each), 4 instances cost ~1.6GB "
-                        "and enable 4 concurrent trajectories. Each instance gets "
+                   default=int(os.environ.get(
+                       "VIBE_THINKER_LOCAL_POOL_SIZE", "1")),
+                   help="Number of in-process Llama instances to load for "
+                        "true "
+                        "parallel inference (default 1 = single instance "
+                        "+ Lock). "
+                        "For a 0.5B model (~398MB each), 4 instances cost "
+                        "~1.6GB "
+                        "and enable 4 concurrent trajectories. Each "
+                        "instance gets "
                         "n_threads/pool_size CPU threads.")
     # --- RuvLLM integration (v0.3.9) ---
     # RuvLLM is a Rust inference engine with TurboQuant KV cache compression.
@@ -476,9 +516,12 @@ def build_argparser() -> argparse.ArgumentParser:
                    default=os.environ.get("RUVLLM_URL", ""),
                    help="RuvLLM HTTP endpoint (e.g. http://127.0.0.1:8080). "
                         "When set, overrides --vibe to use the RuvLLM server "
-                        "with TurboQuant KV cache compression. The orchestrator's "
-                        "existing HTTP path handles it — no other changes needed. "
-                        "See ruvllm_adapter.RuvLLMHTTPBackend for the recommended "
+                        "with TurboQuant KV cache compression. The "
+                        "orchestrator's "
+                        "existing HTTP path handles it — no other changes "
+                        "needed. "
+                        "See ruvllm_adapter.RuvLLMHTTPBackend for the "
+                        "recommended "
                         "start command with TurboQuant flags.")
     # --- Fast code-specialist preset (v0.3.9) ---
     # Bumps CODE_CANDIDATES to 15 for ultra-fast 0.5B code models (ruvltra).
@@ -486,15 +529,21 @@ def build_argparser() -> argparse.ArgumentParser:
     # --local-specialist-model pointing at ruvltra-claude-code-0.5b.
     p.add_argument("--fast-code-specialist", dest="fast_code_specialist",
                    action="store_true",
-                   help="Preset for ultra-fast 0.5B code specialists (ruvltra): "
+                   help="Preset for ultra-fast 0.5B code specialists "
+                        "(ruvltra): "
                         "sets CODE_CANDIDATES=15 so the multi-candidate loop "
                         "shotgun-samples 15 candidates in parallel. At 0.5B "
-                        "speed (~100+ tok/s), 15 candidates cost roughly what 2 "
-                        "cost on a 3B model. Pair with --code-specialist pointing "
-                        "at a ruvltra-claude-code server, or --local-specialist-"
-                        "model pointing at the ruvltra .gguf. Do NOT use with a "
+                        "speed (~100+ tok/s), 15 candidates cost roughly "
+                        "what 2 "
+                        "cost on a 3B model. Pair with --code-specialist "
+                        "pointing "
+                        "at a ruvltra-claude-code server, or --local-"
+                        "specialist-"
+                        "model pointing at the ruvltra .gguf. Do NOT use "
+                        "with a "
                         "3B+ code model — 15 parallel candidates will thrash.")
-    p.set_defaults(fast_code_specialist=_env_bool("RFSN_FAST_CODE_SPECIALIST", False))
+    p.set_defaults(fast_code_specialist=_env_bool(
+        "RFSN_FAST_CODE_SPECIALIST", False))
     p.add_argument("--structured-output", dest="use_structured_output",
                    action="store_true",
                    help="Force the specialist to output structured JSON "
@@ -502,8 +551,10 @@ def build_argparser() -> argparse.ArgumentParser:
                         "GBNF grammar. Eliminates brittle \\boxed{} regex "
                         "scraping — the answer is read directly from the "
                         "boxed_answer key. Falls back to regex for backends "
-                        "without grammar support. Default: off (backward compat).")
-    p.set_defaults(use_structured_output=_env_bool("RFSN_STRUCTURED_OUTPUT", False))
+                        "without grammar support. Default: off (backward "
+                        "compat).")
+    p.set_defaults(use_structured_output=_env_bool(
+        "RFSN_STRUCTURED_OUTPUT", False))
     # --- Static-analysis fallback gate (v3.2) ---
     # AST static analysis is NOT a security boundary. Off by default in
     # production: when no sandbox (wasmtime/Docker) is available, the code
@@ -515,12 +566,15 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Allow the deprecated AST static-analysis fallback "
                         "when no sandbox is available. AST is NOT a security "
                         "boundary — only the code's parse + restricted-import "
-                        "status is checked. Emits a 0.2 heuristic (verified=False). "
+                        "status is checked. Emits a 0.2 heuristic "
+                        "(verified=False). "
                         "Default: off (production-safe).")
     p.set_defaults(allow_static_fallback=_env_bool(
         "VIBE_THINKER_ALLOW_STATIC_FALLBACK", False))
     p.add_argument("--audit-log",
-                   default=os.environ.get("RFSN_AUDIT_LOG", "rfsn_jobs_bitemporal.jsonl"),
+                   default=os.environ.get(
+                       "RFSN_AUDIT_LOG",
+                       "rfsn_jobs_bitemporal.jsonl"),
                    help="Bi-temporal audit log path (empty disables logging)")
     # --- Audit-log signing (v0.3.9) ---
     # HMAC-SHA256 (symmetric, stdlib) or Ed25519 (asymmetric, SLSA L2).
@@ -531,15 +585,22 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="HMAC-SHA256 shared secret for audit-log signatures "
                         "(symmetric, stdlib). When set, each log entry is "
                         "tamper-proof — an attacker cannot forge signatures "
-                        "without the key. Empty = no signing (tamper-evident only).")
+                        "without the key. Empty = no signing (tamper-"
+                        "evident only).")
     p.add_argument("--ed25519-private-key",
                    default=os.environ.get("RFSN_ED25519_PRIVATE_KEY", ""),
-                   help="Hex-encoded Ed25519 private key for asymmetric audit-log "
-                        "signatures (SLSA L2 compliant). Stronger than HMAC: the "
-                        "public key can verify but cannot forge. Requires the "
-                        "'cryptography' package. Takes precedence over --signing-key. "
-                        "Generate with: python3 -c \"from signers import Ed25519Signer; "
-                        "s=Ed25519Signer.generate(); print(s.private_key_hex)\"")
+                   help="Hex-encoded Ed25519 private key for asymmetric "
+                        "audit-log "
+                        "signatures (SLSA L2 compliant). Stronger than "
+                        "HMAC: the "
+                        "public key can verify but cannot forge. Requires "
+                        "the "
+                        "'cryptography' package. Takes precedence over "
+                        "--signing-key. "
+                        "Generate with: python3 -c \"from signers import "
+                        "Ed25519Signer; "
+                        "s=Ed25519Signer.generate(); "
+                        "print(s.private_key_hex)\"")
     p.add_argument("--ed25519-public-key",
                    default=os.environ.get("RFSN_ED25519_PUBLIC_KEY", ""),
                    help="Hex-encoded Ed25519 public key for verify-only mode "
@@ -551,14 +612,20 @@ def build_argparser() -> argparse.ArgumentParser:
     # the local JSON file for zero-downtime migration).
     p.add_argument("--agentdb-url",
                    default=os.environ.get("AGENTDB_URL", ""),
-                   help="RuFlo/AgentDB HTTP endpoint for vector similarity search "
-                        "(e.g. http://127.0.0.1:8088). When set, the CLR result cache "
-                        "and trajectory store dual-write to both the local JSON file "
-                        "and AgentDB (shadow mode). Reads fall back to local if AgentDB "
-                        "is down. Empty = in-memory numpy (default, unchanged).")
+                   help="RuFlo/AgentDB HTTP endpoint for vector similarity "
+                        "search "
+                        "(e.g. http://127.0.0.1:8088). When set, the CLR "
+                        "result cache "
+                        "and trajectory store dual-write to both the local "
+                        "JSON file "
+                        "and AgentDB (shadow mode). Reads fall back to "
+                        "local if AgentDB "
+                        "is down. Empty = in-memory numpy (default, "
+                        "unchanged).")
     p.add_argument("--agentdb-only", action="store_true",
                    default=_env_bool("VIBE_THINKER_AGENTDB_ONLY", False),
-                   help="Use AgentDB as the SOLE vector store (no shadow mode, "
+                   help="Use AgentDB as the SOLE vector store (no shadow "
+                        "mode, "
                         "no local JSON fallback). Use this AFTER running "
                         "'finalize-migration' to cut over to AgentDB-only. "
                         "Requires --agentdb-url. Fail-closed: if AgentDB is "
@@ -569,43 +636,55 @@ def build_argparser() -> argparse.ArgumentParser:
     # to local when the federation is unreachable.
     p.add_argument("--federation-url",
                    default=os.environ.get("FEDERATION_URL", ""),
-                   help="Federation coordinator HTTP endpoint for multi-node job "
-                        "distribution (e.g. https://swarm.local:7443). May be a "
+                   help="Federation coordinator HTTP endpoint for multi-"
+                        "node job "
+                        "distribution (e.g. https://swarm.local:7443). May "
+                        "be a "
                         "comma-separated list of URLs for HA failover (e.g. "
-                        "https://c1:7443,https://c2:7443) — the client tries each "
+                        "https://c1:7443,https://c2:7443) — the client "
+                        "tries each "
                         "and sticks to the first that succeeds. Run each "
                         "coordinator with: python3 -m federation_server "
-                        "[--redis-url ...]. When set, jobs are published to the "
-                        "swarm; any idle node can claim them. Requires mTLS certs. "
+                        "[--redis-url ...]. When set, jobs are published "
+                        "to the "
+                        "swarm; any idle node can claim them. Requires "
+                        "mTLS certs. "
                         "Empty = local-only single-node queue (default).")
     p.add_argument("--mtls-cert",
                    default=os.environ.get("FEDERATION_MTLS_CERT", ""),
-                   help="Path to the mTLS client certificate (PEM) for federation.")
+                   help="Path to the mTLS client certificate (PEM) for "
+                        "federation.")
     p.add_argument("--mtls-key",
                    default=os.environ.get("FEDERATION_MTLS_KEY", ""),
-                   help="Path to the mTLS client private key (PEM) for federation.")
+                   help="Path to the mTLS client private key (PEM) for "
+                        "federation.")
     p.add_argument("--mtls-ca",
                    default=os.environ.get("FEDERATION_MTLS_CA", ""),
-                   help="Path to the mTLS CA certificate (PEM) that signed all node certs.")
+                   help="Path to the mTLS CA certificate (PEM) that signed "
+                        "all node certs.")
     # v3.0: Zero-trust federation encryption
     p.add_argument("--federation-secret",
                    default=os.environ.get("FEDERATION_SECRET", ""),
-                   help="Shared secret for zero-trust payload encryption (v3.0). "
-                        "When set, all federation payloads (job queries, results) "
+                   help="Shared secret for zero-trust payload encryption "
+                        "(v3.0). "
+                        "When set, all federation payloads (job queries, "
+                        "results) "
                         "are encrypted with Fernet AEAD before transmission. "
                         "Nodes without the secret see only opaque ciphertext. "
                         "Requires the 'cryptography' package.")
     # v3.0: SONA gossip protocol — Distributed Brain
     p.add_argument("--sona-sync-url",
                    default=os.environ.get("SONA_SYNC_URL", ""),
-                   help="Federation coordinator URL for SONA pattern sync (v3.0). "
+                   help="Federation coordinator URL for SONA pattern sync "
+                        "(v3.0). "
                         "When set, the orchestrator periodically exports its "
                         "learned patterns and imports global patterns from "
                         "other nodes. Enables swarm-wide learning.")
     p.add_argument("--sona-sync-interval",
                    type=int,
                    default=int(os.environ.get("SONA_SYNC_INTERVAL", "3600")),
-                   help="Interval in seconds between SONA sync cycles (default 3600).")
+                   help="Interval in seconds between SONA sync cycles "
+                        "(default 3600).")
     # --- Active retrieval (v0.4.0) ---
     # When configured, factual tasks fetch real source text from a search API
     # and feed it to the FactualVerifier's NLI judge. Fail-closed: no key =
@@ -620,7 +699,8 @@ def build_argparser() -> argparse.ArgumentParser:
                         "Empty = no retrieval (default, fail-closed).")
     p.add_argument("--searchapi-key",
                    default=os.environ.get("SEARCHAPI_API_KEY", ""),
-                   help="SearchApi.io API key for factual retrieval (alternative "
+                   help="SearchApi.io API key for factual retrieval "
+                        "(alternative "
                         "to --serper-key). Same fail-closed behavior.")
     # --- Network allow-list (v0.4.0) ---
     # When set, code sandbox execution uses --network=default + iptables
@@ -630,9 +710,12 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--network-allowlist",
                    default=os.environ.get("RFSN_NETWORK_ALLOWLIST", ""),
                    help="Comma-separated list of allowed network destinations "
-                        "for sandbox egress (e.g. 'pypi.org:443,10.0.0.0/24'). "
-                        "When set, the Docker sandbox uses iptables filtering "
-                        "instead of --network=none. Empty = deny all (default).")
+                        "for sandbox egress (e.g. "
+                        "'pypi.org:443,10.0.0.0/24'). "
+                        "When set, the Docker sandbox uses iptables "
+                        "filtering "
+                        "instead of --network=none. Empty = deny all "
+                        "(default).")
     p.add_argument("--network-allowlist-file",
                    default=os.environ.get("RFSN_NETWORK_ALLOWLIST_FILE", ""),
                    help="Path to a file with allowed network destinations "
@@ -649,7 +732,8 @@ def build_argparser() -> argparse.ArgumentParser:
                    default=os.environ.get("RFSN_SANDBOX_IMAGE",
                                           "vibe-thinker-sandbox:latest"),
                    help="Docker image for the code sandbox. Defaults to the "
-                        "purpose-built vibe-thinker-sandbox image with iptables "
+                        "purpose-built vibe-thinker-sandbox image with "
+                        "iptables "
                         "baked in. Build it with: docker build -f "
                         "sandbox/Dockerfile -t vibe-thinker-sandbox:latest .")
     p.add_argument("--proxy-egress",
@@ -683,7 +767,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--no-embedding-router", dest="use_embedding_router",
                    action="store_false",
                    help="Disable embedding router, use keyword fallback")
-    p.set_defaults(use_embedding_router=_env_bool("RFSN_USE_EMBEDDING_ROUTER", True))
+    p.set_defaults(use_embedding_router=_env_bool(
+        "RFSN_USE_EMBEDDING_ROUTER", True))
     return p
 
 
@@ -695,17 +780,20 @@ async def _amain() -> None:
     # orchestrator's HTTP path handles RuvLLM unchanged (same OpenAI API).
     vibe_endpoint = args.ruvllm_url or args.vibe
     if args.ruvllm_url:
-        print(f"[CLI] RuvLLM backend enabled: --vibe overridden to {args.ruvllm_url}")
+        print(f"[CLI] RuvLLM backend enabled: --vibe overridden to "
+              f"{args.ruvllm_url}")
 
     # --- Specialist transport (v1.1) ---
     # Only relevant for the HTTP path; ignored when --local-specialist-model
     # is set (the in-process backend has its own code path).
-    if not args.local_specialist_model and args.specialist_transport != "completion":
+    if not args.local_specialist_model and \
+            args.specialist_transport != "completion":
         print(f"[CLI] Specialist transport: {args.specialist_transport} "
               f"(endpoint {vibe_endpoint})")
         if not args.specialist_api_key:
             print("[CLI] Warning: --specialist-transport is set but no "
-                  "--specialist-api-key is configured. Set VIBE_THINKER_SPECIALIST_API_KEY "
+                  "--specialist-api-key is configured. Set "
+                  "VIBE_THINKER_SPECIALIST_API_KEY "
                   "or --specialist-api-key for authenticated providers.")
 
     # --- Encoder NLI judge (v1.1, default ON as of Phase 3.3) ---
@@ -745,11 +833,15 @@ async def _amain() -> None:
     code_candidates = args.code_candidates
     if args.fast_code_specialist:
         code_candidates = max(args.code_candidates, 15)
-        print(f"[CLI] Fast code-specialist preset: CODE_CANDIDATES -> {code_candidates}")
+        print(f"[CLI] Fast code-specialist preset: CODE_CANDIDATES -> "
+              f"{code_candidates}")
         if not (args.code_specialist or args.local_specialist_model):
-            print("[CLI] Warning: --fast-code-specialist is set but no code specialist "
-                  "is configured. Pair with --code-specialist <ruvltra-url> or "
-                  "--local-specialist-model <ruvltra.gguf> for it to take effect.")
+            print("[CLI] Warning: --fast-code-specialist is set but no "
+                  "code specialist "
+                  "is configured. Pair with --code-specialist "
+                  "<ruvltra-url> or "
+                  "--local-specialist-model <ruvltra.gguf> for it to "
+                  "take effect.")
 
     orchestrator = HybridReasoningOrchestrator(
         vibe_endpoint=vibe_endpoint,
@@ -955,8 +1047,10 @@ def _run_doctor() -> int:
     print("\nSandbox:")
     sandbox_mode = os.environ.get("VIBE_SANDBOX_MODE", "disabled")
     network_mode = os.environ.get("VIBE_NETWORK_MODE", "disabled")
-    print(f"  mode: {sandbox_mode} {'OK' if sandbox_mode == 'disabled' else 'CHECK'}")
-    print(f"  network: {network_mode} {'OK' if network_mode == 'disabled' else 'CHECK'}")
+    print(f"  mode: {sandbox_mode} "
+          f"{'OK' if sandbox_mode == 'disabled' else 'CHECK'}")
+    print(f"  network: {network_mode} "
+          f"{'OK' if network_mode == 'disabled' else 'CHECK'}")
     if network_mode == "best_effort_proxy":
         print("  WARNING: best_effort_proxy is NOT a security boundary.")
         print("           Use 'disabled' for untrusted code.")
@@ -1004,7 +1098,9 @@ def _run_smoke() -> int:
         result = _asyncio.run(v.verify(
             "What is 2+2?", "4", context={"expected_answer": "4"}
         ))
-        assert result.verified, f"MathVerifier expected verified=True, got {result.verified}"
+        assert result.verified, (
+            f"MathVerifier expected verified=True, "
+            f"got {result.verified}")
         print("[2/5] Math verifier (2+2=4): OK")
     except Exception as e:
         print(f"[2/5] Math verifier: FAIL ({e})")
@@ -1019,7 +1115,9 @@ def _run_smoke() -> int:
             '{"name": "test"}',
             context={"schema": {"type": "object", "required": ["name"]}},
         ))
-        assert result.verified, f"SchemaVerifier expected verified=True, got {result.verified}"
+        assert result.verified, (
+            f"SchemaVerifier expected verified=True, "
+            f"got {result.verified}")
         print("[3/5] Schema verifier: OK")
     except Exception as e:
         print(f"[3/5] Schema verifier: FAIL ({e})")
@@ -1027,7 +1125,9 @@ def _run_smoke() -> int:
 
     # 4. Audit log (uses record() with a job-like object)
     try:
-        import tempfile, os, types
+        import tempfile
+        import os
+        import types
         from bitemporal_log import BiTemporalAuditLog
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
             log_path = f.name
@@ -1054,7 +1154,8 @@ def _run_smoke() -> int:
 
     # 5. Local cache (exact key lookup, no embeddings needed)
     try:
-        import tempfile, os
+        import tempfile
+        import os
         from persistent_cache import CLRResultCache, CacheSimilarityMode
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
             cache_path = f.name
@@ -1166,7 +1267,8 @@ def _run_finalize_migration() -> int:
         os.path.dirname(os.path.abspath(__file__)),
         "scripts", "migrate_to_agentdb.py",
     )
-    _spec = importlib.util.spec_from_file_location("migrate_to_agentdb", _mig_path)
+    _spec = importlib.util.spec_from_file_location(
+        "migrate_to_agentdb", _mig_path)
     _mig_mod = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_mig_mod)
 
@@ -1209,8 +1311,10 @@ def _run_finalize_migration() -> int:
             archive_path = path + args.archive_suffix
             # Don't overwrite an existing archive.
             if os.path.exists(archive_path):
-                print(f"[Finalize] Archive {archive_path} already exists — "
-                      f"skipping (rename it manually if you want to re-archive)")
+                print(f"[Finalize] Archive {archive_path} already "
+                      f"exists — "
+                      f"skipping (rename it manually if you want to "
+                      f"re-archive)")
                 continue
             os.rename(path, archive_path)
             archived.append((path, archive_path))

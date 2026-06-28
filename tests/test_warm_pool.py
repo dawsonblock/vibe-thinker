@@ -77,7 +77,9 @@ class TestWarmPoolUnit:
         _run_docker, which tried to execute the binary "rm" instead of
         "docker rm -f name". Containers leaked on every shutdown.
         """
-        pool = WarmDockerPool(pool_size=2, container_prefix="test_vt_regression")
+        pool = WarmDockerPool(
+            pool_size=2, container_prefix="test_vt_regression"
+        )
         pool._containers = [
             {"name": "test_container_0", "uses": 0},
             {"name": "test_container_1", "uses": 0},
@@ -98,7 +100,9 @@ class TestWarmPoolUnit:
         # Must have called "docker rm -f" for each container, not just "rm -f"
         assert len(commands) == 2
         for cmd in commands:
-            assert cmd[0] == "docker", f"Expected 'docker' as first arg, got {cmd[0]}"
+            assert cmd[0] == "docker", (
+                f"Expected 'docker' as first arg, got {cmd[0]}"
+            )
             assert cmd[1] == "rm"
             assert cmd[2] == "-f"
         assert len(pool._containers) == 0
@@ -271,7 +275,8 @@ class TestSelectExecutorPreference:
         if not HAS_DOCKER:
             pytest.skip("Docker not available")
         executor = select_executor()
-        # Should be a WarmDockerPool (preferred over cold DockerSandboxExecutor)
+        # Should be a WarmDockerPool
+        # (preferred over cold DockerSandboxExecutor)
         assert isinstance(executor, WarmDockerPool)
 
     def test_can_disable_warm_pool(self):

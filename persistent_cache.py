@@ -272,7 +272,9 @@ def is_cache_entry_trustworthy(
     return True
 
 
-def should_cache(result: Dict[str, Any], allow_weak_cache: bool = False) -> bool:
+def should_cache(
+    result: Dict[str, Any], allow_weak_cache: bool = False
+) -> bool:
     """Decide whether a CLR result dict is safe to promote into the cache.
 
     Default policy is strict (fail-closed): weak self-verification must NOT
@@ -405,7 +407,8 @@ class PersistentRouteCache:
             if len(self.route_cache) > self.cache_size:
                 self.route_cache.popitem(last=False)
         print(
-            f"[PersistentRouteCache] Loaded {len(self.embedding_cache)} embeddings, "
+            f"[PersistentRouteCache] Loaded "
+            f"{len(self.embedding_cache)} embeddings, "
             f"{len(self.route_cache)} route decisions from {self.path}"
         )
 
@@ -431,9 +434,14 @@ class PersistentRouteCache:
 
     def put_embedding(self, key: str, embedding: Any) -> None:
         k = self._normalize(key)
-        emb_list = embedding.tolist() if hasattr(embedding, "tolist") else list(embedding)
+        emb_list = (
+            embedding.tolist()
+            if hasattr(embedding, "tolist")
+            else list(embedding)
+        )
         if k in self.embedding_cache:
-            # Update existing key — do NOT evict (updating doesn't grow occupancy)
+            # Update existing key — do NOT evict (updating
+            # doesn't grow occupancy)
             self.embedding_cache.move_to_end(k)
         else:
             # New key — evict oldest if at capacity
@@ -545,7 +553,8 @@ class CLRResultCache:
             cls = get_sentence_transformer_class()
             if cls is None and self._vector_store is None:
                 raise RuntimeError(
-                    "Embedding similarity mode requires sentence-transformers. "
+                    "Embedding similarity mode requires "
+                    "sentence-transformers. "
                     "Install with: pip install -e '.[embeddings]'"
                 )
 
@@ -568,8 +577,10 @@ class CLRResultCache:
         else:
             self.model = None
         self.entries: List[Dict[str, Any]] = []
-        self._embeddings_matrix: Optional[Any] = None  # np.ndarray, rebuilt on load
-        self._save_lock = threading.Lock()  # Phase 5: prevent concurrent save races
+        self._embeddings_matrix: Optional[Any] = None
+        # np.ndarray, rebuilt on load
+        self._save_lock = threading.Lock()
+        # Phase 5: prevent concurrent save races
 
         self._load()
 
@@ -580,7 +591,10 @@ class CLRResultCache:
             return
         self.entries = data.get("entries", []) or []
         self._rebuild_embeddings_matrix()
-        print(f"[CLRResultCache] Loaded {len(self.entries)} entries from {self.path}")
+        print(
+            f"[CLRResultCache] Loaded {len(self.entries)} entries "
+            f"from {self.path}"
+        )
 
     def _rebuild_embeddings_matrix(self) -> None:
         if not self.entries:
@@ -601,7 +615,11 @@ class CLRResultCache:
             _atomic_write_json(self.path, data)
 
     # ----------------------- lookup ----------------------- #
-    def lookup(self, problem: str, allow_weak_cache: bool = False) -> Optional[Dict[str, Any]]:
+    def lookup(
+        self,
+        problem: str,
+        allow_weak_cache: bool = False,
+    ) -> Optional[Dict[str, Any]]:
         """Return a cached result if a similar high-score problem exists.
 
         Enforces the same trust rules as insertion via
@@ -625,13 +643,19 @@ class CLRResultCache:
         # Exact-match path (NONE mode, or when no embedding model is
         # available). This lets the cache work as a basic exact cache
         # without any optional dependencies.
-        if self.similarity_mode == CacheSimilarityMode.NONE or self.model is None or self._embeddings_matrix is None:
+        if (
+            self.similarity_mode == CacheSimilarityMode.NONE
+            or self.model is None
+            or self._embeddings_matrix is None
+        ):
             for entry in self.entries:
                 if entry.get("problem") != problem:
                     continue
                 if entry.get("best_score", 0) < self.min_score:
                     continue
-                if not is_cache_entry_trustworthy(entry, allow_weak_cache=allow_weak_cache):
+                if not is_cache_entry_trustworthy(
+                    entry, allow_weak_cache=allow_weak_cache
+                ):
                     continue
                 entry["access_count"] = entry.get("access_count", 0) + 1
                 if self.autosave:
@@ -642,7 +666,9 @@ class CLRResultCache:
                     "k": entry.get("k"),
                     "timestamp": entry.get("timestamp"),
                     "trajectory_count": entry.get("trajectory_count"),
-                    "verification_method": entry.get("verification_method", "self_claims_only"),
+                    "verification_method": entry.get(
+                        "verification_method", "self_claims_only"
+                    ),
                     "verified": entry.get("verified", False),
                     "schema_version": entry.get("schema_version", 1),
                     "cached": True,
@@ -664,7 +690,9 @@ class CLRResultCache:
             entry = self.entries[int(idx)]
             if entry.get("best_score", 0) < self.min_score:
                 continue
-            if not is_cache_entry_trustworthy(entry, allow_weak_cache=allow_weak_cache):
+            if not is_cache_entry_trustworthy(
+                entry, allow_weak_cache=allow_weak_cache
+            ):
                 continue
             # Track access frequency for LRU eviction.
             entry["access_count"] = entry.get("access_count", 0) + 1
@@ -676,7 +704,9 @@ class CLRResultCache:
                 "k": entry.get("k"),
                 "timestamp": entry.get("timestamp"),
                 "trajectory_count": entry.get("trajectory_count"),
-                "verification_method": entry.get("verification_method", "self_claims_only"),
+                "verification_method": entry.get(
+                    "verification_method", "self_claims_only"
+                ),
                 "verified": entry.get("verified", False),
                 "schema_version": entry.get("schema_version", 1),
                 "cached": True,
@@ -712,7 +742,8 @@ class CLRResultCache:
           - answer_present: whether a final answer was produced
           - deterministic_check: result of cross-trajectory deterministic check
           - failure: None if successful, error description if failed
-          - transport_failures: number of trajectories that failed at transport level
+          - transport_failures: number of trajectories that failed at
+            transport level
           - model_failures: number of trajectories that failed at model level
           - schema_version: cache entry format version (3)
         """
@@ -742,7 +773,10 @@ class CLRResultCache:
         # Evict least-recently-accessed entries if over capacity (LRU + score).
         if len(self.entries) > self.max_entries:
             self.entries.sort(
-                key=lambda e: (e.get("access_count", 0), e.get("best_score", 0)),
+                key=lambda e: (
+                    e.get("access_count", 0),
+                    e.get("best_score", 0),
+                ),
                 reverse=True,
             )
             self.entries = self.entries[: self.max_entries]
@@ -809,13 +843,16 @@ class VerifiedTrajectoryStore:
     attempt success rate.
 
     Trust model (fail-closed):
-      - ONLY results with verified=True and a deterministic verification_method
+      - ONLY results with verified=True and a deterministic
+        verification_method
         (not self_claims_only) are stored. Unverified results are never learned
-        from — learning from unverified output would be epistemic contamination.
+        from — learning from unverified output would be epistemic
+        contamination.
       - On retrieval, entries are re-checked for trustworthiness via
         is_cache_entry_trustworthy(). A corrupted or stale entry cannot inject
         false context.
-      - The store is read-only on lookup: it provides context, not answers.
+      - The store is read-only on lookup: it provides context, not
+        answers.
         The model still must solve the problem and the verifier still must
         confirm it.
 
@@ -871,7 +908,8 @@ class VerifiedTrajectoryStore:
             cls = get_sentence_transformer_class()
             if cls is None and self._vector_store is None:
                 raise RuntimeError(
-                    "Embedding similarity mode requires sentence-transformers. "
+                    "Embedding similarity mode requires "
+                    "sentence-transformers. "
                     "Install with: pip install -e '.[embeddings]'"
                 )
 
@@ -893,7 +931,8 @@ class VerifiedTrajectoryStore:
             self.model = None
         self.entries: List[Dict[str, Any]] = []
         self._embeddings_matrix: Optional[Any] = None
-        self._save_lock = threading.Lock()  # Phase 5: prevent concurrent save races
+        self._save_lock = threading.Lock()
+        # Phase 5: prevent concurrent save races
 
         self._load()
 
@@ -907,11 +946,17 @@ class VerifiedTrajectoryStore:
         # the file could have been hand-edited or written by an older version)
         self.entries = [
             e for e in self.entries
-            if e.get("verified") and e.get("verification_method", "self_claims_only") != "self_claims_only"
+            if e.get("verified")
+            and e.get(
+                "verification_method", "self_claims_only"
+            ) != "self_claims_only"
         ]
         self._rebuild_embeddings_matrix()
         if self.entries:
-            print(f"[TrajectoryStore] Loaded {len(self.entries)} verified trajectories from {self.path}")
+            print(
+                f"[TrajectoryStore] Loaded {len(self.entries)} "
+                f"verified trajectories from {self.path}"
+            )
 
     def _rebuild_embeddings_matrix(self) -> None:
         if not self.entries:
@@ -933,7 +978,11 @@ class VerifiedTrajectoryStore:
             _atomic_write_json(self.path, data)
 
     # ----------------------- retrieval ----------------------- #
-    def retrieve(self, query: str, task_type: Optional[str] = None) -> List[Dict[str, Any]]:
+    def retrieve(
+        self,
+        query: str,
+        task_type: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """Retrieve similar verified trajectories as few-shot context.
 
         Returns up to ``max_few_shot`` entries sorted by similarity, each
@@ -957,7 +1006,11 @@ class VerifiedTrajectoryStore:
 
         # Exact-match path (NONE mode, or when no embedding model is
         # available). Returns exact-match entries only.
-        if self.similarity_mode == CacheSimilarityMode.NONE or self.model is None or self._embeddings_matrix is None:
+        if (
+            self.similarity_mode == CacheSimilarityMode.NONE
+            or self.model is None
+            or self._embeddings_matrix is None
+        ):
             candidates = []
             for entry in self.entries:
                 if entry.get("query") != query:
@@ -970,7 +1023,9 @@ class VerifiedTrajectoryStore:
                     "query": entry["query"],
                     "answer": entry["answer"],
                     "score": entry.get("score", 0.0),
-                    "verification_method": entry.get("verification_method", ""),
+                    "verification_method": entry.get(
+                        "verification_method", ""
+                    ),
                     "task_type": entry.get("task_type", ""),
                     "similarity": 1.0,
                 })
@@ -993,7 +1048,8 @@ class VerifiedTrajectoryStore:
             entry = self.entries[int(idx)]
             if task_type and entry.get("task_type") != task_type:
                 continue
-            # Re-check trust on retrieval (defensive against stale/corrupt entries)
+            # Re-check trust on retrieval (defensive against
+            # stale/corrupt entries)
             if not is_cache_entry_trustworthy(entry):
                 continue
             candidates.append({
@@ -1013,7 +1069,11 @@ class VerifiedTrajectoryStore:
             self.save()
         return candidates
 
-    def build_few_shot_prefix(self, query: str, task_type: Optional[str] = None) -> str:
+    def build_few_shot_prefix(
+        self,
+        query: str,
+        task_type: Optional[str] = None,
+    ) -> str:
         """Build a few-shot context string from verified trajectories.
 
         Returns a string prepended to the model prompt, or "" if no
@@ -1032,14 +1092,18 @@ class VerifiedTrajectoryStore:
         if not trajectories:
             return ""
         lines = [
-            "Here are similar problems that were independently verified correct.",
+            "Here are similar problems that were independently "
+            "verified correct.",
             "Use them as reference:",
             "",
         ]
         for t in trajectories:
             lines.append(f"Problem: {t['query']}")
             lines.append(f"Verified answer: {t['answer']}")
-            lines.append(f"(verified via {t['verification_method']}, score {t['score']:.3f})")
+            lines.append(
+                f"(verified via {t['verification_method']}, "
+                f"score {t['score']:.3f})"
+            )
             lines.append("")
         return "\n".join(lines)
 
@@ -1090,7 +1154,8 @@ class VerifiedTrajectoryStore:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "verified": True,
             "schema_version": CURRENT_CACHE_SCHEMA_VERSION,
-            "best_answer": answer,  # alias for is_cache_entry_trustworthy compatibility
+            "best_answer": answer,
+            # alias for is_cache_entry_trustworthy compatibility
             "best_score": float(score),  # alias
             "claim_count": 10,  # verified entries pass the claim_count check
         }
@@ -1295,7 +1360,8 @@ class VerifiedTrajectoryStore:
             return clusters
 
     def remove_entries(self, indices: List[int]) -> None:
-        """Remove entries at the given indices and rebuild the embedding matrix.
+        """Remove entries at the given indices and rebuild the
+        embedding matrix.
 
         Used by trajectory synthesis: after a cluster is synthesized into a
         master trajectory, the raw entries are removed to save memory. The

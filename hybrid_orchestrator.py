@@ -2,7 +2,8 @@
 Hybrid Reasoning Orchestrator for VibeThinker-3B.
 
 Routes queries between:
-  - VibeThinker-3B (high-precision reasoning specialist, with optional async CLR)
+  - VibeThinker-3B (high-precision reasoning specialist, with optional
+    async CLR)
   - A generalist model (for knowledge, planning, tool use, conversation, etc.)
 
 Includes:
@@ -76,12 +77,17 @@ def empty_synthesis_result(ok: bool = True) -> Dict[str, Any]:
         "warnings": [],
     }
 
+
 # Sentinel for "argument not provided" — distinct from an explicit None
 # (which means "disable the code verifier / verified loop").
 _UNSET = object()
 
 
-def select_verifier(task_type: str, llm_judge=None, prefer_encoder_nli: bool = True):
+def select_verifier(
+    task_type: str,
+    llm_judge=None,
+    prefer_encoder_nli: bool = True,
+):
     """Select a deterministic verifier based on the detected task type.
 
     Returns None if no verifier applies (conversation, summarization, etc.).
@@ -132,6 +138,7 @@ def select_verifier(task_type: str, llm_judge=None, prefer_encoder_nli: bool = T
         return LogicVerifier()
     return None
 
+
 # Optional dependency — gracefully degrade if not installed
 try:
     import numpy as np
@@ -153,7 +160,9 @@ class OrchestratorResult:
     specialist_used: str
     clr_score: Optional[float] = None
     raw_traces: Dict[str, Any] = field(default_factory=dict)
-    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    timestamp: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
     routing_confidence: float = 0.0
 
 
@@ -161,7 +170,8 @@ class OrchestratorResult:
 # Embedding router with caching
 # ====================================================================== #
 class EmbeddingRouter:
-    """Semantic router with embedding + decision caching (LRU + disk persistence)."""
+    """Semantic router with embedding + decision caching (LRU + disk
+    persistence)."""
 
     def __init__(
         self,
@@ -175,7 +185,8 @@ class EmbeddingRouter:
                 "Install with: pip install sentence-transformers scikit-learn"
             )
 
-        print(f"[EmbeddingRouter] Loading {model_name} with cache_size={cache_size}")
+        print(f"[EmbeddingRouter] Loading {model_name} with "
+              f"cache_size={cache_size}")
         from persistent_cache import get_shared_embedding_model
         self.model = get_shared_embedding_model(model_name)
         self.cache_size = cache_size
@@ -193,7 +204,8 @@ class EmbeddingRouter:
         ]
         self.generalist_examples: List[str] = [
             "Explain the history of the Riemann Hypothesis",
-            "What are the philosophical differences between capitalism and socialism?",
+            "What are the philosophical differences between capitalism "
+            "and socialism?",
             "Summarize the key ideas in 'The Selfish Gene'",
             "How do transformer models work at a conceptual level?",
             "What caused World War I?",
@@ -201,8 +213,10 @@ class EmbeddingRouter:
         ]
 
         # Pre-compute reference embeddings
-        self.specialist_embeddings = self.model.encode(self.specialist_examples)
-        self.generalist_embeddings = self.model.encode(self.generalist_examples)
+        self.specialist_embeddings = self.model.encode(
+            self.specialist_examples)
+        self.generalist_embeddings = self.model.encode(
+            self.generalist_examples)
 
         # Persistent (disk-backed) cache — replaces the in-memory OrderedDicts.
         # Falls back to in-memory only if persist_path is None.
@@ -214,7 +228,8 @@ class EmbeddingRouter:
         else:
             self.persistent = None
             self.embedding_cache: "OrderedDict[str, Any]" = OrderedDict()
-            self.route_cache: "OrderedDict[str, Tuple[str, float]]" = OrderedDict()
+            self.route_cache: "OrderedDict[str, Tuple[str, float]]" = (
+                OrderedDict())
 
         print("[EmbeddingRouter] Ready with caching enabled")
 
@@ -260,8 +275,10 @@ class EmbeddingRouter:
 
         query_embedding = self._get_or_compute_embedding(query).reshape(1, -1)
 
-        spec_sim = float(cosine_similarity(query_embedding, self.specialist_embeddings).max())
-        gen_sim = float(cosine_similarity(query_embedding, self.generalist_embeddings).max())
+        spec_sim = float(cosine_similarity(
+            query_embedding, self.specialist_embeddings).max())
+        gen_sim = float(cosine_similarity(
+            query_embedding, self.generalist_embeddings).max())
 
         confidence = max(spec_sim, gen_sim)
 
@@ -394,8 +411,10 @@ def _static_analysis_fallback(code: str) -> tuple:
             if isinstance(func, _ast.Name) and func.id == "__import__":
                 evasion_found.append("__import__() call")
             # importlib.import_module('os') — method call on importlib.
-            elif isinstance(func, _ast.Attribute) and func.attr == "import_module":
-                if isinstance(func.value, _ast.Name) and func.value.id == "importlib":
+            elif (isinstance(func, _ast.Attribute)
+                    and func.attr == "import_module"):
+                if (isinstance(func.value, _ast.Name)
+                        and func.value.id == "importlib"):
                     evasion_found.append("importlib.import_module() call")
             # exec()/eval() — dynamic code execution.
             elif isinstance(func, _ast.Name) and func.id in ("exec", "eval"):
@@ -406,13 +425,18 @@ def _static_analysis_fallback(code: str) -> tuple:
                 for arg in node.args:
                     if isinstance(arg, _ast.Name) and arg.id == "__builtins__":
                         evasion_found.append("getattr(__builtins__, ...) call")
-                    elif isinstance(arg, _ast.Constant) and isinstance(arg.value, str):
-                        if arg.value in ("__import__", "eval", "exec", "compile"):
-                            # getattr(x, 'eval') — flag if the target is dangerous.
+                    elif (isinstance(arg, _ast.Constant)
+                            and isinstance(arg.value, str)):
+                        if arg.value in (
+                                "__import__", "eval", "exec", "compile"):
+                            # getattr(x, 'eval') — flag if the target is
+                            # dangerous.
                             pass  # Caught by the __builtins__ check above.
             # builtins.__import__('os') — attribute access on builtins module.
-            elif isinstance(func, _ast.Attribute) and func.attr == "__import__":
-                if isinstance(func.value, _ast.Name) and func.value.id == "builtins":
+            elif (isinstance(func, _ast.Attribute)
+                    and func.attr == "__import__"):
+                if (isinstance(func.value, _ast.Name)
+                        and func.value.id == "builtins"):
                     evasion_found.append("builtins.__import__() call")
         # Any Name node referencing importlib, __builtins__, or builtins.
         elif isinstance(node, _ast.Name):
@@ -484,7 +508,9 @@ async def _wasmtime_sandbox_fallback(
     if wasm_module_path:
         try:
             import wasmtime  # type: ignore
-            from wasmtime import Engine, Module, Store, Instance, Config  # type: ignore
+            from wasmtime import (  # type: ignore
+                Engine, Module, Store, Instance, Config,
+            )
 
             # v3.2: deterministic fuel limit. Infinite loops burn fuel at
             # the CPU-instruction level and trap deterministically; this
@@ -538,7 +564,8 @@ async def _wasmtime_sandbox_fallback(
             loop = asyncio.get_event_loop()
 
             async def _run_wasm():
-                return await loop.run_in_executor(None, lambda: run(store, code))
+                return await loop.run_in_executor(
+                    None, lambda: run(store, code))
 
             try:
                 result = await asyncio.wait_for(
@@ -577,7 +604,8 @@ async def _wasmtime_sandbox_fallback(
                 return (_WASM_SANDBOX_SCORE, [])
             # Non-zero exit — the code errored or crashed.
             error_msg = result.stderr.strip()[:200] if result.stderr else ""
-            return (0.0, [f"sandbox: exit code {result.exit_code}: {error_msg}"])
+            return (0.0, [f"sandbox: exit code "
+                          f"{result.exit_code}: {error_msg}"])
         except Exception as e:
             return (0.0, [f"sandbox: execution failed: {e}"])
 
@@ -641,7 +669,8 @@ class HybridReasoningOrchestrator:
         # routed here for plain generation instead of the VibeThinker CLR path.
         # Disabled by default; set via CODE_SPECIALIST_URL / --code-specialist.
         self.code_specialist_endpoint = (
-            code_specialist_endpoint.rstrip("/") if code_specialist_endpoint else None
+            code_specialist_endpoint.rstrip("/")
+            if code_specialist_endpoint else None
         )
         # Multi-candidate code generation: generate N candidates from the code
         # specialist, verify each in the sandbox, return the first that passes.
@@ -669,7 +698,8 @@ class HybridReasoningOrchestrator:
             self._retrieval_backend = retrieval_backend
         # _UNSET -> default CodeVerifier (safe, fail-closed sandbox).
         # None -> explicitly disabled (plain generation, no verification).
-        self.code_verifier = CodeVerifier() if code_verifier is _UNSET else code_verifier
+        self.code_verifier = (
+            CodeVerifier() if code_verifier is _UNSET else code_verifier)
         # Apply the network allow-list to the code verifier's executor
         # (v0.4.0). When set, the Docker sandbox uses iptables egress
         # filtering instead of --network=none. Only DockerSandboxExecutor
@@ -682,9 +712,11 @@ class HybridReasoningOrchestrator:
                     executor.set_dns_resolver(dns_resolver)
                 print(f"[Orchestrator] Network allow-list applied to "
                       f"{type(executor).__name__}"
-                      + (f" (DNS restricted to {dns_resolver})" if dns_resolver else ""))
+                      + (f" (DNS restricted to {dns_resolver})"
+                         if dns_resolver else ""))
             # Override the sandbox image if specified.
-            if sandbox_image and executor is not None and hasattr(executor, "image"):
+            if (sandbox_image and executor is not None
+                    and hasattr(executor, "image")):
                 executor.image = sandbox_image
         # Apply SNI proxy egress mode (v0.4.1). When set, the sandbox
         # routes traffic through the proxy instead of using iptables.
@@ -698,11 +730,14 @@ class HybridReasoningOrchestrator:
             if executor is not None:
                 if proxy_egress and hasattr(executor, "set_proxy_egress"):
                     executor.set_proxy_egress(proxy_egress)
-                    print(f"[Orchestrator] SNI proxy egress enabled: {proxy_egress}"
-                          + (f" (domain-level filtering)" if network_allowlist else ""))
+                    print(f"[Orchestrator] SNI proxy egress enabled: "
+                          f"{proxy_egress}"
+                          + (f" (domain-level filtering)"
+                             if network_allowlist else ""))
         # If the verifier's executor is a WarmDockerPool, start it eagerly so
         # the first code task doesn't pay the cold-start cost.
-        if self.code_verifier is not None and hasattr(self.code_verifier, "executor"):
+        if (self.code_verifier is not None
+                and hasattr(self.code_verifier, "executor")):
             executor = self.code_verifier.executor
             if isinstance(executor, WarmDockerPool):
                 self._warm_pool = executor
@@ -747,7 +782,8 @@ class HybridReasoningOrchestrator:
             max_parse_repairs=max_parse_repairs,
         )
 
-        self.use_embedding_router = use_embedding_router and EMBEDDINGS_AVAILABLE
+        self.use_embedding_router = (
+            use_embedding_router and EMBEDDINGS_AVAILABLE)
         if self.use_embedding_router:
             try:
                 self.router = EmbeddingRouter(
@@ -782,7 +818,8 @@ class HybridReasoningOrchestrator:
         # few-shot context for similar future queries. Only available with
         # embedding deps. Only stores verified=True results — never learns
         # from unverified output.
-        self.use_trajectory_store = use_trajectory_store and EMBEDDINGS_AVAILABLE
+        self.use_trajectory_store = (
+            use_trajectory_store and EMBEDDINGS_AVAILABLE)
         if self.use_trajectory_store:
             try:
                 self.trajectory_store = VerifiedTrajectoryStore(
@@ -899,7 +936,8 @@ class HybridReasoningOrchestrator:
     # "series" appearing in a non-math context (e.g. "sum of human knowledge",
     # "world series", "TV series").
     MATH_INTENT_PATTERNS = [
-        r"\bsolve\b.*\b(equation|integral|derivative|sum|series|system|inequality)\b",
+        r"\bsolve\b.*\b(equation|integral|derivative|sum|"
+        r"series|system|inequality)\b",
         r"\bcompute\b",
         r"\bcalculate\b",
         r"\bprove\b",
@@ -943,9 +981,12 @@ class HybridReasoningOrchestrator:
     # the tools they typically require for deterministic verification.
     _TASK_TYPE_KEYWORDS = {
         "math": {
-            "keywords": {"solve", "calculate", "prove", "find the value", "sum",
-                         "sequence", "series", "integral", "derivative", "probability",
-                         "recurrence", "equation", "matrix", "vector", "theorem",
+            "keywords": {"solve", "calculate", "prove", "find the value",
+                         "sum",
+                         "sequence", "series", "integral", "derivative",
+                         "probability",
+                         "recurrence", "equation", "matrix", "vector",
+                         "theorem",
                          "geometric", "algebra", "calculus", "combinatorics",
                          "compute", "evaluate"},
             "requires_tools": ["deterministic_check"],
@@ -953,7 +994,8 @@ class HybridReasoningOrchestrator:
         },
         "code": {
             "keywords": {"leetcode", "code", "algorithm", "complexity",
-                         "implement", "function", "debug", "refactor", "program",
+                         "implement", "function", "debug", "refactor",
+                         "program",
                          "python", "javascript", "rust", "compile"},
             "requires_tools": ["python_exec", "unit_tests"],
             "requires_model": True,
@@ -977,7 +1019,8 @@ class HybridReasoningOrchestrator:
             "requires_model": True,
         },
         "conversation": {
-            "keywords": {"explain", "what is", "who is", "history of", "compare",
+            "keywords": {"explain", "what is", "who is", "history of",
+                         "compare",
                          "opinion", "describe", "tell me about", "why does"},
             "requires_tools": [],
             "requires_model": True,
@@ -1029,7 +1072,8 @@ class HybridReasoningOrchestrator:
         best_type = "unknown"
         best_score = 0
         for task_type, config in self._TASK_TYPE_KEYWORDS.items():
-            # Skip code task type if the query is a non-programming "code" phrase
+            # Skip code task type if the query is a non-programming
+            # "code" phrase
             if task_type == "code" and is_non_programming_code:
                 continue
             # Skip math task type if there's no computational intent
@@ -1068,7 +1112,8 @@ class HybridReasoningOrchestrator:
         Returns a dict with:
           - route: specialist | generalist | hybrid
           - confidence: float 0-1
-          - task_type: math | code | planning | retrieval | summarization | conversation | unknown
+          - task_type: math | code | planning | retrieval | summarization |
+            conversation | unknown
           - requires_tools: list of tool names needed for verification
           - requires_model: whether a model call is needed
           - requires_human_review: whether human review is recommended
@@ -1079,9 +1124,11 @@ class HybridReasoningOrchestrator:
           - reason: human-readable explanation
         """
         route, confidence = self._classify_route(query)
-        task_type, requires_tools, requires_model = self._detect_task_type(query)
+        task_type, requires_tools, requires_model = (
+            self._detect_task_type(query))
 
-        # Human review recommended for low-confidence routing or unknown task types
+        # Human review recommended for low-confidence routing or unknown
+        # task types
         requires_human_review = confidence < 0.65 or task_type == "unknown"
 
         # Suggest sandbox resource limits based on task complexity (v0.4.0).
@@ -1188,7 +1235,8 @@ class HybridReasoningOrchestrator:
         not code, so it must route to generalist, not specialist.
 
         Routing rules:
-          - math, code -> specialist (these need CLR + deterministic verification)
+          - math, code -> specialist (these need CLR + deterministic
+            verification)
           - conversation, summarization -> generalist (no verifier needed)
           - planning, retrieval, unknown -> hybrid
         """
@@ -1200,7 +1248,8 @@ class HybridReasoningOrchestrator:
                 route, conf = self.router.classify(query)
                 # Override embedding router if it disagrees with task_type
                 if route != "specialist":
-                    print(f"[Route] Embedding router said {route} but task_type={task_type} -> specialist")
+                    print(f"[Route] Embedding router said {route} "
+                          f"but task_type={task_type} -> specialist")
                 return "specialist", max(conf, 0.8)
             return "specialist", 0.8
 
@@ -1209,7 +1258,8 @@ class HybridReasoningOrchestrator:
             if self.use_embedding_router:
                 route, conf = self.router.classify(query)
                 if route == "specialist":
-                    print(f"[Route] Embedding router said specialist but task_type={task_type} -> generalist")
+                    print(f"[Route] Embedding router said specialist "
+                          f"but task_type={task_type} -> generalist")
                 return "generalist", max(conf, 0.75)
             return "generalist", 0.75
 
@@ -1278,7 +1328,8 @@ class HybridReasoningOrchestrator:
                     else SchemaKind.CLAIMS
                 )
                 enforcer = make_enforcer(kind, transport="openai_chat")
-                chat_payload["response_format"] = enforcer.to_openai_response_format()
+                chat_payload["response_format"] = (
+                    enforcer.to_openai_response_format())
             except Exception as e:
                 # If the enforcer mapping fails, proceed without it — the
                 # retry loop + validate_constraints still catch bad output.
@@ -1300,9 +1351,11 @@ class HybridReasoningOrchestrator:
             raise
         except Exception as e:
             # Fallback to raw /completion with ChatML
-            print(f"[Generalist] chat endpoint failed ({e}), falling back to /completion")
+            print(f"[Generalist] chat endpoint failed ({e}), "
+                  f"falling back to /completion")
             payload = {
-                "prompt": f"<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n",
+                "prompt": f"<|im_start|>user\n{query}<|im_end|>\n"
+                          f"<|im_start|>assistant\n",
                 "n_predict": max_tokens,
                 "temperature": 0.7,
                 "top_p": 0.95,
@@ -1321,7 +1374,9 @@ class HybridReasoningOrchestrator:
                     data = await resp.json()
                     content = data.get("content", "")
                     if not content:
-                        raise RuntimeError("Generalist returned empty response on fallback")
+                        raise RuntimeError(
+                            "Generalist returned empty response "
+                            "on fallback")
                     return content
             except RuntimeError:
                 raise
@@ -1333,7 +1388,9 @@ class HybridReasoningOrchestrator:
     # ------------------------------------------------------------------ #
     # Specialist (plain, no CLR) — fixed
     # ------------------------------------------------------------------ #
-    async def _call_specialist_plain(self, query: str, max_tokens: int = 8192) -> str:
+    async def _call_specialist_plain(
+        self, query: str, max_tokens: int = 8192
+    ) -> str:
         """Plain VibeThinker generation without CLR. Uses a real session."""
         session = await self._get_session()
         return await self.reasoner.generate_plain(session, query, max_tokens)
@@ -1341,7 +1398,9 @@ class HybridReasoningOrchestrator:
     # ------------------------------------------------------------------ #
     # Code specialist (dedicated fast code-generation model, e.g. ruvltra)
     # ------------------------------------------------------------------ #
-    async def _call_code_specialist(self, query: str, max_tokens: int = 4096) -> str:
+    async def _call_code_specialist(
+        self, query: str, max_tokens: int = 4096
+    ) -> str:
         """Call the dedicated code-specialist model via the OpenAI-compatible
         /v1/chat/completions endpoint. Falls back to /completion with ChatML
         if the chat endpoint fails. Raises RuntimeError if both fail.
@@ -1369,14 +1428,17 @@ class HybridReasoningOrchestrator:
                 data = await resp.json()
                 content = data["choices"][0]["message"]["content"]
                 if not content:
-                    raise RuntimeError("Code specialist returned empty response")
+                    raise RuntimeError(
+                        "Code specialist returned empty response")
                 return content
         except RuntimeError:
             raise
         except Exception as e:
-            print(f"[CodeSpecialist] chat endpoint failed ({e}), falling back to /completion")
+            print(f"[CodeSpecialist] chat endpoint failed ({e}), "
+                  f"falling back to /completion")
             payload = {
-                "prompt": f"<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n",
+                "prompt": f"<|im_start|>user\n{query}<|im_end|>\n"
+                          f"<|im_start|>assistant\n",
                 "n_predict": max_tokens,
                 "temperature": 0.2,
                 "top_p": 0.95,
@@ -1392,7 +1454,9 @@ class HybridReasoningOrchestrator:
                     data = await resp.json()
                     content = data.get("content", "")
                     if not content:
-                        raise RuntimeError("Code specialist returned empty response on fallback")
+                        raise RuntimeError(
+                            "Code specialist returned empty response "
+                            "on fallback")
                     return content
             except RuntimeError:
                 raise
@@ -1600,7 +1664,8 @@ class HybridReasoningOrchestrator:
                 prompt = (
                     self._TEST_SPEC_PROMPT.format(query=query)
                     + f"\n\n--- FEEDBACK ---\n"
-                    f"The previous test spec was rejected because: {feedback}\n"
+                    f"The previous test spec was rejected because: "
+                    f"{feedback}\n"
                     f"Write tests that actually call the functions/classes "
                     f"the solution should define. Do NOT use vacuous asserts "
                     f"like `assert True`."
@@ -1617,7 +1682,8 @@ class HybridReasoningOrchestrator:
             if not tests or "assert" not in tests:
                 feedback = "no assert statements found in the output"
                 print(f"[CodeLoop] Generalist produced no usable asserts "
-                      f"(attempt {attempt + 1}) — {'retrying' if attempt == 0 else 'giving up'}")
+                      f"(attempt {attempt + 1}) — "
+                      f"{'retrying' if attempt == 0 else 'giving up'}")
                 if attempt == 0:
                     continue
                 return None
@@ -1626,7 +1692,8 @@ class HybridReasoningOrchestrator:
                             "they must reference functions or variables from "
                             "the solution")
                 print(f"[CodeLoop] Generalist produced vacuous test spec "
-                      f"(attempt {attempt + 1}) — {'retrying' if attempt == 0 else 'giving up'}")
+                      f"(attempt {attempt + 1}) — "
+                      f"{'retrying' if attempt == 0 else 'giving up'}")
                 if attempt == 0:
                     continue
                 return None
@@ -1664,7 +1731,8 @@ class HybridReasoningOrchestrator:
             # If the mutation check itself errors, fail-safe: treat the
             # tests as NOT vacuous (don't reject a passing candidate on
             # an infrastructure error). Log the issue.
-            print(f"[CodeLoop] Mutation check errored (treating as non-vacuous): {e}")
+            print(f"[CodeLoop] Mutation check errored "
+                  f"(treating as non-vacuous): {e}")
             return False, {"operator": mutation.operator, "error": str(e)}
         details = {
             "operator": mutation.operator,
@@ -1724,7 +1792,8 @@ class HybridReasoningOrchestrator:
 
         # Without tests or a verifier, we cannot verify — fall back to plain.
         if tests is None:
-            print("[CodeLoop] No test spec — single-candidate unverified generation")
+            print("[CodeLoop] No test spec — single-candidate "
+                  "unverified generation")
             answer = await self._call_code_specialist(query)
             # v3.1: Sandbox fallback. If the Generalist fails to generate
             # unit tests, execute the candidate code in a sandbox (Wasm or
@@ -1781,7 +1850,8 @@ class HybridReasoningOrchestrator:
             # AST pass still runs but emits only a low 0.2 heuristic and a
             # loud "NOT a security boundary" warning.
             if self.allow_static_fallback:
-                print("[CodeLoop] WARNING: no sandbox available — falling back "
+                print("[CodeLoop] WARNING: no sandbox available — "
+                      "falling back "
                       "to AST static analysis (NOT a security boundary, "
                       "enabled via --allow-static-fallback)")
                 static_score, static_issues = _static_analysis_fallback(answer)
@@ -1791,12 +1861,15 @@ class HybridReasoningOrchestrator:
                     return OrchestratorResult(
                         final_answer=answer,
                         route_taken="code_specialist_unverified_static_only",
-                        specialist_used="Code Specialist (ruvltra-claude-code)",
+                        specialist_used=(
+                            "Code Specialist (ruvltra-claude-code)"),
                         clr_score=static_score,
                         routing_confidence=0.3,
                         raw_traces={
                             "verified": False,
-                            "reason": "no test spec generated — AST static analysis fallback (no sandbox available)",
+                            "reason": ("no test spec generated — AST "
+                                       "static analysis fallback (no "
+                                       "sandbox available)"),
                             "static_analysis": True,
                             "static_score": static_score,
                             "static_issues": static_issues,
@@ -1808,10 +1881,14 @@ class HybridReasoningOrchestrator:
             return OrchestratorResult(
                 final_answer=answer,
                 route_taken="code_specialist_unverified",
-                specialist_used="Code Specialist (ruvltra-claude-code)",
+                specialist_used=(
+                    "Code Specialist (ruvltra-claude-code)"),
                 clr_score=0.0,
                 routing_confidence=0.0,
-                raw_traces={"verified": False, "reason": "no test spec generated"},
+                raw_traces={
+                    "verified": False,
+                    "reason": "no test spec generated",
+                },
             )
 
         # --- Test-feedback loop: up to 2 attempts (initial + 1 retry) ---
@@ -1821,8 +1898,9 @@ class HybridReasoningOrchestrator:
         test_error_feedback: Optional[str] = None
         for attempt in range(2):
             if test_error_feedback is not None:
-                print(f"[CodeLoop] Tests crashed on attempt {attempt} — asking "
-                      f"generalist to rewrite tests with error feedback")
+                print(f"[CodeLoop] Tests crashed on attempt {attempt} — "
+                      f"asking generalist to rewrite tests with error "
+                      f"feedback")
                 tests = await self._generate_test_spec(
                     f"{query}\n\n--- TEST FEEDBACK ---\n"
                     f"The previous test spec crashed with this error:\n"
@@ -1838,27 +1916,36 @@ class HybridReasoningOrchestrator:
                     return OrchestratorResult(
                         final_answer=answer,
                         route_taken="code_specialist_unverified",
-                        specialist_used="Code Specialist (ruvltra-claude-code)",
+                        specialist_used=(
+                            "Code Specialist (ruvltra-claude-code)"),
                         clr_score=0.0,
                         routing_confidence=0.0,
                         raw_traces={
                             "verified": False,
-                            "reason": "test spec retry failed after TEST_ERROR",
+                            "reason": ("test spec retry failed after "
+                                       "TEST_ERROR"),
                         },
                     )
 
             # Generate N candidates in parallel with diverse temperatures.
-            # Prepend verified trajectories as few-shot context (self-improving).
+            # Prepend verified trajectories as few-shot context
+            # (self-improving).
             temps = [0.2] + [0.7] * (self.code_candidates - 1)
             few_shot = self._get_few_shot_context(query, task_type="code")
             query_with_ctx = f"{few_shot}\n{query}" if few_shot else query
-            gen_prompt = self._CODE_GEN_PROMPT.format(query=query_with_ctx, tests=tests)
+            gen_prompt = self._CODE_GEN_PROMPT.format(
+                query=query_with_ctx, tests=tests)
             if few_shot:
-                print(f"[CodeLoop] Retrieved verified examples as few-shot context")
+                print(f"[CodeLoop] Retrieved verified examples as "
+                      f"few-shot context")
             print(f"[CodeLoop] Generating {self.code_candidates} candidates + "
                   f"test spec verification (attempt {attempt + 1}/2)")
             candidates_raw = await asyncio.gather(
-                *[self._call_code_specialist(gen_prompt, max_tokens=2048) for _ in temps],
+                *[
+                    self._call_code_specialist(
+                        gen_prompt, max_tokens=2048)
+                    for _ in temps
+                ],
                 return_exceptions=True,
             )
             candidates = [
@@ -1869,10 +1956,14 @@ class HybridReasoningOrchestrator:
                 return OrchestratorResult(
                     final_answer="",
                     route_taken="code_specialist_failed",
-                    specialist_used="Code Specialist (ruvltra-claude-code)",
+                    specialist_used=(
+                        "Code Specialist (ruvltra-claude-code)"),
                     clr_score=0.0,
                     routing_confidence=0.0,
-                    raw_traces={"verified": False, "reason": "all candidate generations failed"},
+                    raw_traces={
+                        "verified": False,
+                        "reason": "all candidate generations failed",
+                    },
                 )
 
             # Verify each candidate against the test spec in the sandbox.
@@ -1888,7 +1979,8 @@ class HybridReasoningOrchestrator:
                 return idx, result
 
             verify_tasks = [
-                _verify_one(i, code) for i, (raw, code) in enumerate(candidates)
+                _verify_one(i, code)
+                for i, (raw, code) in enumerate(candidates)
             ]
             verify_results = await asyncio.gather(*verify_tasks)
 
@@ -1918,22 +2010,28 @@ class HybridReasoningOrchestrator:
                         # the test-feedback loop (same as TEST_ERROR).
                         test_error_count = len(candidates)
                         first_test_error = (
-                            f"VACUOUS_TESTS: mutation ({mutation_details['operator']}: "
-                            f"{mutation_details['description']}) still passed — "
-                            f"tests cannot distinguish correct from incorrect code"
+                            f"VACUOUS_TESTS: mutation ("
+                            f"{mutation_details['operator']}: "
+                            f"{mutation_details['description']}) still "
+                            f"passed — tests cannot distinguish correct "
+                            f"from incorrect code"
                         )
-                        verification_traces[-1]["mutation_check"] = mutation_details
+                        verification_traces[-1][
+                            "mutation_check"] = mutation_details
                         verification_traces[-1]["vacuous_tests"] = True
                         if attempt == 0:
                             test_error_feedback = first_test_error
-                            break  # break out of the candidate loop, retry tests
+                            break  # break out of the candidate loop,
+                            # retry tests
                         # Already retried — fall through to best-effort.
                         break
-                    print(f"[CodeLoop] Candidate {i} PASSED verification — returning")
+                    print(f"[CodeLoop] Candidate {i} PASSED verification "
+                          f"— returning")
                     return OrchestratorResult(
                         final_answer=candidates[i][1],
                         route_taken="code_specialist_verified",
-                        specialist_used="Code Specialist (ruvltra-claude-code)",
+                        specialist_used=(
+                            "Code Specialist (ruvltra-claude-code)"),
                         clr_score=1.0,
                         routing_confidence=1.0,
                         raw_traces={
@@ -1947,7 +2045,8 @@ class HybridReasoningOrchestrator:
                             "mutation_check": mutation_details,
                         },
                     )
-                print(f"[CodeLoop] Candidate {i} failed: {result.error or 'not verified'}")
+                print(f"[CodeLoop] Candidate {i} failed: "
+                      f"{result.error or 'not verified'}")
                 # Detect test-harness crashes (TEST_ERROR = the test itself is
                 # broken, not the candidate). IMPORT_ERROR and ASSERTION_FAILED
                 # are candidate problems — they don't trigger a test retry.
@@ -1988,7 +2087,8 @@ class HybridReasoningOrchestrator:
             repair_error: Optional[str] = None
             for i, result in verify_results:
                 if result.error and any(
-                    m in result.error for m in ("ASSERTION_FAILED", "IMPORT_ERROR")
+                    m in result.error
+                    for m in ("ASSERTION_FAILED", "IMPORT_ERROR")
                 ):
                     repair_idx = i
                     repair_error = result.error
@@ -1999,7 +2099,8 @@ class HybridReasoningOrchestrator:
             failing_code = candidates[repair_idx][1]
             print(f"[CodeLoop] Repair attempt {repair_attempt + 1}/"
                   f"{self.max_repair_attempts}: feeding error back to code "
-                  f"specialist (candidate {repair_idx} failed: {repair_error})")
+                  f"specialist (candidate {repair_idx} failed: "
+                  f"{repair_error})")
             repair_prompt = self._CODE_REPAIR_PROMPT.format(
                 query=query_with_ctx, tests=tests,
                 failing_code=failing_code, error=repair_error,
@@ -2043,14 +2144,17 @@ class HybridReasoningOrchestrator:
                     if vacuous:
                         print(f"[CodeLoop] Repaired candidate {i} passed but "
                               f"tests are VACUOUS — rejecting")
-                        verification_traces[-1]["mutation_check"] = mutation_details
+                        verification_traces[-1][
+                            "mutation_check"] = mutation_details
                         verification_traces[-1]["vacuous_tests"] = True
                         continue  # try next repair candidate
-                    print(f"[CodeLoop] Repaired candidate {i} PASSED — returning")
+                    print(f"[CodeLoop] Repaired candidate {i} PASSED "
+                          f"— returning")
                     return OrchestratorResult(
                         final_answer=repair_candidates[i][1],
                         route_taken="code_specialist_verified",
-                        specialist_used="Code Specialist (ruvltra-claude-code)",
+                        specialist_used=(
+                            "Code Specialist (ruvltra-claude-code)"),
                         clr_score=1.0,
                         routing_confidence=1.0,
                         raw_traces={
@@ -2075,7 +2179,8 @@ class HybridReasoningOrchestrator:
             repair_attempts_made = repair_attempt + 1
 
         # No candidate passed — return the first with honest score 0.0.
-        print(f"[CodeLoop] No candidate passed verification — returning best-effort (unverified)")
+        print(f"[CodeLoop] No candidate passed verification — "
+              f"returning best-effort (unverified)")
         return OrchestratorResult(
             final_answer=candidates[0][1],
             route_taken="code_specialist_unverified",
@@ -2131,7 +2236,10 @@ class HybridReasoningOrchestrator:
             "deterministic_check": clr_result.deterministic_verification,
         }
 
-    def _is_cacheable(self, clr_result: CLRResult, allow_weak_cache: bool = False) -> bool:
+    def _is_cacheable(
+        self, clr_result: CLRResult,
+        allow_weak_cache: bool = False,
+    ) -> bool:
         """Return True only if a CLR result is safe to cache.
 
         Uses the strict :func:`should_cache` policy by default:
@@ -2150,7 +2258,8 @@ class HybridReasoningOrchestrator:
         if not should_cache(result_dict, allow_weak_cache=allow_weak_cache):
             return False
         # Also respect the cache's own min_score threshold if set higher
-        if self.clr_cache is not None and clr_result.best_score < self.clr_cache.min_score:
+        if (self.clr_cache is not None
+                and clr_result.best_score < self.clr_cache.min_score):
             return False
         return True
 
@@ -2186,10 +2295,12 @@ class HybridReasoningOrchestrator:
 
         elif task_type == "code":
             # Extract code blocks from the query (```python ... ```)
-            code_blocks = re.findall(r"```(?:python)?\n(.*?)```", query, re.DOTALL)
+            code_blocks = re.findall(
+                r"```(?:python)?\n(.*?)```", query, re.DOTALL)
             if code_blocks:
                 context["expected_output"] = code_blocks[0].strip()
-            # Pass dynamic sandbox resource limits (v0.4.0) to the CodeVerifier.
+            # Pass dynamic sandbox resource limits (v0.4.0) to the
+            # CodeVerifier.
             # When present, the verifier sizes the sandbox accordingly instead
             # of using its hardcoded 128m / 5.0s defaults. Backward-compatible:
             # absent compute_limits -> the verifier uses its own defaults.
@@ -2206,12 +2317,14 @@ class HybridReasoningOrchestrator:
                 try:
                     sources = await self._retrieval_backend.search(query)
                 except Exception as e:
-                    print(f"[CLR] Retrieval failed: {e} — no sources (fail-closed)")
+                    print(f"[CLR] Retrieval failed: {e} — no sources "
+                          f"(fail-closed)")
                     sources = []
                 if sources:
                     context["sources"] = sources
                     print(f"[CLR] Retrieved {len(sources)} source(s) via "
-                          f"{self._retrieval_backend.name} for factual verification")
+                          f"{self._retrieval_backend.name} for factual "
+                          f"verification")
                 else:
                     print(f"[CLR] Retrieval returned no sources — "
                           f"verifier will return unsupported_factual")
@@ -2259,42 +2372,59 @@ class HybridReasoningOrchestrator:
     # constraints parse on the first try (reducing retry-loop trips).
     _LOGIC_CONSTRAINT_PROMPT = (
         "Translate the following logic problem into Z3 SMT constraints.\n"
-        "Output ONLY a JSON object with these keys (no explanation, no markdown):\n"
-        '  "constraints": list of Z3 assertion strings (e.g. "x > 0", "x + y == 10")\n'
-        '  "variables": object mapping variable names to their Z3 sort ("Int", "Real", or "Bool")\n'
-        '  "values": object mapping variable names to the answer\'s numeric values\n'
+        "Output ONLY a JSON object with these keys (no explanation, "
+        "no markdown):\n"
+        '  "constraints": list of Z3 assertion strings (e.g. "x > 0", '
+        '"x + y == 10")\n'
+        '  "variables": object mapping variable names to their Z3 sort '
+        '("Int", "Real", or "Bool")\n'
+        '  "values": object mapping variable names to the answer\'s '
+        'numeric values\n'
         "\n"
-        "Z3 syntax allowed in constraint strings (use these EXACT names, no z3. prefix):\n"
+        "Z3 syntax allowed in constraint strings (use these EXACT "
+        "names, no z3. prefix):\n"
         "  Arithmetic: + - * / == != > < >= <=\n"
-        "  Boolean: And(...) Or(...) Not(...) Implies(a, b) If(c, a, b) Xor(a, b)\n"
-        "  Every variable referenced in a constraint MUST be declared in \"variables\".\n"
+        "  Boolean: And(...) Or(...) Not(...) Implies(a, b) "
+        "If(c, a, b) Xor(a, b)\n"
+        "  Every variable referenced in a constraint MUST be declared "
+        'in "variables".\n'
         "\n"
-        "CRITICAL — \"values\" MUST be JSON numbers or booleans, NEVER words or strings:\n"
+        "CRITICAL — \"values\" MUST be JSON numbers or booleans, NEVER "
+        "words or strings:\n"
         '  RIGHT: "values": {{"x": 7, "y": 3}}        (integers)\n'
         '  RIGHT: "values": {{"raining": 0}}          (boolean as 0/1)\n'
-        '  WRONG: "values": {{"x": "seven"}}          (string word — rejected)\n'
-        '  WRONG: "values": {{"x": "7"}}              (quoted number — rejected)\n'
-        "  If a value is unknown, omit it from \"values\" rather than using a word.\n"
-        "  Non-numeric values cause the verifier to fail-closed (drop all values).\n"
+        '  WRONG: "values": {{"x": "seven"}}          (string word — '
+        'rejected)\n'
+        '  WRONG: "values": {{"x": "7"}}              (quoted number — '
+        'rejected)\n'
+        "  If a value is unknown, omit it from \"values\" rather than "
+        "using a word.\n"
+        "  Non-numeric values cause the verifier to fail-closed (drop "
+        "all values).\n"
         "\n"
         "Examples:\n"
         "\n"
         'Problem: "I have 3 apples and give 1 away. How many do I have?"\n'
         "Output:\n"
-        '{{"constraints": ["apples == 3", "given == 1", "remaining == apples - given"], '
-        '"variables": {{"apples": "Int", "given": "Int", "remaining": "Int"}}, '
+        '{{"constraints": ["apples == 3", "given == 1", '
+        '"remaining == apples - given"], '
+        '"variables": {{"apples": "Int", "given": "Int", '
+        '"remaining": "Int"}}, '
         '"values": {{"apples": 3, "given": 1, "remaining": 2}}}}\n'
         "\n"
-        'Problem: "If it is raining then the ground is wet. The ground is not wet. Is it raining?"\n'
+        'Problem: "If it is raining then the ground is wet. The ground '
+        'is not wet. Is it raining?"\n'
         "Output:\n"
         '{{"constraints": ["Implies(raining, wet)", "Not(wet)"], '
         '"variables": {{"raining": "Bool", "wet": "Bool"}}, '
         '"values": {{"raining": 0}}}}\n'
         "\n"
-        'Problem: "If x is a positive integer and x + y = 10 and y < x, what are x and y?"\n'
+        'Problem: "If x is a positive integer and x + y = 10 and y < x, '
+        'what are x and y?"\n'
         "Output:\n"
         '{{"constraints": ["x > 0", "x + y == 10", "y < x"], '
-        '"variables": {{"x": "Int", "y": "Int"}}, "values": {{"x": 7, "y": 3}}}}\n'
+        '"variables": {{"x": "Int", "y": "Int"}}, '
+        '"values": {{"x": 7, "y": 3}}}}\n'
         "\n"
         "Problem: {query}\n"
         "Output:"
@@ -2332,7 +2462,10 @@ class HybridReasoningOrchestrator:
             # Strip markdown code fences if present.
             if text.startswith("```"):
                 lines = text.split("\n")
-                text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+                text = "\n".join(
+                    lines[1:-1]
+                    if lines[-1].strip() == "```"
+                    else lines[1:])
             # Find the first { and last } to extract the JSON object.
             start = text.find("{")
             end = text.rfind("}")
@@ -2460,8 +2593,10 @@ class HybridReasoningOrchestrator:
             if cached is not None:
                 # Double-check the cached answer isn't a known-bad sentinel.
                 # (Defensive: old cache files may contain bad entries.)
-                if (cached["best_answer"] or "").strip().lower() in self._UNCACHEABLE_ANSWERS:
-                    print(f"[CLRCache] HIT but answer is uncacheable sentinel — ignoring cache")
+                if ((cached["best_answer"] or "").strip().lower()
+                        in self._UNCACHEABLE_ANSWERS):
+                    print(f"[CLRCache] HIT but answer is uncacheable "
+                          f"sentinel — ignoring cache")
                 else:
                     print(
                         f"[CLRCache] HIT (sim={cached['similarity']:.3f}, "
@@ -2474,7 +2609,9 @@ class HybridReasoningOrchestrator:
                             best_raw_trace="<cached>",
                             all_trajectories=[],
                             k=cached.get("k") or self.reasoner.k,
-                            verification_method=cached.get("verification_method", "self_claims_only"),
+                            verification_method=cached.get(
+                                "verification_method",
+                                "self_claims_only"),
                             verified=cached.get("verified", False),
                         ),
                         True,
@@ -2493,11 +2630,18 @@ class HybridReasoningOrchestrator:
             compute_limits=decision.get("compute_limits"),
         )
         if verifier is not None:
-            ctx_desc = ", ".join(f"{k}={v!r}" for k, v in verifier_context.items() if v)
-            print(f"[CLR] Selected verifier: {verifier.name} (task_type={task_type})"
-                  f"{f', context: {ctx_desc}' if ctx_desc else ', no derivable context'}")
+            ctx_desc = ", ".join(
+                f"{k}={v!r}"
+                for k, v in verifier_context.items() if v)
+            ctx_part = (
+                f", context: {ctx_desc}"
+                if ctx_desc
+                else ", no derivable context")
+            print(f"[CLR] Selected verifier: {verifier.name} "
+                  f"(task_type={task_type}){ctx_part}")
         else:
-            print(f"[CLR] No verifier for task_type={task_type} — self-claims-only cap applies")
+            print(f"[CLR] No verifier for task_type={task_type} — "
+                  f"self-claims-only cap applies")
 
         # Retrieve verified trajectories as few-shot context (self-improving
         # memory). The model sees prior verified solutions to similar problems
@@ -2506,7 +2650,12 @@ class HybridReasoningOrchestrator:
         few_shot = self._get_few_shot_context(query, task_type=task_type)
         query_with_context = f"{few_shot}\n{query}" if few_shot else query
         if few_shot:
-            print(f"[TrajectoryStore] Retrieved {min(self.trajectory_store.max_few_shot, len(self.trajectory_store.retrieve(query, task_type)))} "
+            retrieved = self.trajectory_store.retrieve(
+                query, task_type)
+            count = min(
+                self.trajectory_store.max_few_shot,
+                len(retrieved))
+            print(f"[TrajectoryStore] Retrieved {count} "
                   f"verified examples as few-shot context")
 
         clr_result = await self.reasoner.run(
@@ -2516,7 +2665,8 @@ class HybridReasoningOrchestrator:
 
         # Insert into cache ONLY if the result is cacheable per the strict
         # should_cache policy. Weak self-verification is NOT cached by default.
-        if self.use_clr_cache and self.clr_cache is not None and self._is_cacheable(clr_result):
+        if (self.use_clr_cache and self.clr_cache is not None
+                and self._is_cacheable(clr_result)):
             result_dict = self._build_cache_result_dict(clr_result)
             claim_count = result_dict["claim_count"]
 
@@ -2535,15 +2685,18 @@ class HybridReasoningOrchestrator:
                 transport_failures=clr_result.transport_failures,
                 model_failures=clr_result.model_failures,
             )
-            print(f"[CLRCache] Stored result (score={clr_result.best_score:.3f}, "
-                  f"claims={claim_count}, method={clr_result.verification_method}, "
+            print(f"[CLRCache] Stored result "
+                  f"(score={clr_result.best_score:.3f}, "
+                  f"claims={claim_count}, "
+                  f"method={clr_result.verification_method}, "
                   f"verified={clr_result.verified})")
         elif self.use_clr_cache and self.clr_cache is not None:
             print(
-                f"[CLRCache] NOT caching (score={clr_result.best_score:.3f}, "
-                  f"method={clr_result.verification_method}, "
-                  f"verified={clr_result.verified}, "
-                  f"answer={clr_result.best_answer[:40]!r}...)"
+                f"[CLRCache] NOT caching "
+                f"(score={clr_result.best_score:.3f}, "
+                f"method={clr_result.verification_method}, "
+                f"verified={clr_result.verified}, "
+                f"answer={clr_result.best_answer[:40]!r}...)"
             )
 
         return clr_result, False
@@ -2586,7 +2739,8 @@ class HybridReasoningOrchestrator:
             method = clr_result.verification_method
         elif result.raw_traces.get("verified"):
             verified = True
-            method = result.raw_traces.get("verification_method", "self_claims_only")
+            method = result.raw_traces.get(
+                "verification_method", "self_claims_only")
 
         if not verified or method == "self_claims_only":
             return  # Never learn from unverified or self-claimed results
@@ -2635,11 +2789,13 @@ class HybridReasoningOrchestrator:
 
                 # 1. Try Rust-native embeddings from the RuvLLMBinding.
                 local_llm = getattr(self.reasoner, "_local_llm", None)
-                if local_llm is not None and hasattr(local_llm, "get_embeddings"):
+                if (local_llm is not None
+                        and hasattr(local_llm, "get_embeddings")):
                     q_emb = local_llm.get_embeddings(query)
                     a_emb = local_llm.get_embeddings(result.final_answer)
 
-                # 2. Fall back to sentence-transformers for any missing embeddings.
+                # 2. Fall back to sentence-transformers for any missing
+                # embeddings.
                 model = getattr(self.trajectory_store, "model", None)
                 if q_emb is None and model is not None:
                     q_emb = model.encode([query])[0].tolist()
@@ -2703,7 +2859,8 @@ class HybridReasoningOrchestrator:
             dim = 384  # default embedding dim
             zero_query = [0.0] * dim
             _EXPORT_LIMIT = 100000
-            patterns = self._sona_recorder.search_patterns(zero_query, _EXPORT_LIMIT)
+            patterns = self._sona_recorder.search_patterns(
+                zero_query, _EXPORT_LIMIT)
             if len(patterns) >= _EXPORT_LIMIT:
                 print(f"[SONA] Warning: export hit limit ({_EXPORT_LIMIT}), "
                       f"some patterns may be truncated")
@@ -2730,7 +2887,9 @@ class HybridReasoningOrchestrator:
                 import uuid as _uuid
                 centroid = p.get("centroid", [])
                 quality = p.get("avg_quality", 0.5)
-                if isinstance(centroid, list) and centroid and isinstance(quality, (int, float)) and quality > 0:
+                if (isinstance(centroid, list) and centroid
+                        and isinstance(quality, (int, float))
+                        and quality > 0):
                     self._sona_recorder.record(
                         request_id=str(_uuid.uuid4()),
                         session_id="global_sync",
@@ -2781,7 +2940,8 @@ class HybridReasoningOrchestrator:
                     f"{self._sona_sync_url}/api/sona/sync",
                 ) as resp:
                     global_data = await resp.json()
-                    global_data = self._decrypt_federation_response(global_data)
+                    global_data = (
+                        self._decrypt_federation_response(global_data))
 
             # Import global patterns.
             global_patterns = global_data.get("patterns", [])
@@ -2810,7 +2970,10 @@ class HybridReasoningOrchestrator:
             await _asyncio.sleep(self._sona_sync_interval)
             await self.sona_sync_once()
 
-    def _get_few_shot_context(self, query: str, task_type: Optional[str] = None) -> str:
+    def _get_few_shot_context(
+        self, query: str,
+        task_type: Optional[str] = None,
+    ) -> str:
         """Retrieve verified trajectories as few-shot context for the query.
 
         Returns a string to prepend to the model prompt, or "" if no similar
@@ -2818,7 +2981,8 @@ class HybridReasoningOrchestrator:
         """
         if not self.use_trajectory_store or self.trajectory_store is None:
             return ""
-        return self.trajectory_store.build_few_shot_prefix(query, task_type=task_type)
+        return self.trajectory_store.build_few_shot_prefix(
+            query, task_type=task_type)
 
     # ------------------------------------------------------------------ #
     # Trajectory synthesis (v0.4.0) — memory pruning
@@ -2826,7 +2990,8 @@ class HybridReasoningOrchestrator:
     async def _reverify_synthesized_master(
         self, master: str, children: List[Dict[str, Any]],
     ) -> bool:
-        """Re-verify a synthesized master against the children's ground truths (v3.1).
+        """Re-verify a synthesized master against the children's ground
+        truths (v3.1).
 
         For each child trajectory, the master is run against the child's
         verification context (unit_tests for code, expected_answer for math).
@@ -2882,8 +3047,9 @@ class HybridReasoningOrchestrator:
                     child["query"], master, vctx,
                 )
                 if not result.verified:
-                    print(f"[Synthesis] Master failed re-verification against "
-                          f"child {child['query'][:50]!r}: {result.error or 'not verified'}")
+                    print(f"[Synthesis] Master failed re-verification "
+                          f"against child {child['query'][:50]!r}: "
+                          f"{result.error or 'not verified'}")
                     return False
             except Exception as e:
                 print(f"[Synthesis] Re-verification error for child "
@@ -2983,8 +3149,9 @@ class HybridReasoningOrchestrator:
             return empty_synthesis_result(ok=True)
 
         clusters = clusters[:max_clusters]
-        print(f"[Synthesis] Found {len(clusters)} cluster(s) to synthesize "
-              f"(similarity >= {similarity_threshold}, min_size {min_cluster_size})")
+        print(f"[Synthesis] Found {len(clusters)} cluster(s) to "
+              f"synthesize (similarity >= {similarity_threshold}, "
+              f"min_size {min_cluster_size})")
 
         masters_stored = 0
         masters_reverified = 0
@@ -3006,7 +3173,7 @@ class HybridReasoningOrchestrator:
 
             # Build the examples string for the generalist.
             examples = "\n\n".join(
-                f"Problem {i+1}: {e['query']}\n"
+                f"Problem {i + 1}: {e['query']}\n"
                 f"Verified answer: {e['answer']}\n"
                 f"(verified via {e.get('verification_method', '?')})"
                 for i, e in enumerate(entries)
@@ -3057,7 +3224,8 @@ class HybridReasoningOrchestrator:
                       f"{len(entries)} trajectories into 1 RE-VERIFIED master "
                       f"(synthesized_and_proven)")
             else:
-                # Store the synthesized master (NOT verified — provenance only).
+                # Store the synthesized master (NOT verified —
+                # provenance only).
                 self.trajectory_store.store_synthesized(
                     query=representative["query"],
                     answer=master_text,
@@ -3065,8 +3233,9 @@ class HybridReasoningOrchestrator:
                     source_count=len(entries),
                     source_queries=source_queries,
                 )
-                print(f"[Synthesis] Cluster {cluster_idx}: synthesized "
-                      f"{len(entries)} trajectories into 1 master (unverified)")
+                print(f"[Synthesis] Cluster {cluster_idx}: "
+                      f"synthesized {len(entries)} trajectories into 1 "
+                      f"master (unverified)")
             masters_stored += 1
 
             # Mark the raw entries for removal. Adjust indices for already-
@@ -3104,7 +3273,8 @@ class HybridReasoningOrchestrator:
         Eager session creation avoids a lazy-init race where multiple
         concurrent first-requests each create overlapping sessions.
         """
-        # Eagerly create the shared HTTP session (must be inside the event loop).
+        # Eagerly create the shared HTTP session (must be inside the
+        # event loop).
         async with self._session_lock:
             if self._http_session is None or self._http_session.closed:
                 self._http_session = aiohttp.ClientSession()
@@ -3112,7 +3282,8 @@ class HybridReasoningOrchestrator:
             await self._warm_pool.start()
 
     async def cleanup(self) -> None:
-        """Clean up background resources (warm Docker pool, shared HTTP session).
+        """Clean up background resources (warm Docker pool, shared HTTP
+        session).
 
         Call this when shutting down to remove warm containers and close the
         shared aiohttp session.
@@ -3126,33 +3297,42 @@ class HybridReasoningOrchestrator:
     # ------------------------------------------------------------------ #
     # Main entry point
     # ------------------------------------------------------------------ #
-    async def run(self, query: str, force_route: Optional[str] = None) -> OrchestratorResult:
+    async def run(
+        self, query: str,
+        force_route: Optional[str] = None,
+    ) -> OrchestratorResult:
         if force_route:
             route, confidence = force_route, 1.0
         else:
             route, confidence = self._classify_route(query)
 
-        print(f"\n[Orchestrator] Route: {route.upper()} (conf={confidence:.3f})")
+        print(f"\n[Orchestrator] Route: {route.upper()} "
+              f"(conf={confidence:.3f})")
 
         if route == "specialist":
             # If a dedicated code specialist is configured and this is a code
             # task, route to it. When a code verifier is available, run the
-            # multi-candidate sandbox-verified loop; otherwise plain generation.
+            # multi-candidate sandbox-verified loop; otherwise plain
+            # generation.
             # Math/reasoning still uses VibeThinker CLR.
             if self.code_specialist_endpoint:
                 task_type, _, _ = self._detect_task_type(query)
                 if task_type == "code":
                     if self.code_verifier is not None:
-                        print("[Orchestrator] Code task -> code specialist + sandbox verification")
-                        result = await self._run_code_specialist_verified(query)
+                        print("[Orchestrator] Code task -> code "
+                              "specialist + sandbox verification")
+                        result = await (
+                            self._run_code_specialist_verified(query))
                         self._store_if_verified(query, result)
                         return result
-                    print("[Orchestrator] Code task -> code specialist (no verifier)")
+                    print("[Orchestrator] Code task -> code "
+                          "specialist (no verifier)")
                     answer = await self._call_code_specialist(query)
                     return OrchestratorResult(
                         final_answer=answer,
                         route_taken="code_specialist",
-                        specialist_used="Code Specialist (ruvltra-claude-code)",
+                        specialist_used=(
+                            "Code Specialist (ruvltra-claude-code)"),
                         routing_confidence=confidence,
                         raw_traces={"task_type": task_type},
                     )
@@ -3160,11 +3340,15 @@ class HybridReasoningOrchestrator:
                 clr_result, cache_hit = await self._run_clr_with_cache(query)
                 result = OrchestratorResult(
                     final_answer=clr_result.best_answer,
-                    route_taken="specialist_clr_cached" if cache_hit else "specialist_clr",
+                    route_taken=("specialist_clr_cached"
+                                 if cache_hit else "specialist_clr"),
                     specialist_used="VibeThinker-3B + CLR",
                     clr_score=clr_result.best_score,
                     routing_confidence=confidence,
-                    raw_traces={"clr_result": self._trim_clr(clr_result), "cache_hit": cache_hit},
+                    raw_traces={
+                        "clr_result": self._trim_clr(clr_result),
+                        "cache_hit": cache_hit,
+                    },
                 )
                 self._store_if_verified(query, result, clr_result=clr_result)
                 return result
@@ -3187,7 +3371,8 @@ class HybridReasoningOrchestrator:
             )
 
         else:  # hybrid
-            print("[Orchestrator] Hybrid path: Generalist plans -> Specialist solves -> Generalist synthesizes")
+            print("[Orchestrator] Hybrid path: Generalist plans -> "
+                  "Specialist solves -> Generalist synthesizes")
 
             plan = await self._call_generalist(
                 f"Break this query into sub-problems and identify which need "
@@ -3195,7 +3380,8 @@ class HybridReasoningOrchestrator:
             )
 
             if self.use_clr:
-                specialist_result, cache_hit = await self._run_clr_with_cache(query)
+                specialist_result, cache_hit = (
+                    await self._run_clr_with_cache(query))
                 specialist_answer = specialist_result.best_answer
                 specialist_score = specialist_result.best_score
                 specialist_trace = self._trim_clr(specialist_result)
@@ -3205,10 +3391,13 @@ class HybridReasoningOrchestrator:
                 specialist_score = None
                 specialist_trace = {"raw": specialist_answer}
 
+            score_str = (specialist_score
+                         if specialist_score is not None
+                         else 'n/a')
             final = await self._call_generalist(
                 f"Using this plan: {plan}\n"
                 f"And this high-quality reasoning result (score "
-                f"{specialist_score if specialist_score is not None else 'n/a'}): "
+                f"{score_str}): "
                 f"{specialist_answer}\n"
                 f"Synthesize the final answer for the original query."
             )
@@ -3247,7 +3436,10 @@ class HybridReasoningOrchestrator:
             ],
         }
 
-    def log_to_memory(self, result: OrchestratorResult, query: str, path: str = "orchestrator_memory.jsonl"):
+    def log_to_memory(
+        self, result: OrchestratorResult, query: str,
+        path: str = "orchestrator_memory.jsonl",
+    ):
         """Hook for your memory system / immutable vault."""
         log_entry = {
             "timestamp": result.timestamp,
@@ -3263,7 +3455,8 @@ class HybridReasoningOrchestrator:
                 f.write(json.dumps(log_entry) + "\n")
             print(f"[Memory] Logged to {path}")
         except (TypeError, ValueError) as e:
-            # Fall back to a trimmed entry if raw_traces isn't JSON-serializable
+            # Fall back to a trimmed entry if raw_traces isn't
+            # JSON-serializable
             log_entry["raw_traces"] = "<non-serializable>"
             with open(path, "a") as f:
                 f.write(json.dumps(log_entry) + "\n")
@@ -3275,7 +3468,8 @@ class HybridReasoningOrchestrator:
 async def main():
     orchestrator = HybridReasoningOrchestrator(
         vibe_endpoint="http://127.0.0.1:8080",
-        generalist_endpoint="http://127.0.0.1:8081",  # <- change to your generalist
+        generalist_endpoint="http://127.0.0.1:8081",  # <- change to
+        # your generalist
         use_clr=True,
         clr_k=8,
         use_embedding_router=True,
@@ -3284,7 +3478,8 @@ async def main():
 
     queries = [
         "Solve the recurrence: a_1=2, a_{n+1}=a_n^2 - a_n + 1. Find a_5.",
-        "Explain the history of the Riemann Hypothesis and its current status.",
+        "Explain the history of the Riemann Hypothesis and its "
+        "current status.",
         "A complex problem involving both math and conceptual understanding.",
     ]
 
