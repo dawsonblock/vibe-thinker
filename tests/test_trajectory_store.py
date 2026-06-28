@@ -7,12 +7,22 @@ These tests verify:
   - Few-shot context is built correctly
   - task_type filtering works (math examples don't pollute code queries)
   - Trust re-checking on retrieval rejects stale/corrupt entries
+
+These tests require the embeddings extra (numpy + sentence-transformers)
+for semantic retrieval. They skip cleanly when numpy is absent.
 """
 
 import os
 import tempfile
 
 import pytest
+
+pytestmark = pytest.mark.embeddings
+
+# numpy is needed for the embedding matrix operations. The store itself
+# can construct in NONE mode without numpy, but these tests exercise the
+# semantic retrieval path which requires it.
+pytest.importorskip("numpy", reason="requires numpy for trajectory store semantic retrieval tests")
 
 from persistent_cache import VerifiedTrajectoryStore
 

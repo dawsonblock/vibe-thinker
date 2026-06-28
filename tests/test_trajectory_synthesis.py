@@ -7,7 +7,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 pytestmark = pytest.mark.embeddings
 
-import numpy as np
+# numpy is an embeddings-extra dependency; skip cleanly when absent so
+# collection does not crash without the embeddings extra.
+pytest.importorskip("numpy", reason="requires numpy for trajectory synthesis tests")
+import numpy as np  # noqa: E402
 
 from persistent_cache import VerifiedTrajectoryStore, _clear_embedding_model_cache
 

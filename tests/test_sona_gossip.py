@@ -8,6 +8,9 @@ import pytest
 
 pytestmark = [pytest.mark.web, pytest.mark.federation]
 
+# federation_server imports fastapi at module load time.
+pytest.importorskip("fastapi", reason="requires fastapi for SONA federation tests")
+
 from federation_server import create_federation_app
 
 

@@ -1123,8 +1123,10 @@ class TestLogicTranslationRetry:
         o._translate_logic_constraints.assert_called_once()
 
     @pytest.mark.asyncio
+    @pytest.mark.logic
     async def test_retry_on_parse_error(self):
         """When the first translation has a parse error, retry with feedback."""
+        pytest.importorskip("z3", reason="requires z3-solver for constraint parse validation")
         o = self._make_orch()
         # First call: invalid Z3 syntax. Second call: valid.
         o._translate_logic_constraints = AsyncMock(side_effect=[
@@ -1145,9 +1147,11 @@ class TestLogicTranslationRetry:
         assert o._translate_logic_constraints.call_count == 2
 
     @pytest.mark.asyncio
+    @pytest.mark.logic
     async def test_exhausted_retries_returns_best_effort(self):
         """When all retries fail, return the last (invalid) result —
         the LogicVerifier will catch the parse error at verification time."""
+        pytest.importorskip("z3", reason="requires z3-solver for constraint parse validation")
         o = self._make_orch()
         o._translate_logic_constraints = AsyncMock(return_value={
             "constraints": ["bad !!!"],
@@ -1165,9 +1169,11 @@ class TestLogicTranslationRetry:
         assert o._translate_logic_constraints.call_count == 3
 
     @pytest.mark.asyncio
+    @pytest.mark.logic
     async def test_none_translation_no_retry_wasted(self):
         """When _translate_logic_constraints returns None (network/JSON
         error), retry once with feedback, but don't waste all retries."""
+        pytest.importorskip("z3", reason="requires z3-solver for constraint parse validation")
         o = self._make_orch()
         o._translate_logic_constraints = AsyncMock(return_value=None)
         result = await o._translate_logic_constraints_with_retry(
@@ -1178,8 +1184,10 @@ class TestLogicTranslationRetry:
         assert o._translate_logic_constraints.call_count == 3
 
     @pytest.mark.asyncio
+    @pytest.mark.logic
     async def test_retry_feedback_contains_parse_error(self):
         """The retry prompt should include the specific Z3 parse error."""
+        pytest.importorskip("z3", reason="requires z3-solver for constraint parse validation")
         o = self._make_orch()
         o._translate_logic_constraints = AsyncMock(side_effect=[
             {

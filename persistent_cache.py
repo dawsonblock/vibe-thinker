@@ -29,6 +29,7 @@ import threading
 import uuid as _uuid
 from collections import OrderedDict
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
 from vector_store import VectorStore, LocalVectorStore, make_vector_store
@@ -61,6 +62,66 @@ except ImportError:
                 "sentence-transformers is not installed. "
                 "Install with: pip install sentence-transformers"
             )
+
+
+# ====================================================================== #
+# Cache similarity mode (Phase 5 — decouple cache from embeddings)
+# ====================================================================== #
+class CacheSimilarityMode(str, Enum):
+    """Three-level similarity mode for the semantic caches.
+
+    NONE       — no similarity search; exact string-match cache only.
+                 Works with zero optional dependencies. This is the
+                 safe default for minimal installs.
+    HASH       — lexical/fingerprint similarity using stdlib only.
+                 No external deps. Coarser than embeddings but better
+                 than exact match for near-duplicate queries.
+    EMBEDDINGS — semantic similarity via sentence-transformers +
+                 scikit-learn + numpy. Requires the ``embeddings`` extra.
+                 Raises RuntimeError if requested but unavailable.
+    """
+
+    NONE = "none"
+    HASH = "hash"
+    EMBEDDINGS = "embeddings"
+
+
+def get_sentence_transformer_class():
+    """Return the SentenceTransformer class if available, else None.
+
+    Used by the cache constructors to decide whether embedding-based
+    similarity is possible without raising at import time.
+    """
+    try:
+        from sentence_transformers import SentenceTransformer as _ST
+        return _ST
+    except Exception:
+        return None
+
+
+def _resolve_similarity_mode(
+    similarity_mode: Optional[CacheSimilarityMode],
+    vector_store: Optional[VectorStore],
+) -> CacheSimilarityMode:
+    """Resolve the effective similarity mode.
+
+    Precedence:
+      1. Explicit similarity_mode (if not None) — caller's choice.
+      2. Injected vector_store → EMBEDDINGS (the store handles vectors).
+      3. Auto-detect: EMBEDDINGS if deps available, else NONE.
+
+    This preserves backward compatibility: existing callers that don't
+    pass similarity_mode get EMBEDDINGS when deps are present (the
+    historical behavior) and NONE when they're absent (instead of
+    raising ImportError).
+    """
+    if similarity_mode is not None:
+        return similarity_mode
+    if vector_store is not None:
+        return CacheSimilarityMode.EMBEDDINGS
+    if EMBEDDINGS_AVAILABLE:
+        return CacheSimilarityMode.EMBEDDINGS
+    return CacheSimilarityMode.NONE
 
 
 # ====================================================================== #
@@ -394,17 +455,18 @@ class CLRResultCache:
         agentdb_url: Optional[str] = None,
         agentdb_collection: str = "clr_results",
         agentdb_only: bool = False,
+        similarity_mode: Optional[CacheSimilarityMode] = None,
     ):
-        # Phase 3 (stabilization): when a vector_store is injected, don't
-        # require the heavy embedding deps if the vector_store can handle
-        # its own embedding generation. However, LocalVectorStore and
-        # AgentDBVectorStore still need pre-computed embeddings for
-        # indexing, so we still load the embedding model when available.
-        # The key change: we don't RAISE ImportError when a vector_store
-        # is provided — the caller may have a custom store that handles
-        # embeddings internally. If embeddings are needed but not
-        # available, the insert/search methods will fail at runtime with
-        # a clear error instead of failing at construction.
+        # Phase 5 (stabilization): decouple the cache from embeddings.
+        # The cache has three similarity modes (see CacheSimilarityMode):
+        #   NONE       — exact string-match only, zero optional deps.
+        #   HASH       — lexical/fingerprint similarity, stdlib only.
+        #   EMBEDDINGS — semantic similarity, requires the embeddings extra.
+        # When similarity_mode is None (default), auto-detect: EMBEDDINGS
+        # if deps are available, else NONE. This preserves backward
+        # compatibility (existing callers get semantic search when deps
+        # are present) while allowing clean minimal installs to construct
+        # the cache without raising ImportError.
         self._vector_store: Optional[VectorStore] = vector_store
         if self._vector_store is None and agentdb_url:
             self._vector_store = make_vector_store(
@@ -412,12 +474,21 @@ class CLRResultCache:
                 collection=agentdb_collection,
             )
 
-        if not EMBEDDINGS_AVAILABLE and self._vector_store is None:
-            raise ImportError(
-                "CLRResultCache needs: pip install sentence-transformers "
-                "scikit-learn numpy  (OR provide vector_store= for a "
-                "custom similarity backend)"
-            )
+        self.similarity_mode = _resolve_similarity_mode(
+            similarity_mode, self._vector_store
+        )
+
+        # If EMBEDDINGS mode is explicitly requested but deps are missing,
+        # raise a clear RuntimeError (not a silent fallback to NONE — the
+        # caller asked for semantic search and should know it's unavailable).
+        if self.similarity_mode == CacheSimilarityMode.EMBEDDINGS:
+            cls = get_sentence_transformer_class()
+            if cls is None and self._vector_store is None:
+                raise RuntimeError(
+                    "Embedding similarity mode requires sentence-transformers. "
+                    "Install with: pip install -e '.[embeddings]'"
+                )
+
         self.path = path
         self.model_name = model_name
         self.similarity_threshold = similarity_threshold
@@ -425,15 +496,17 @@ class CLRResultCache:
         self.max_entries = max_entries
         self.autosave = autosave
 
-        # Load the embedding model when available (needed for generating
-        # entry/query embeddings even when a vector_store is injected,
-        # since LocalVectorStore/AgentDBVectorStore store pre-computed
-        # vectors, not raw text).
-        self.model = (
-            get_shared_embedding_model(model_name)
-            if EMBEDDINGS_AVAILABLE
-            else None
-        )
+        # Load the embedding model only when in EMBEDDINGS mode (or when a
+        # vector_store is injected — it needs pre-computed embeddings for
+        # indexing). In NONE/HASH mode, no embedding model is loaded.
+        if self.similarity_mode == CacheSimilarityMode.EMBEDDINGS:
+            self.model = (
+                get_shared_embedding_model(model_name)
+                if EMBEDDINGS_AVAILABLE
+                else None
+            )
+        else:
+            self.model = None
         self.entries: List[Dict[str, Any]] = []
         self._embeddings_matrix: Optional[Any] = None  # np.ndarray, rebuilt on load
         self._save_lock = threading.Lock()  # Phase 5: prevent concurrent save races
@@ -476,15 +549,49 @@ class CLRResultCache:
         the trust model (schema_version < 3, self_claims_only with high
         score, missing verification metadata) are silently rejected.
 
+        In NONE similarity mode (no embeddings), performs exact string
+        matching only — returns a cached result only if the exact same
+        problem string was previously cached. In EMBEDDINGS mode, performs
+        semantic similarity search above ``similarity_threshold``.
+
         Args:
             problem: the query to look up.
             allow_weak_cache: if True, allow self_claims_only entries
                 through lookup. Default is False.
         """
-        if not self.entries or self._embeddings_matrix is None:
+        if not self.entries:
             return None
-        if self.model is None:
+
+        # Exact-match path (NONE mode, or when no embedding model is
+        # available). This lets the cache work as a basic exact cache
+        # without any optional dependencies.
+        if self.similarity_mode == CacheSimilarityMode.NONE or self.model is None or self._embeddings_matrix is None:
+            for entry in self.entries:
+                if entry.get("problem") != problem:
+                    continue
+                if entry.get("best_score", 0) < self.min_score:
+                    continue
+                if not is_cache_entry_trustworthy(entry, allow_weak_cache=allow_weak_cache):
+                    continue
+                entry["access_count"] = entry.get("access_count", 0) + 1
+                if self.autosave:
+                    self.save()
+                return {
+                    "best_answer": entry["best_answer"],
+                    "best_score": entry["best_score"],
+                    "k": entry.get("k"),
+                    "timestamp": entry.get("timestamp"),
+                    "trajectory_count": entry.get("trajectory_count"),
+                    "verification_method": entry.get("verification_method", "self_claims_only"),
+                    "verified": entry.get("verified", False),
+                    "schema_version": entry.get("schema_version", 1),
+                    "cached": True,
+                    "similarity": 1.0,
+                    "matched_problem": entry["problem"],
+                }
             return None
+
+        # Semantic similarity path (EMBEDDINGS mode).
         q_emb = self.model.encode([problem])[0].reshape(1, -1)
         sims = cosine_similarity(q_emb, self._embeddings_matrix)[0]
         # Search entries in order of similarity, return the first
@@ -671,10 +778,12 @@ class VerifiedTrajectoryStore:
         agentdb_url: Optional[str] = None,
         agentdb_collection: str = "trajectories",
         agentdb_only: bool = False,
+        similarity_mode: Optional[CacheSimilarityMode] = None,
     ):
-        # Phase 3 (stabilization): when a vector_store is injected, don't
-        # require the heavy embedding deps at construction time. See
-        # CLRResultCache.__init__ for the same pattern.
+        # Phase 5 (stabilization): decouple from embeddings. See
+        # CLRResultCache.__init__ for the full rationale. The store
+        # constructs in NONE mode (exact match only) when embeddings are
+        # absent, instead of raising ImportError.
         self._vector_store: Optional[VectorStore] = vector_store
         if self._vector_store is None and agentdb_url:
             self._vector_store = make_vector_store(
@@ -682,12 +791,18 @@ class VerifiedTrajectoryStore:
                 collection=agentdb_collection,
             )
 
-        if not EMBEDDINGS_AVAILABLE and self._vector_store is None:
-            raise ImportError(
-                "VerifiedTrajectoryStore needs: pip install "
-                "sentence-transformers scikit-learn numpy  "
-                "(OR provide vector_store= for a custom similarity backend)"
-            )
+        self.similarity_mode = _resolve_similarity_mode(
+            similarity_mode, self._vector_store
+        )
+
+        if self.similarity_mode == CacheSimilarityMode.EMBEDDINGS:
+            cls = get_sentence_transformer_class()
+            if cls is None and self._vector_store is None:
+                raise RuntimeError(
+                    "Embedding similarity mode requires sentence-transformers. "
+                    "Install with: pip install -e '.[embeddings]'"
+                )
+
         self.path = path
         self.model_name = model_name
         self.retrieval_threshold = retrieval_threshold
@@ -695,13 +810,15 @@ class VerifiedTrajectoryStore:
         self.max_few_shot = max_few_shot
         self.autosave = autosave
 
-        # Load the embedding model when available (needed for generating
-        # entry/query embeddings even when a vector_store is injected).
-        self.model = (
-            get_shared_embedding_model(model_name)
-            if EMBEDDINGS_AVAILABLE
-            else None
-        )
+        # Load the embedding model only in EMBEDDINGS mode.
+        if self.similarity_mode == CacheSimilarityMode.EMBEDDINGS:
+            self.model = (
+                get_shared_embedding_model(model_name)
+                if EMBEDDINGS_AVAILABLE
+                else None
+            )
+        else:
+            self.model = None
         self.entries: List[Dict[str, Any]] = []
         self._embeddings_matrix: Optional[Any] = None
         self._save_lock = threading.Lock()  # Phase 5: prevent concurrent save races
@@ -752,6 +869,10 @@ class VerifiedTrajectoryStore:
         entries with a matching task_type are returned (so math examples
         don't pollute code queries and vice versa).
 
+        In NONE similarity mode (no embeddings), performs exact string
+        matching only — returns entries whose query string exactly matches.
+        In EMBEDDINGS mode, performs semantic similarity search.
+
         Each returned dict has:
           - query: the original verified problem
           - answer: the verified answer
@@ -759,10 +880,36 @@ class VerifiedTrajectoryStore:
           - verification_method: how it was verified
           - similarity: cosine similarity to the current query
         """
-        if not self.entries or self._embeddings_matrix is None:
+        if not self.entries:
             return []
-        if self.model is None:
-            return []
+
+        # Exact-match path (NONE mode, or when no embedding model is
+        # available). Returns exact-match entries only.
+        if self.similarity_mode == CacheSimilarityMode.NONE or self.model is None or self._embeddings_matrix is None:
+            candidates = []
+            for entry in self.entries:
+                if entry.get("query") != query:
+                    continue
+                if task_type and entry.get("task_type") != task_type:
+                    continue
+                if not is_cache_entry_trustworthy(entry):
+                    continue
+                candidates.append({
+                    "query": entry["query"],
+                    "answer": entry["answer"],
+                    "score": entry.get("score", 0.0),
+                    "verification_method": entry.get("verification_method", ""),
+                    "task_type": entry.get("task_type", ""),
+                    "similarity": 1.0,
+                })
+                entry["access_count"] = entry.get("access_count", 0) + 1
+                if len(candidates) >= self.max_few_shot:
+                    break
+            if candidates and self.autosave:
+                self.save()
+            return candidates
+
+        # Semantic similarity path (EMBEDDINGS mode).
         q_emb = self.model.encode([query])[0].reshape(1, -1)
         sims = cosine_similarity(q_emb, self._embeddings_matrix)[0]
 

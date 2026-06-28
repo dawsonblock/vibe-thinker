@@ -10,6 +10,10 @@ import pytest
 
 pytestmark = [pytest.mark.web, pytest.mark.federation]
 
+# federation_server imports fastapi at module load time; skip the whole
+# module cleanly when fastapi is absent instead of failing collection.
+pytest.importorskip("fastapi", reason="requires fastapi for federation server tests")
+
 from federation_server import FederationState, create_federation_app
 
 

@@ -16,7 +16,14 @@ import pytest
 
 pytestmark = [pytest.mark.federation, pytest.mark.web]
 
-import fakeredis.aioredis
+# fakeredis is the test-only Redis double; web.app imports fastapi at module
+# load time. importorskip before those imports so collection does not crash
+# when these optional deps are absent.
+fakeredis_aioredis = pytest.importorskip(
+    "fakeredis.aioredis",
+    reason="requires fakeredis for web PubSub tests",
+)
+pytest.importorskip("fastapi", reason="requires fastapi for web PubSub tests")
 
 from web.app import (
     LocalBroadcaster,
@@ -54,7 +61,7 @@ class TestRedisBroadcaster:
         async def send_fn(msg):
             received.append(msg)
 
-        client = fakeredis.aioredis.FakeRedis()
+        client = fakeredis_aioredis.FakeRedis()
         b = RedisBroadcaster(
             redis_url="redis://localhost:0", channel="vt:test",
             send_fn=send_fn, redis_client=client,
@@ -87,9 +94,9 @@ class TestRedisBroadcaster:
             received_b.append(msg)
 
         # Shared FakeServer models one Redis cluster.
-        server = fakeredis.aioredis.FakeServer()
-        client_a = fakeredis.aioredis.FakeRedis(server=server)
-        client_b = fakeredis.aioredis.FakeRedis(server=server)
+        server = fakeredis_aioredis.FakeServer()
+        client_a = fakeredis_aioredis.FakeRedis(server=server)
+        client_b = fakeredis_aioredis.FakeRedis(server=server)
 
         b_a = RedisBroadcaster(
             redis_url="redis://localhost:0", channel="vt:test",
@@ -181,7 +188,7 @@ class TestAppStateBroadcaster:
         orch.start = AsyncMock()
         orch.cleanup = AsyncMock()
 
-        client = fakeredis.aioredis.FakeRedis()
+        client = fakeredis_aioredis.FakeRedis()
         from web.app import make_broadcaster
         # Build state first (default local), then swap in Redis.
         state = AppState(orch)

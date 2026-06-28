@@ -20,7 +20,14 @@ import pytest
 
 pytestmark = [pytest.mark.federation, pytest.mark.web]
 
-import fakeredis.aioredis
+# fakeredis is the test-only Redis double; federation_server needs fastapi.
+# importorskip at module load time so collection does not crash when these
+# optional deps are absent (markers alone cannot prevent import-time errors).
+fakeredis_aioredis = pytest.importorskip(
+    "fakeredis.aioredis",
+    reason="requires fakeredis for Redis federation tests",
+)
+pytest.importorskip("fastapi", reason="requires fastapi for federation server tests")
 
 from federation_server import (
     RedisFederationState,
@@ -38,7 +45,7 @@ from federation_server import (
 @pytest.fixture
 def redis_state():
     """A RedisFederationState backed by an in-process FakeRedis."""
-    client = fakeredis.aioredis.FakeRedis()
+    client = fakeredis_aioredis.FakeRedis()
     return RedisFederationState(redis_client=client)
 
 
@@ -54,9 +61,9 @@ def redis_state_pair():
     # real deployment each coordinator would have its own client
     # connection to the same Redis server; the shared FakeRedis here
     # models that shared server state.
-    server = fakeredis.aioredis.FakeServer()
-    client_a = fakeredis.aioredis.FakeRedis(server=server)
-    client_b = fakeredis.aioredis.FakeRedis(server=server)
+    server = fakeredis_aioredis.FakeServer()
+    client_a = fakeredis_aioredis.FakeRedis(server=server)
+    client_b = fakeredis_aioredis.FakeRedis(server=server)
     a = RedisFederationState(redis_client=client_a)
     b = RedisFederationState(redis_client=client_b)
     return a, b
@@ -259,7 +266,7 @@ class TestMakeFederationState:
         assert isinstance(state, RedisFederationState)
 
     def test_redis_client_returns_redis_state(self):
-        client = fakeredis.aioredis.FakeRedis()
+        client = fakeredis_aioredis.FakeRedis()
         state = make_federation_state(redis_client=client)
         assert isinstance(state, RedisFederationState)
 
@@ -273,7 +280,7 @@ class TestRedisFederationApp:
     def test_app_with_redis_state(self):
         """create_federation_app accepts a RedisFederationState."""
         from fastapi.testclient import TestClient
-        client = fakeredis.aioredis.FakeRedis()
+        client = fakeredis_aioredis.FakeRedis()
         state = RedisFederationState(redis_client=client)
         app = create_federation_app(state=state)
         tc = TestClient(app)

@@ -13,7 +13,9 @@ from unittest.mock import patch, MagicMock
 
 pytestmark = pytest.mark.embeddings
 
-import numpy as np
+# numpy is an embeddings-extra dependency; skip cleanly when absent.
+pytest.importorskip("numpy", reason="requires numpy for migration tests")
+import numpy as np  # noqa: E402
 
 # Load the migration script as a module (it's not in a package).
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

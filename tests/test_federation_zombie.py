@@ -12,7 +12,9 @@ import pytest
 
 pytestmark = [pytest.mark.web, pytest.mark.federation]
 
-from fastapi.testclient import TestClient
+# fastapi is required both for TestClient and for federation_server itself.
+pytest.importorskip("fastapi", reason="requires fastapi for federation zombie tests")
+from fastapi.testclient import TestClient  # noqa: E402
 
 from federation_server import (
     InMemoryFederationState,

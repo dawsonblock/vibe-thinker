@@ -85,16 +85,24 @@ class TestRuvLLMHTTPBackend:
 class TestRuvLLMBinding:
     """Tests for the in-process PyO3 binding.
 
-    v2.0: The ruvllm_py extension is now built and installed. These tests
-    verify the binding detection and behavior when the extension IS present.
+    The ruvllm_py extension is an OPTIONAL Rust-built component (requires
+    ``pip install -e '.[rust]'`` + ``bash scripts/check_ruvllm.sh``).
+    These tests verify binding detection and behavior. They skip cleanly
+    when the extension is not installed — RuvLLM is experimental and must
+    never be assumed present in a clean environment.
     """
 
     def test_is_ruvllm_binding_available(self):
-        # v2.0: the binding is now built and installed
-        assert is_ruvllm_binding_available() is True
+        # The binding is optional (Rust/maturin build). When absent,
+        # is_ruvllm_binding_available() must return False, not raise.
+        # When present, it must return True. Test both branches honestly.
+        result = is_ruvllm_binding_available()
+        assert result in (True, False)
+        if result is False:
+            pytest.skip("ruvllm_py not installed in this env (experimental, optional)")
 
     def test_binding_constructs_when_installed(self):
-        # v2.0: the binding should construct successfully when installed
+        # The binding should construct successfully when installed
         # (it will fail on load_gguf with a non-existent model, but the
         # constructor itself should not raise ImportError)
         try:

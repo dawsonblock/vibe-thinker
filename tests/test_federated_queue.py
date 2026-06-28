@@ -420,6 +420,7 @@ class TestFederationEncryption:
 
     def test_encrypt_decrypt_roundtrip(self):
         """Encrypting and decrypting a payload returns the original."""
+        pytest.importorskip("cryptography", reason="requires cryptography for Fernet encryption")
         from federated_queue import FederatedJobQueue
         queue = object.__new__(FederatedJobQueue)
         queue._fernet = None
@@ -473,6 +474,7 @@ class TestFederationEncryption:
 
     def test_encrypted_payload_is_not_plaintext(self):
         """The encrypted payload does not contain the original text."""
+        pytest.importorskip("cryptography", reason="requires cryptography for Fernet encryption")
         from federated_queue import FederatedJobQueue
         from cryptography.fernet import Fernet
         import base64
