@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.4.4a0
+
+Stabilization-only release. No new features. Release-engineering fixes
+addressing the v28 validation report.
+
+### Fixed
+- `release_gate.sh` now creates an isolated build venv (with `build`
+  installed) before `python -m build` — no longer assumes the ambient
+  Python has `build`.
+- `build_clean_zip.py` no longer requires `pytest-timeout` (removed
+  `--timeout` flags; relies on subprocess timeout). Skips the pytest
+  gate gracefully with a warning when pytest is absent.
+- `build_clean_zip.py` now includes the full project source:
+  `.github/`, `Dockerfile`, `docker-compose.yml`, `.dockerignore`,
+  `docker/`, `ruvllm_py/`, `rust/` (excluding multi-GB `target/` and
+  `vendor/` build artifacts). The ZIP is now a complete source release,
+  not a Python-only subset.
+- `httpx` added to the `web` optional dependency group
+  (FastAPI/Starlette TestClient requires it; the web test layer was
+  not reproducible without it).
+- Web/federation test skipping: replaced module-level
+  `pytest.importorskip` with `pytestmark.skipif` so direct execution
+  without optional deps collects tests and skips them (exit 0), not
+  "no tests collected" (exit code 5).
+- CLI/docs: removed "production egress path" and "production-safe"
+  overclaims. Enforced egress is now consistently described as
+  EXPERIMENTAL / not production-safe until real bypass tests pass.
+- `sandbox/Dockerfile`: "production executor" → "default executor".
+
+### Still experimental
+- Enforced sandbox gateway egress (`NetworkMode.ENFORCED_GATEWAY`).
+- RuvLLM (Rust inference engine — default build is stub).
+- Distributed federation (Redis-backed HA).
+
 ## v0.4.3a0
 
 Stabilization-only release. No new features.

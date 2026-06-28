@@ -10,27 +10,56 @@ balancer backed by one Redis cluster.
 """
 
 import asyncio
+import importlib.util
 import json
 
 import pytest
 
-pytestmark = [pytest.mark.federation, pytest.mark.web]
 
-# fakeredis is the test-only Redis double; web.app imports fastapi at module
-# load time. importorskip before those imports so collection does not crash
-# when these optional deps are absent.
-fakeredis_aioredis = pytest.importorskip(
-    "fakeredis.aioredis",
-    reason="requires fakeredis for web PubSub tests",
-)
-pytest.importorskip("fastapi", reason="requires fastapi for web PubSub tests")
+def _has_module(name: str) -> bool:
+    """Check if a module is importable without importing it."""
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ModuleNotFoundError, ImportError):
+        return False
 
-from web.app import (
-    LocalBroadcaster,
-    RedisBroadcaster,
-    make_broadcaster,
-    AppState,
+
+# Check optional deps with find_spec (no import side effects). Using
+# pytest.importorskip at module level causes pytest to skip the entire
+# module and exit with code 5 ("no tests collected"), which CI scripts
+# treat as failure. Instead, use skipif so tests are collected (exit 0)
+# but individually skipped when deps are absent.
+_DEPS_AVAILABLE = (
+    _has_module("fakeredis.aioredis")
+    and _has_module("fastapi")
 )
+
+pytestmark = [
+    pytest.mark.federation,
+    pytest.mark.web,
+    pytest.mark.skipif(
+        not _DEPS_AVAILABLE,
+        reason="requires fakeredis + fastapi (pip install -e '.[federation,web]')",
+    ),
+]
+
+# Guard the web.app import: web.app imports fastapi at module load time.
+# When deps are absent the names are set to None; they are never
+# referenced at runtime because all tests are skipped via skipif above.
+if _DEPS_AVAILABLE:
+    from fakeredis import aioredis as fakeredis_aioredis
+    from web.app import (
+        LocalBroadcaster,
+        RedisBroadcaster,
+        make_broadcaster,
+        AppState,
+    )
+else:
+    fakeredis_aioredis = None  # type: ignore[assignment]
+    LocalBroadcaster = None  # type: ignore[assignment]
+    RedisBroadcaster = None  # type: ignore[assignment]
+    make_broadcaster = None  # type: ignore[assignment]
+    AppState = None  # type: ignore[assignment]
 
 
 # --------------------------------------------------------------------------- #

@@ -595,7 +595,7 @@ def build_argparser() -> argparse.ArgumentParser:
                         "boundary — only the code's parse + restricted-import "
                         "status is checked. Emits a 0.2 heuristic "
                         "(verified=False). "
-                        "Default: off (production-safe).")
+                        "Default: off (safest).")
     p.set_defaults(allow_static_fallback=_env_bool(
         "VIBE_THINKER_ALLOW_STATIC_FALLBACK", False))
     p.add_argument("--audit-log",
@@ -785,9 +785,11 @@ def build_argparser() -> argparse.ArgumentParser:
                         "Envoy as a child process before the orchestrator "
                         "runs. Requires the envoy binary on PATH. The "
                         "sandbox routes traffic through the Envoy listener "
-                        "(default 127.0.0.1:8888). This is the recommended "
-                        "production egress path; the Python sni_proxy.py is "
-                        "the lightweight fallback.")
+                        "(default 127.0.0.1:8888). NOTE: enforced egress "
+                        "is EXPERIMENTAL — not production-safe until real "
+                        "bypass tests pass. The Python sni_proxy.py is the "
+                        "lightweight fallback (also not a security "
+                        "boundary).")
     p.add_argument("--embedding-router", dest="use_embedding_router",
                    action="store_true",
                    help="Use embedding-based semantic router (default)")
@@ -908,8 +910,10 @@ async def _amain() -> None:
     # --- Envoy sidecar egress (v1.2) ---
     # When --envoy-sidecar is set, generate an Envoy config from the
     # network allow-list and launch Envoy as a child process. The
-    # sandbox routes traffic through the Envoy listener. This is the
-    # recommended production egress path (replaces the Python sni_proxy).
+    # sandbox routes traffic through the Envoy listener. NOTE: enforced
+    # egress is EXPERIMENTAL — not production-safe until real bypass
+    # tests pass. This replaces the Python sni_proxy for convenience
+    # routing, but neither path is a proven security boundary.
     envoy_proc = None
     if args.envoy_sidecar:
         from sandbox.envoy_sidecar import (

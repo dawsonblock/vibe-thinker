@@ -10,7 +10,7 @@
 #
 # v1.0 privilege model (Phase 1.3):
 #   - The image defaults to USER sandbox (uid 1000). The container
-#     lifecycle no longer requires root — the production path
+#     lifecycle no longer requires root — the default path
 #     (DockerSandboxExecutor) runs python3 directly as uid 1000 with
 #     --cap-drop ALL and --security-opt no-new-privileges.
 #   - The legacy iptables entrypoint is root-aware: it only applies
@@ -29,7 +29,7 @@ FROM python:3.12-slim
 # --no-install-recommends keeps the image small.
 # We clean apt lists to reduce image size.
 # NOTE: iptables is only used by the DEPRECATED legacy entrypoint path
-# (opt-in via `docker run --user root`). The production proxy path does
+# (opt-in via `docker run --user root`). The default proxy path does
 # not need it, but it is retained for defense-in-depth fallback.
 RUN apt-get update -qq && \
     apt-get install -y --no-install-recommends \
@@ -54,7 +54,7 @@ RUN chmod +x /usr/local/bin/vt-entrypoint.sh
 ENTRYPOINT ["/usr/local/bin/vt-entrypoint.sh"]
 
 # v1.0 (Phase 1.3): run as the non-root sandbox user by default. The
-# production executor also passes --user 1000:1000 explicitly. The
+# default executor also passes --user 1000:1000 explicitly. The
 # legacy iptables entrypoint path requires `docker run --user root` to
 # opt back into root (deprecated).
 USER sandbox

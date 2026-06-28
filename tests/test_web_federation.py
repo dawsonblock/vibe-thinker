@@ -4,18 +4,38 @@ Tests POST /api/jobs/claim and POST /api/jobs/complete — the endpoints
 that allow the web UI server to act as a federation coordinator.
 """
 
+import importlib.util
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-pytestmark = [pytest.mark.web, pytest.mark.federation]
 
-# web.app imports fastapi at module load time and the fixtures below use
-# fastapi.testclient.TestClient. importorskip *before* any web.app import
-# so direct execution (without the web extra) skips cleanly instead of
-# erroring with ModuleNotFoundError: No module named 'fastapi'. The
-# federation markers alone cannot prevent collection-time import errors.
-pytest.importorskip("fastapi", reason="requires fastapi web extra")
-pytest.importorskip("fastapi.testclient", reason="requires fastapi test client")
+def _has_module(name: str) -> bool:
+    """Check if a module is importable without importing it."""
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ModuleNotFoundError, ImportError):
+        return False
+
+
+# Check optional deps with find_spec (no import side effects). Using
+# pytest.importorskip at module level causes pytest to skip the entire
+# module and exit with code 5 ("no tests collected"), which CI scripts
+# treat as failure. Instead, use skipif so tests are collected (exit 0)
+# but individually skipped when deps are absent.
+_FASTAPI_AVAILABLE = (
+    _has_module("fastapi")
+    and _has_module("fastapi.testclient")
+)
+
+pytestmark = [
+    pytest.mark.web,
+    pytest.mark.federation,
+    pytest.mark.skipif(
+        not _FASTAPI_AVAILABLE,
+        reason="requires fastapi web extra (pip install -e '.[web]')",
+    ),
+]
 
 
 @pytest.fixture

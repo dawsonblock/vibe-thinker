@@ -1,20 +1,29 @@
 #!/usr/bin/env python3
-"""Build a clean distribution ZIP for vibe-thinker.
+"""Build a clean source distribution ZIP for vibe-thinker.
 
-Copies only source/docs/tests/config files into a staging directory,
-excludes all runtime junk (__pycache__, .pyc, cache JSON, audit logs),
-runs compileall + the *core* pytest marker filter as validation (NOT
-full pytest — optional web/federation/embeddings tests would error
-without their extras), then creates the ZIP. The output filename is
-derived from the version in ``pyproject.toml`` so it is never stale.
+Copies the full project source (Python modules, tests, Docker, CI, Rust
+probes, ruvllm_py, docs, configs) into a staging directory, excludes all
+runtime/build junk (__pycache__, .pyc, .pytest_cache, target/, vendor/,
+dist/, cache JSON, audit logs), runs compileall + the *core* pytest
+marker filter as validation (NOT full pytest — optional
+web/federation/embeddings tests would error without their extras), then
+creates the ZIP. The output filename is derived from the version in
+``pyproject.toml`` so it is never stale.
+
+The pytest step uses no --timeout flags so it works with plain pytest
+(no pytest-timeout required). A subprocess timeout provides the outer
+guard. If pytest is not installed at all, the test step is skipped with
+a clear warning (compileall still runs).
 
 Usage:
     python scripts/build_clean_zip.py
 
 Output:
-    dist/vibe-thinker-v<version>.zip   (e.g. dist/vibe-thinker-v0.4.3a0.zip)
+    dist/vibe-thinker-v<version>.zip   (e.g. dist/vibe-thinker-v0.4.4a0.zip)
 
-Exit code is nonzero if compileall or the core pytest gate fails.
+Exit code is nonzero if compileall fails, or if pytest is available but
+the core gate fails. If pytest is absent, the ZIP is still created (with
+a warning) — compileall is the mandatory gate, pytest is best-effort.
 """
 
 import compileall
@@ -57,10 +66,14 @@ def get_project_version() -> str:
 VERSION = get_project_version()
 ZIP_NAME = f"vibe-thinker-v{VERSION}.zip"
 
-# Files/dirs to include (everything else is excluded)
+# Directories to include (full source snapshot). Everything else in the
+# project root is excluded. This MUST cover all project content so the
+# ZIP is a complete, self-contained source release — not a Python-only
+# runtime subset.
 INCLUDE_DIRS = [
     "verifiers", "sandbox", "tests", "examples", "scripts",
     "web", "profiles", "docs",
+    ".github", "docker", "ruvllm_py", "rust",
 ]
 
 # Non-.py root files shipped verbatim.
@@ -70,7 +83,8 @@ _INCLUDE_NONPY_FILES = [
     "requirements-embeddings.txt", "requirements-federation.txt",
     "requirements-sandbox.txt", "requirements-models.txt",
     "requirements-legacy-full.txt",
-    ".env.example", ".gitignore",
+    ".env.example", ".gitignore", ".dockerignore",
+    "Dockerfile", "docker-compose.yml",
 ]
 
 
@@ -92,20 +106,31 @@ def _discover_root_py_modules() -> list:
 
 
 INCLUDE_FILES = _discover_root_py_modules() + _INCLUDE_NONPY_FILES
-# Also include tests/__init__.py, verifiers/__init__.py etc.
-# (handled by dir copy)
 
-# Patterns to EXCLUDE from the staging dir (runtime junk)
+# Patterns to EXCLUDE from the staging dir (runtime/build junk).
+# - __pycache__, .pyc, .pyo, .pytest_cache: Python runtime caches
+# - target, vendor: Rust/Cargo build artifacts (can be multi-GB)
+# - dist: built wheels/sdists (the ZIP itself goes there)
+# - route_cache.json etc.: runtime cache/audit files
+# - .DS_Store: macOS metadata
+# - .git (exact): Git metadata — NOT .github (which is CI config we ship)
 EXCLUDE_PATTERNS = [
     "__pycache__", ".pyc", ".pyo", ".pytest_cache",
+    "target", "vendor", "dist",
     "route_cache.json", "clr_result_cache.json", "clr_trace.json",
     "rfsn_jobs.jsonl", "rfsn_jobs_bitemporal.jsonl",
     "orchestrator_memory.jsonl",
-    ".DS_Store", ".git",
+    ".DS_Store",
 ]
+# Directory/file names to exclude ONLY on exact match (not substring).
+# This prevents ".git" from matching ".github".
+EXCLUDE_EXACT = {".git"}
 
 
 def should_exclude(name: str) -> bool:
+    base = os.path.basename(name)
+    if base in EXCLUDE_EXACT:
+        return True
     for pat in EXCLUDE_PATTERNS:
         if pat in name:
             return True
@@ -125,12 +150,17 @@ def copy_tree_clean(src: str, dst: str) -> None:
             os.makedirs(os.path.dirname(dst_path), exist_ok=True)
             shutil.copy2(os.path.join(root, fname), dst_path)
             # Ensure shell scripts are executable in the staging dir.
-            # shutil.copy2 preserves source permissions, but if the
-            # source lost its +x bit (e.g. via git on a filesystem that
-            # doesn't track exec bits), force it here so the ZIP
-            # preserves it.
             if fname.endswith(".sh"):
                 os.chmod(dst_path, 0o755)
+
+
+def _pytest_available() -> bool:
+    """Check whether pytest is importable in the current Python."""
+    try:
+        import importlib.util
+        return importlib.util.find_spec("pytest") is not None
+    except Exception:
+        return False
 
 
 def main() -> int:
@@ -148,7 +178,7 @@ def main() -> int:
             if os.path.isfile(src):
                 shutil.copy2(src, os.path.join(staging, f))
 
-        # --- Validation: compileall ---
+        # --- Validation: compileall (mandatory) ---
         print("Running compileall...")
         if compileall.compile_dir(staging, quiet=1):
             print("  compileall: OK")
@@ -161,29 +191,37 @@ def main() -> int:
                 if d == "__pycache__":
                     shutil.rmtree(os.path.join(root, d), ignore_errors=True)
 
-        # --- Validation: core pytest gate ---
+        # --- Validation: core pytest gate (best-effort) ---
         # Run ONLY the core marker filter (same as scripts/test_core.sh).
-        # Full pytest is not run: optional-subsystem tests need extra deps
-        # that are not installed in the staging dir and would error.
-        print("Running core pytest gate...")
-        try:
-            result = subprocess.run(
-                [sys.executable, "-m", "pytest", staging + "/tests", "-q",
-                 "--timeout=60", "--timeout-method=thread",
-                 "-m", CORE_MARKERS],
-                capture_output=True, text=True, cwd=staging,
-                timeout=180, check=False,
-            )
-        except subprocess.TimeoutExpired:
-            print("  pytest: TIMED OUT (180s outer limit)", file=sys.stderr)
-            return 1
-        if result.returncode == 0:
-            print("  pytest: OK")
+        # No --timeout flags are used so this works with plain pytest
+        # (pytest-timeout is not required). A subprocess timeout provides
+        # the outer guard. If pytest is not installed, skip with a warning.
+        if not _pytest_available():
+            print("Running core pytest gate...")
+            print("  pytest: SKIPPED (pytest not installed in current "
+                  "environment)")
+            print("  (install with: pip install -e '.[dev,test]')")
         else:
-            print("  pytest: FAILED")
-            print(result.stdout[-800:])
-            print(result.stderr[-800:])
-            return 1
+            print("Running core pytest gate...")
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-m", "pytest",
+                     staging + "/tests", "-q",
+                     "-m", CORE_MARKERS],
+                    capture_output=True, text=True, cwd=staging,
+                    timeout=300, check=False,
+                )
+            except subprocess.TimeoutExpired:
+                print("  pytest: TIMED OUT (300s outer limit)",
+                      file=sys.stderr)
+                return 1
+            if result.returncode == 0:
+                print("  pytest: OK")
+            else:
+                print("  pytest: FAILED")
+                print(result.stdout[-800:])
+                print(result.stderr[-800:])
+                return 1
 
         # --- Create ZIP ---
         # Wrap all files under a single top-level directory named
@@ -205,15 +243,10 @@ def main() -> int:
                     fpath = os.path.join(root, fname)
                     arcname = os.path.join(
                         top_dir, os.path.relpath(fpath, staging))
-                    # Preserve Unix file permissions so executable
-                    # scripts (e.g. scripts/*.sh) remain executable after
-                    # extraction. copy_tree_clean already chmods .sh files
-                    # to 0o755 in staging; zf.write() builds the ZipInfo
-                    # via ZipInfo.from_file internally, which copies the
-                    # file's mode into external_attr. (The previous code
-                    # built a ZipInfo manually and then passed it to
-                    # zf.write() as the *filename* argument, which raised
-                    # TypeError at runtime.)
+                    # zf.write() builds the ZipInfo via
+                    # ZipInfo.from_file internally, which copies the
+                    # file's mode into external_attr. copy_tree_clean
+                    # already chmods .sh files to 0o755 in staging.
                     zf.write(fpath, arcname)
 
         print(f"\nClean ZIP created: {zip_path}")
