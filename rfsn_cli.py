@@ -66,6 +66,25 @@ def _env_bool(name: str, default: bool) -> bool:
     return val.strip().lower() in ("true", "1", "yes", "on")
 
 
+def get_package_version() -> str:
+    """Return the installed vibe-thinker package version.
+
+    Uses importlib.metadata so the reported version always matches the
+    actually-installed wheel/egg-info (not a hardcoded string). Falls
+    back to a ``-dev`` suffix when the package metadata is unavailable
+    (e.g. running directly from a source checkout that has not been
+    installed/editable-installed).
+    """
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+        try:
+            return version("vibe-thinker")
+        except PackageNotFoundError:
+            return "0.0.0-dev"
+    except ImportError:  # pragma: no cover - py>=3.11 always has importlib.metadata
+        return "0.0.0-dev"
+
+
 def _build_retrieval_backend(args) -> "object | None":
     """Build a retrieval backend from CLI args / env vars.
 
@@ -356,6 +375,14 @@ class JobQueueREPL:
 # ----------------------------- entry point ----------------------------- #
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="RFSN job queue REPL.")
+    # --version: report the installed package version and exit. Lives on
+    # the root parser so `vibe-thinker --version` works regardless of
+    # subcommands. argparse handles the exit itself (action="version").
+    p.add_argument(
+        "--version",
+        action="version",
+        version=get_package_version(),
+    )
     # Precedence: CLI flags > environment variables > defaults
     p.add_argument("--vibe",
                    default=os.environ.get(

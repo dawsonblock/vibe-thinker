@@ -8,7 +8,7 @@ WORKDIR="$(mktemp -d)"
 
 echo "Testing ZIP in $WORKDIR"
 unzip -q "$ZIP_PATH" -d "$WORKDIR"
-REPO_DIR="$(find "$WORKDIR" -maxdepth 1 -type d | tail -n 1)"
+REPO_DIR="$(find "$WORKDIR" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
 cd "$REPO_DIR"
 
 # --- Script permissions ---
@@ -43,6 +43,9 @@ python -m build
 
 echo "=== CLI help ==="
 vibe-thinker --help
+
+echo "=== Version ==="
+vibe-thinker --version
 
 echo "=== Doctor ==="
 vibe-thinker doctor

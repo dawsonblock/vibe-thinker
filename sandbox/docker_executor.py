@@ -99,7 +99,7 @@ GATEWAY_NETWORK_NAME = "vibe-thinker-gateway-net"
 class DockerSandboxExecutor:
     """Execute Python code in a hardened Docker container.
 
-    This is the production executor for CodeVerifier. It provides:
+    This is the default executor for CodeVerifier. It provides:
       - filesystem isolation (read-only root, writable /tmp only)
       - network isolation (controlled by NetworkMode)
       - memory limits (default 128m)

@@ -9,6 +9,14 @@ from unittest.mock import AsyncMock, MagicMock
 
 pytestmark = [pytest.mark.web, pytest.mark.federation]
 
+# web.app imports fastapi at module load time and the fixtures below use
+# fastapi.testclient.TestClient. importorskip *before* any web.app import
+# so direct execution (without the web extra) skips cleanly instead of
+# erroring with ModuleNotFoundError: No module named 'fastapi'. The
+# federation markers alone cannot prevent collection-time import errors.
+pytest.importorskip("fastapi", reason="requires fastapi web extra")
+pytest.importorskip("fastapi.testclient", reason="requires fastapi test client")
+
 
 @pytest.fixture
 def web_client():

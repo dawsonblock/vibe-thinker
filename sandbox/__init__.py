@@ -22,7 +22,9 @@ model output. The architecture is defense-in-depth:
 Executors:
   - DockerSandboxExecutor: runs Python in a Docker container with
     network isolation, memory limits, read-only filesystem, and no
-    new privileges. This is the production executor.
+    new privileges. This is the default executor. Note: enforced
+    egress (NetworkMode.ENFORCED_GATEWAY) is still experimental — see
+    the sandbox README.
   - LocalSubprocessExecutor: runs Python in a local subprocess with
     timeout only. This is NOT safe for untrusted code — it exists for
     development and testing where Docker is not available.

@@ -38,9 +38,11 @@ Runs Python in a Docker container with hardening:
 - `--tmpfs /tmp` (writable temp dir for execution)
 - `--rm` (auto-remove container after exit)
 
-This is the production executor for CodeVerifier. It is lightweight
+This is the default executor for CodeVerifier. It is lightweight
 (containers start in <1s) and provides strong isolation for code
-verification.
+verification. Note: enforced egress (NetworkMode.ENFORCED_GATEWAY) is
+experimental and not production-safe; DISABLED and BEST_EFFORT_PROXY
+modes are convenience routing, not a security boundary.
 
 ### DockerSbxExecutor (outer layer)
 

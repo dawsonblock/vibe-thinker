@@ -88,6 +88,36 @@ EMBEDDINGS_AVAILABLE = (
 )
 
 
+def embeddings_available() -> bool:
+    """Runtime embedding-capability check.
+
+    Returns True only when ALL three optional dependencies are importable
+    right now: numpy, scikit-learn (cosine_similarity), and
+    sentence-transformers (via :func:`get_sentence_transformer_class`).
+
+    This is the dynamic counterpart of the module-level
+    ``EMBEDDINGS_AVAILABLE`` constant. The constant is captured once at
+    import time, so callers that bind it (e.g. ``from persistent_cache
+    import EMBEDDINGS_AVAILABLE``) keep a stale value if a test patches
+    ``get_sentence_transformer_class`` afterwards. Runtime callers that
+    need to reflect such patches — notably the orchestrator deciding
+    whether to build a trajectory store — should call this function
+    instead of reading the constant.
+
+    Truth table (preserved from v27):
+        numpy   sklearn  sentence-transformers  embeddings_available()
+        missing any      any                    False
+        present missing  any                    False
+        present present  missing                False
+        present present  present                True
+    """
+    return (
+        np is not None
+        and cosine_similarity is not None
+        and get_sentence_transformer_class() is not None
+    )
+
+
 # ====================================================================== #
 # Cache similarity mode (Phase 5 — decouple cache from embeddings)
 # ====================================================================== #

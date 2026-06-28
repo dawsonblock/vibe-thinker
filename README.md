@@ -5,10 +5,21 @@ queries between a high-precision reasoning specialist and a generalist
 model, with deterministic verifiers, bi-temporal audit logging, and an
 interactive CLI.
 
-## Current status: ALPHA (v0.4.2a0)
+## Current status: ALPHA (v0.4.3a0)
 
 **Not production-safe.** This is alpha software. See `docs/roadmap.md`
 for the stabilization plan and frozen feature scope.
+
+Core local profile is stable: clean install, `vibe-thinker doctor`,
+`vibe-thinker smoke`, `vibe-thinker --version`, and the core test gate
+all work with only the core dependencies installed.
+
+Optional / experimental (require extra dependencies or external
+services, and skip honestly when absent): trajectory synthesis,
+embeddings, federation/web, Docker sandbox, RuvLLM.
+
+Not production-safe: hostile code with network access, enforced egress,
+autonomous production operation.
 
 ## What works
 

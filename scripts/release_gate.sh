@@ -1,41 +1,51 @@
 #!/usr/bin/env bash
 # Release gate — must pass before any release.
 # Run: ./scripts/release_gate.sh
+#
+# Uses fully isolated venvs for both stages so the gate never depends on
+# ambient/system/user Python state:
+#   1. Clean wheel install + CLI smoke (fresh venv, wheel only).
+#   2. Dev/test editable install + core tests (separate fresh venv).
 set -euo pipefail
 
-echo "=== Cleaning build artifacts ==="
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
+
+echo "[release-gate] Cleaning generated artifacts"
 rm -rf build dist *.egg-info vibe_thinker.egg-info .pytest_cache
 find . -type d -name "__pycache__" -prune -exec rm -rf {} +
 find . -name "*.pyc" -delete
 
-echo "=== Compile check ==="
+echo "[release-gate] Compile check"
 python3 -m compileall -q .
 
-echo "=== Build wheel ==="
+echo "[release-gate] Build wheel/sdist"
 python3 -m build
 
-echo "=== Fresh venv install test ==="
-rm -rf /tmp/vibe-thinker-release-gate
-python3 -m venv /tmp/vibe-thinker-release-gate
-source /tmp/vibe-thinker-release-gate/bin/activate
+echo "[release-gate] Clean installed wheel smoke"
+INSTALL_VENV="$(mktemp -d)/venv"
+python3 -m venv "$INSTALL_VENV"
+# shellcheck disable=SC1091
+source "$INSTALL_VENV/bin/activate"
 python -m pip install --upgrade pip
 python -m pip install dist/*.whl
-
-echo "=== CLI help ==="
 vibe-thinker --help
-
-echo "=== Doctor ==="
+vibe-thinker --version
 vibe-thinker doctor
-
-echo "=== Smoke ==="
 vibe-thinker smoke
-
 deactivate
-rm -rf /tmp/vibe-thinker-release-gate
+rm -rf "$(dirname "$INSTALL_VENV")"
 
-echo "=== Core tests ==="
-python3 -m pip install -e ".[dev,test]"
-bash scripts/test_core.sh
+echo "[release-gate] Isolated dev/test core gate"
+TEST_VENV="$(mktemp -d)/venv"
+python3 -m venv "$TEST_VENV"
+# shellcheck disable=SC1091
+source "$TEST_VENV/bin/activate"
+python -m pip install --upgrade pip setuptools wheel build
+python -m pip install -e ".[dev,test]"
+./scripts/test_core.sh
+deactivate
+rm -rf "$(dirname "$TEST_VENV")"
 
 echo ""
-echo "Release gate PASSED."
+echo "[release-gate] PASS"

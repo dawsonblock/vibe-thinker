@@ -51,6 +51,7 @@ from persistent_cache import (
     VerifiedTrajectoryStore,
     should_cache,
     EMBEDDINGS_AVAILABLE,
+    embeddings_available,
 )
 from verifiers import (
     MathVerifier, CodeVerifier, FactualVerifier,
@@ -639,6 +640,8 @@ class HybridReasoningOrchestrator:
         trajectory_store_path: str = "verified_trajectories.json",
         trajectory_retrieval_threshold: float = 0.70,
         trajectory_max_few_shot: int = 3,
+        trajectory_store: Optional["VerifiedTrajectoryStore"] = None,
+        embedder: Optional[Any] = None,
         fast_specialist: bool = False,
         local_specialist_model: Optional[str] = None,
         local_specialist_n_ctx: int = 4096,
@@ -818,9 +821,29 @@ class HybridReasoningOrchestrator:
         # few-shot context for similar future queries. Only available with
         # embedding deps. Only stores verified=True results — never learns
         # from unverified output.
-        self.use_trajectory_store = (
-            use_trajectory_store and EMBEDDINGS_AVAILABLE)
-        if self.use_trajectory_store:
+        #
+        # v0.4.3: capability is checked at runtime via
+        # embeddings_available() (which calls get_sentence_transformer_class
+        # dynamically) rather than the module-level EMBEDDINGS_AVAILABLE
+        # constant captured at import time. The constant goes stale when a
+        # test patches get_sentence_transformer_class after import, which
+        # silently disabled the trajectory store in partial environments
+        # even though a (fake) model was configured.
+        #
+        # An injectable ``trajectory_store`` or ``embedder`` bypasses the
+        # capability check entirely — this is how tests wire in fake
+        # embeddings without requiring the real embeddings extra, and how
+        # callers can supply a pre-built (e.g. AgentDB-backed) store.
+        if trajectory_store is not None:
+            self.trajectory_store = trajectory_store
+            self.use_trajectory_store = True
+        elif use_trajectory_store and embedder is not None:
+            # An embedder was injected (e.g. a fake encoder in tests).
+            # Build the store and override its embedding model with the
+            # injected object so the real sentence-transformers extra is
+            # not required. The similarity math still needs numpy +
+            # scikit-learn (cosine_similarity), which the caller is
+            # expected to provide alongside the fake embedder.
             try:
                 self.trajectory_store = VerifiedTrajectoryStore(
                     path=trajectory_store_path,
@@ -830,11 +853,29 @@ class HybridReasoningOrchestrator:
                     agentdb_url=agentdb_url,
                     agentdb_only=agentdb_only,
                 )
+                self.trajectory_store.model = embedder
+                self.use_trajectory_store = True
+            except Exception as e:
+                print(f"[Warning] Could not load trajectory store: {e}")
+                self.use_trajectory_store = False
+                self.trajectory_store = None
+        elif use_trajectory_store and embeddings_available():
+            try:
+                self.trajectory_store = VerifiedTrajectoryStore(
+                    path=trajectory_store_path,
+                    model_name=embedding_model,
+                    retrieval_threshold=trajectory_retrieval_threshold,
+                    max_few_shot=trajectory_max_few_shot,
+                    agentdb_url=agentdb_url,
+                    agentdb_only=agentdb_only,
+                )
+                self.use_trajectory_store = True
             except Exception as e:
                 print(f"[Warning] Could not load trajectory store: {e}")
                 self.use_trajectory_store = False
                 self.trajectory_store = None
         else:
+            self.use_trajectory_store = False
             self.trajectory_store = None
 
         # v2.0: SONA trajectory recorder (optional, in-process PyO3).
@@ -3120,20 +3161,8 @@ class HybridReasoningOrchestrator:
         if not self.use_trajectory_store or self.trajectory_store is None:
             result = empty_synthesis_result(ok=False)
             result["errors"].append(
-                "trajectory store is not configured"
-            )
-            return result
-        if self.trajectory_store is None:
-            result = empty_synthesis_result(ok=False)
-            result["errors"].append(
-                "trajectory store is not configured"
-            )
-            return result
-        if not EMBEDDINGS_AVAILABLE:
-            result = empty_synthesis_result(ok=False)
-            result["errors"].append(
-                "trajectory synthesis requires embedding dependencies; "
-                "install with pip install -e '.[embeddings]'"
+                "trajectory synthesis unavailable: trajectory store is "
+                "not configured"
             )
             return result
 
