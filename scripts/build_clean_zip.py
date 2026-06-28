@@ -119,7 +119,7 @@ def main() -> int:
                 [sys.executable, "-m", "pytest", staging + "/tests", "-q",
                  "--timeout=60", "--timeout-method=thread"],
                 capture_output=True, text=True, cwd=staging,
-                timeout=120,
+                timeout=120, check=False,
             )
         except subprocess.TimeoutExpired:
             print("  pytest: TIMED OUT (120s outer limit)", file=sys.stderr)
