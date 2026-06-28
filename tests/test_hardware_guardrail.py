@@ -10,9 +10,6 @@ cost is negligible.
 """
 
 import os
-import tempfile
-
-import pytest
 
 from hardware_guardrail import (
     check_model_fits_ram,

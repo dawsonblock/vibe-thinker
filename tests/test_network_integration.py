@@ -12,11 +12,9 @@ blocks/allows traffic — not just that the rules are generated correctly.
 They test the security properties, not the construction.
 """
 
-import asyncio
 import pytest
 import shutil
 import subprocess
-import time
 
 from sandbox.network_allowlist import NetworkAllowList
 from sandbox.docker_executor import DockerSandboxExecutor, SANDBOX_IMAGE

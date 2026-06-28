@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from retrieval import RetrievalBackend
+    from sandbox.network_allowlist import NetworkAllowList
 
 from vibe_clr_async import CLRResult, VibeThinkerCLRAsync
 from persistent_cache import (
@@ -139,15 +140,15 @@ def select_verifier(
     return None
 
 
-# Optional dependency — gracefully degrade if not installed
+# Optional dependency — gracefully degrade if not installed.
+# EMBEDDINGS_AVAILABLE is imported from persistent_cache (single source
+# of truth). numpy and cosine_similarity are imported here only for the
+# embedding router similarity comparison at lines ~278.
 try:
     import numpy as np
-    from sentence_transformers import SentenceTransformer
     from sklearn.metrics.pairwise import cosine_similarity
-
-    EMBEDDINGS_AVAILABLE = True
 except ImportError:
-    EMBEDDINGS_AVAILABLE = False
+    pass
 
 
 # ====================================================================== #
@@ -507,7 +508,6 @@ async def _wasmtime_sandbox_fallback(
     wasm_module_path = os.environ.get("VIBE_WASM_PYTHON_MODULE", "")
     if wasm_module_path:
         try:
-            import wasmtime  # type: ignore
             from wasmtime import (  # type: ignore
                 Engine, Module, Store, Instance, Config,
             )
@@ -732,7 +732,7 @@ class HybridReasoningOrchestrator:
                     executor.set_proxy_egress(proxy_egress)
                     print(f"[Orchestrator] SNI proxy egress enabled: "
                           f"{proxy_egress}"
-                          + (f" (domain-level filtering)"
+                          + (" (domain-level filtering)"
                              if network_allowlist else ""))
         # If the verifier's executor is a WarmDockerPool, start it eagerly so
         # the first code task doesn't pay the cold-start cost.
@@ -1317,7 +1317,7 @@ class HybridReasoningOrchestrator:
             try:
                 from format_enforcer import (
                     make_enforcer, SchemaKind,
-                    STRUCTURED_OUTPUT_GRAMMAR, CLAIMS_JSON_GRAMMAR,
+                    STRUCTURED_OUTPUT_GRAMMAR,
                     LOGIC_CONSTRAINTS_GRAMMAR,
                 )
                 kind = (
@@ -1561,7 +1561,7 @@ class HybridReasoningOrchestrator:
                 # Inside a block — a fence line either closes it or is
                 # literal content. CommonMark: a closing fence must use
                 # >= the opener's backtick count AND have no info string.
-                _indent, ticks, info = m.group(1), m.group(2), m.group(3)
+                _, ticks, info = m.group(1), m.group(2), m.group(3)
                 if len(ticks) >= len(current_fence) and info.strip() == "":
                     # Closing fence — save the block.
                     blocks.append((current_tag, "\n".join(current_block)))
@@ -1574,7 +1574,7 @@ class HybridReasoningOrchestrator:
             elif m and current_block is None:
                 # Opening fence — extract the language tag (info string).
                 # Only the first whitespace-delimited token is the lang.
-                _indent, ticks, info = m.group(1), m.group(2), m.group(3)
+                _, ticks, info = m.group(1), m.group(2), m.group(3)
                 tag = info.strip().split()[0].lower() if info.strip() else ""
                 current_tag = tag if tag else None
                 current_fence = ticks
@@ -1936,8 +1936,8 @@ class HybridReasoningOrchestrator:
             gen_prompt = self._CODE_GEN_PROMPT.format(
                 query=query_with_ctx, tests=tests)
             if few_shot:
-                print(f"[CodeLoop] Retrieved verified examples as "
-                      f"few-shot context")
+                print("[CodeLoop] Retrieved verified examples as "
+                      "few-shot context")
             print(f"[CodeLoop] Generating {self.code_candidates} candidates + "
                   f"test spec verification (attempt {attempt + 1}/2)")
             candidates_raw = await asyncio.gather(
@@ -2179,8 +2179,8 @@ class HybridReasoningOrchestrator:
             repair_attempts_made = repair_attempt + 1
 
         # No candidate passed — return the first with honest score 0.0.
-        print(f"[CodeLoop] No candidate passed verification — "
-              f"returning best-effort (unverified)")
+        print("[CodeLoop] No candidate passed verification — "
+              "returning best-effort (unverified)")
         return OrchestratorResult(
             final_answer=candidates[0][1],
             route_taken="code_specialist_unverified",
@@ -2326,8 +2326,8 @@ class HybridReasoningOrchestrator:
                           f"{self._retrieval_backend.name} for factual "
                           f"verification")
                 else:
-                    print(f"[CLR] Retrieval returned no sources — "
-                          f"verifier will return unsupported_factual")
+                    print("[CLR] Retrieval returned no sources — "
+                          "verifier will return unsupported_factual")
 
         elif task_type == "logic":
             # Z3 constraint translation (v0.4.1): the LogicVerifier needs
@@ -2355,8 +2355,8 @@ class HybridReasoningOrchestrator:
                       f"{len(context['constraints'])} constraint(s), "
                       f"{len(context['variables'])} variable(s)")
             else:
-                print(f"[CLR] Logic constraint translation failed — "
-                      f"verifier will return verified=False (no constraints)")
+                print("[CLR] Logic constraint translation failed — "
+                      "verifier will return verified=False (no constraints)")
 
         return context
 
@@ -2578,8 +2578,8 @@ class HybridReasoningOrchestrator:
         # return early inside the loop (line above).
         if result is None:
             return None
-        print(f"[CLR] Logic translation retries exhausted — returning "
-              f"best-effort (will fail at verification)")
+        print("[CLR] Logic translation retries exhausted — returning "
+              "best-effort (will fail at verification)")
         return result
         """Run CLR, but return a cached result if a similar high-score
         problem was solved before. Returns (result, cache_hit).
@@ -2595,8 +2595,8 @@ class HybridReasoningOrchestrator:
                 # (Defensive: old cache files may contain bad entries.)
                 if ((cached["best_answer"] or "").strip().lower()
                         in self._UNCACHEABLE_ANSWERS):
-                    print(f"[CLRCache] HIT but answer is uncacheable "
-                          f"sentinel — ignoring cache")
+                    print("[CLRCache] HIT but answer is uncacheable "
+                          "sentinel — ignoring cache")
                 else:
                     print(
                         f"[CLRCache] HIT (sim={cached['similarity']:.3f}, "
@@ -2912,7 +2912,6 @@ class HybridReasoningOrchestrator:
             return {"status": "disabled"}
         try:
             import aiohttp
-            import json as _json
 
             # Export local patterns.
             local_patterns = self._sona_export_patterns()
@@ -2933,7 +2932,7 @@ class HybridReasoningOrchestrator:
                     f"{self._sona_sync_url}/api/sona/sync",
                     json=export_payload,
                 ) as resp:
-                    post_result = await resp.json()
+                    await resp.json()  # acknowledge POST
 
                 # GET global patterns (may be encrypted).
                 async with session.get(

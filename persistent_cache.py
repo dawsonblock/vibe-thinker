@@ -26,13 +26,12 @@ import json
 import os
 import tempfile
 import threading
-import uuid as _uuid
 from collections import OrderedDict
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
-from vector_store import VectorStore, LocalVectorStore, make_vector_store
+from vector_store import VectorStore, make_vector_store
 
 # Optional deps for semantic CLR cache — each imported independently so
 # that the absence of one does not mask the availability of another.

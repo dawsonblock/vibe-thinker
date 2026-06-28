@@ -168,7 +168,7 @@ def main() -> int:
             if bad:
                 print(f"  ERROR: ZIP contains junk files: {bad}")
                 return 1
-            print(f"  Verified: no __pycache__ or .pyc files in ZIP")
+            print("  Verified: no __pycache__ or .pyc files in ZIP")
             print(f"  Entries: {len(zf.namelist())}")
 
         return 0

@@ -110,8 +110,8 @@ def _build_network_allowlist(args) -> "object | None":
         return None
 
     if allowlist.is_empty:
-        print(f"[CLI] Network allow-list is empty — deny all egress "
-              f"(same as --network=none)")
+        print("[CLI] Network allow-list is empty — deny all egress "
+              "(same as --network=none)")
     else:
         summary = allowlist.summary()
         print(f"[CLI] Network allow-list active ({source}): "
@@ -1283,7 +1283,7 @@ def _run_finalize_migration() -> int:
     # Import the recall verification from the migration script (already
     # loaded above for the reachability check).
     verify_recall = _mig_mod.verify_recall
-    print(f"\n=== Recall verification ===")
+    print("\n=== Recall verification ===")
     vres = verify_recall(
         agentdb, clr_path, traj_path,
         sample_size=args.sample_size,

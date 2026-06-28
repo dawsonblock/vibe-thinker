@@ -16,7 +16,6 @@ import pytest
 from unittest.mock import patch, MagicMock, AsyncMock
 
 from sandbox import WarmDockerPool
-from sandbox.warm_pool_executor import WarmDockerPool as _WarmDockerPool
 from verifiers.code_verifier import select_executor
 
 
