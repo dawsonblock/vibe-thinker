@@ -4,12 +4,44 @@ The SandboxExecutor protocol is the abstraction layer between
 CodeVerifier and the actual isolation backend (Docker, sbx, Shuru).
 The control plane should not care which backend runs the command —
 it cares about policy, evidence, exit code, and logs.
+
+Security note (v0.4.0-alpha stabilization):
+  The current proxy-based network mode (BEST_EFFORT_PROXY) is NOT a
+  security boundary. It only affects clients that respect HTTP_PROXY /
+  HTTPS_PROXY environment variables. It does NOT prevent raw socket
+  egress, DNS bypasses, or direct IP connections. The default is
+  NetworkMode.DISABLED. Use ENFORCED_GATEWAY only when you have
+  validated the Docker --internal network + gateway container setup.
 """
 
 import secrets
 import textwrap
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
+
+
+class NetworkMode(str, Enum):
+    """Sandbox network isolation mode.
+
+    DISABLED (default): no network access at all. The safest mode.
+        Use this for all untrusted code execution.
+
+    BEST_EFFORT_PROXY: sets HTTP_PROXY / HTTPS_PROXY env vars to route
+        through an SNI egress proxy. NOT a security boundary — clients
+        that ignore proxy env vars (raw sockets, direct IP) can bypass
+        it. Use only with trusted code that respects proxy conventions.
+
+    ENFORCED_GATEWAY: the candidate container runs on a Docker
+        --internal network with no direct internet access. All egress
+        goes through a gateway/proxy container that enforces the
+        allow-list at the network level. This IS a security boundary
+        (when correctly configured). Requires Docker.
+    """
+
+    DISABLED = "disabled"
+    BEST_EFFORT_PROXY = "best_effort_proxy"
+    ENFORCED_GATEWAY = "enforced_gateway"
 
 
 # Environment variable name carrying the per-execution verification nonce.

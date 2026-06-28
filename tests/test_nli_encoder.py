@@ -18,6 +18,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+pytestmark = pytest.mark.embeddings
+
 from verifiers.nli_encoder import EncoderNLIJudge, is_available
 
 

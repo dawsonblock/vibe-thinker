@@ -8,6 +8,8 @@ import asyncio
 import json
 import pytest
 
+pytestmark = [pytest.mark.web, pytest.mark.federation]
+
 from federation_server import FederationState, create_federation_app
 
 

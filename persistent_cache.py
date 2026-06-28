@@ -29,9 +29,29 @@ import threading
 import uuid as _uuid
 from collections import OrderedDict
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
 from vector_store import VectorStore, LocalVectorStore, make_vector_store
+
+
+class CacheSimilarityMode(str, Enum):
+    """Cache similarity mode (Phase 8 — cache/embedding decoupling).
+
+    NONE (default): exact key lookup only. No embeddings, no similarity
+        search. The lightest mode — works with zero optional deps.
+
+    HASH: cheap lexical/fingerprint similarity. No embeddings needed.
+        Uses a text hash for approximate matching. Faster than embeddings
+        but less semantically accurate.
+
+    EMBEDDINGS: semantic search via sentence-transformers/FAISS. The
+        most accurate mode but requires the [embeddings] extra.
+    """
+
+    NONE = "none"
+    HASH = "hash"
+    EMBEDDINGS = "embeddings"
 
 # Optional deps for semantic CLR cache
 try:
@@ -42,6 +62,25 @@ try:
     EMBEDDINGS_AVAILABLE = True
 except ImportError:
     EMBEDDINGS_AVAILABLE = False
+    # Define a sentinel so `patch("persistent_cache.SentenceTransformer")`
+    # in tests doesn't raise AttributeError when sentence-transformers is
+    # not installed. The sentinel is never called in production when
+    # EMBEDDINGS_AVAILABLE is False — code paths check the flag first.
+    # Tests that patch it set EMBEDDINGS_AVAILABLE=True via mocking.
+    class SentenceTransformer:  # type: ignore[no-redef]
+        """Stub used when sentence-transformers is not installed.
+
+        This exists so that ``patch("persistent_cache.SentenceTransformer")``
+        in tests works whether or not the real package is installed.
+        It is never instantiated in production when
+        ``EMBEDDINGS_AVAILABLE`` is False.
+        """
+
+        def __init__(self, *args, **kwargs):
+            raise ImportError(
+                "sentence-transformers is not installed. "
+                "Install with: pip install sentence-transformers"
+            )
 
 
 # ====================================================================== #
@@ -376,9 +415,28 @@ class CLRResultCache:
         agentdb_collection: str = "clr_results",
         agentdb_only: bool = False,
     ):
-        if not EMBEDDINGS_AVAILABLE:
+        # Phase 3 (stabilization): when a vector_store is injected, don't
+        # require the heavy embedding deps if the vector_store can handle
+        # its own embedding generation. However, LocalVectorStore and
+        # AgentDBVectorStore still need pre-computed embeddings for
+        # indexing, so we still load the embedding model when available.
+        # The key change: we don't RAISE ImportError when a vector_store
+        # is provided — the caller may have a custom store that handles
+        # embeddings internally. If embeddings are needed but not
+        # available, the insert/search methods will fail at runtime with
+        # a clear error instead of failing at construction.
+        self._vector_store: Optional[VectorStore] = vector_store
+        if self._vector_store is None and agentdb_url:
+            self._vector_store = make_vector_store(
+                agentdb_url=agentdb_url,
+                collection=agentdb_collection,
+            )
+
+        if not EMBEDDINGS_AVAILABLE and self._vector_store is None:
             raise ImportError(
-                "CLRResultCache needs: pip install sentence-transformers scikit-learn numpy"
+                "CLRResultCache needs: pip install sentence-transformers "
+                "scikit-learn numpy  (OR provide vector_store= for a "
+                "custom similarity backend)"
             )
         self.path = path
         self.model_name = model_name
@@ -387,26 +445,18 @@ class CLRResultCache:
         self.max_entries = max_entries
         self.autosave = autosave
 
-        self.model = get_shared_embedding_model(model_name)
+        # Load the embedding model when available (needed for generating
+        # entry/query embeddings even when a vector_store is injected,
+        # since LocalVectorStore/AgentDBVectorStore store pre-computed
+        # vectors, not raw text).
+        self.model = (
+            get_shared_embedding_model(model_name)
+            if EMBEDDINGS_AVAILABLE
+            else None
+        )
         self.entries: List[Dict[str, Any]] = []
         self._embeddings_matrix: Optional[Any] = None  # np.ndarray, rebuilt on load
         self._save_lock = threading.Lock()  # Phase 5: prevent concurrent save races
-
-        # Vector store backend (v0.3.9). When provided, similarity search
-        # is delegated to it (AgentDB sidecar) instead of the in-memory
-        # numpy matrix. When None, the in-memory matrix is used (default,
-        # unchanged behavior). The agentdb_url convenience parameter
-        # builds an AgentDBVectorStore automatically.
-        # v3.2.1: ShadowVectorStore was removed. When agentdb_url is set,
-        # AgentDB is used DIRECTLY (no local shadow/fallback). The
-        # agentdb_only flag is accepted for backward API/CLI compat but is
-        # now a no-op — setting agentdb_url always means AgentDB-only.
-        self._vector_store: Optional[VectorStore] = vector_store
-        if self._vector_store is None and agentdb_url:
-            self._vector_store = make_vector_store(
-                agentdb_url=agentdb_url,
-                collection=agentdb_collection,
-            )
 
         self._load()
 
@@ -635,10 +685,21 @@ class VerifiedTrajectoryStore:
         agentdb_collection: str = "trajectories",
         agentdb_only: bool = False,
     ):
-        if not EMBEDDINGS_AVAILABLE:
+        # Phase 3 (stabilization): when a vector_store is injected, don't
+        # require the heavy embedding deps at construction time. See
+        # CLRResultCache.__init__ for the same pattern.
+        self._vector_store: Optional[VectorStore] = vector_store
+        if self._vector_store is None and agentdb_url:
+            self._vector_store = make_vector_store(
+                agentdb_url=agentdb_url,
+                collection=agentdb_collection,
+            )
+
+        if not EMBEDDINGS_AVAILABLE and self._vector_store is None:
             raise ImportError(
                 "VerifiedTrajectoryStore needs: pip install "
-                "sentence-transformers scikit-learn numpy"
+                "sentence-transformers scikit-learn numpy  "
+                "(OR provide vector_store= for a custom similarity backend)"
             )
         self.path = path
         self.model_name = model_name
@@ -647,24 +708,16 @@ class VerifiedTrajectoryStore:
         self.max_few_shot = max_few_shot
         self.autosave = autosave
 
-        self.model = get_shared_embedding_model(model_name)
+        # Load the embedding model when available (needed for generating
+        # entry/query embeddings even when a vector_store is injected).
+        self.model = (
+            get_shared_embedding_model(model_name)
+            if EMBEDDINGS_AVAILABLE
+            else None
+        )
         self.entries: List[Dict[str, Any]] = []
         self._embeddings_matrix: Optional[Any] = None
         self._save_lock = threading.Lock()  # Phase 5: prevent concurrent save races
-
-        # Vector store backend (v0.3.9). See CLRResultCache.__init__ for
-        # the same pattern: when provided, similarity search is delegated
-        # to the vector store (AgentDB sidecar) instead of the in-memory
-        # numpy matrix. Default is None (in-memory, unchanged behavior).
-        # v3.2.1: ShadowVectorStore was removed — agentdb_url always
-        # produces an AgentDBVectorStore directly. agentdb_only is kept
-        # for backward API/CLI compat but is a no-op.
-        self._vector_store: Optional[VectorStore] = vector_store
-        if self._vector_store is None and agentdb_url:
-            self._vector_store = make_vector_store(
-                agentdb_url=agentdb_url,
-                collection=agentdb_collection,
-            )
 
         self._load()
 

@@ -9,6 +9,9 @@ import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+pytestmark = [pytest.mark.web, pytest.mark.federation]
+
 from fastapi.testclient import TestClient
 
 from federation_server import (

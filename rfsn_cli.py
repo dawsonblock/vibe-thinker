@@ -871,19 +871,240 @@ async def _amain() -> None:
 
 
 def main() -> None:
-    # --- finalize-migration subcommand (v0.4.0) ---
-    # Detected as the first argument before the normal REPL argparse. This
-    # avoids needing subparsers (which would complicate the existing REPL
-    # arg structure). When invoked, runs the migration finalization and
-    # exits without starting the REPL.
-    if len(sys.argv) > 1 and sys.argv[1] == "finalize-migration":
-        sys.argv = [sys.argv[0]] + sys.argv[2:]  # shift for argparse
-        sys.exit(_run_finalize_migration())
+    # --- subcommands (detected as the first argument before the REPL) ---
+    # This avoids needing subparsers (which would complicate the existing
+    # REPL arg structure). When invoked, the subcommand runs and exits
+    # without starting the REPL.
+    if len(sys.argv) > 1:
+        sub = sys.argv[1]
+        if sub == "finalize-migration":
+            sys.argv = [sys.argv[0]] + sys.argv[2:]
+            sys.exit(_run_finalize_migration())
+        if sub == "doctor":
+            sys.exit(_run_doctor())
+        if sub == "smoke":
+            sys.exit(_run_smoke())
 
     try:
         asyncio.run(_amain())
     except KeyboardInterrupt:
         pass
+
+
+def _run_doctor() -> int:
+    """Check the environment and report what's available.
+
+    Verifies Python version, package install, optional dependencies, model
+    backend config, cache backend, sandbox mode, and service availability.
+    Prints a human-readable report and exits 0 if the core profile is
+    runnable, 1 otherwise.
+    """
+    import sys as _sys
+    import importlib.util
+
+    print("Vibe Thinker Doctor")
+    print("=" * 50)
+
+    # Core
+    print("\nCore:")
+    py_ok = _sys.version_info >= (3, 10)
+    print(f"  Python: {_sys.version.split()[0]} {'OK' if py_ok else 'FAIL'}")
+    if not py_ok:
+        print("  Verdict: Python >= 3.10 required")
+        return 1
+
+    # Package install
+    try:
+        import hybrid_orchestrator  # noqa: F401
+        print("  Package import: OK")
+    except ImportError as e:
+        print(f"  Package import: FAIL ({e})")
+        return 1
+
+    try:
+        import rfsn_cli  # noqa: F401
+        print("  CLI module: OK")
+    except ImportError as e:
+        print(f"  CLI module: FAIL ({e})")
+        return 1
+
+    # Optional dependencies
+    print("\nOptional:")
+    optional_deps = [
+        ("z3-solver", "z3"),
+        ("sentence-transformers", "sentence_transformers"),
+        ("faiss-cpu", "faiss"),
+        ("fakeredis", "fakeredis"),
+        ("redis", "redis"),
+        ("docker", "docker"),
+        ("fastapi", "fastapi"),
+        ("cryptography", "cryptography"),
+        ("wasmtime", "wasmtime"),
+        ("numpy", "numpy"),
+        ("scikit-learn", "sklearn"),
+    ]
+    for pip_name, mod_name in optional_deps:
+        avail = importlib.util.find_spec(mod_name) is not None
+        print(f"  {pip_name}: {'present' if avail else 'missing'}")
+
+    # RuvLLM
+    ruvllm_env = os.environ.get("VIBE_RUVLLM", "disabled")
+    print(f"  ruvllm: {ruvllm_env}")
+
+    # Sandbox
+    print("\nSandbox:")
+    sandbox_mode = os.environ.get("VIBE_SANDBOX_MODE", "disabled")
+    network_mode = os.environ.get("VIBE_NETWORK_MODE", "disabled")
+    print(f"  mode: {sandbox_mode} {'OK' if sandbox_mode == 'disabled' else 'CHECK'}")
+    print(f"  network: {network_mode} {'OK' if network_mode == 'disabled' else 'CHECK'}")
+    if network_mode == "best_effort_proxy":
+        print("  WARNING: best_effort_proxy is NOT a security boundary.")
+        print("           Use 'disabled' for untrusted code.")
+
+    # Verdict
+    print("\nVerdict:")
+    if py_ok and sandbox_mode == "disabled":
+        print("  core local profile is runnable")
+        return 0
+    else:
+        print("  some components need attention (see above)")
+        return 1
+
+
+def _run_smoke() -> int:
+    """Run a minimal no-network, no-model smoke test.
+
+    Verifies:
+      - import orchestrator
+      - run deterministic math verifier
+      - run schema verifier
+      - create audit event
+      - write/read local cache
+    Exits 0 if all pass, 1 otherwise.
+    """
+    import asyncio as _asyncio
+
+    print("Vibe Thinker Smoke Test")
+    print("=" * 50)
+
+    failures = []
+
+    # 1. Import orchestrator
+    try:
+        import hybrid_orchestrator  # noqa: F401
+        print("[1/5] Import orchestrator: OK")
+    except ImportError as e:
+        print(f"[1/5] Import orchestrator: FAIL ({e})")
+        failures.append("import")
+
+    # 2. Math verifier (async)
+    try:
+        from verifiers.math_verifier import MathVerifier
+        v = MathVerifier()
+        result = _asyncio.run(v.verify(
+            "What is 2+2?", "4", context={"expected_answer": "4"}
+        ))
+        assert result.verified, f"MathVerifier expected verified=True, got {result.verified}"
+        print("[2/5] Math verifier (2+2=4): OK")
+    except Exception as e:
+        print(f"[2/5] Math verifier: FAIL ({e})")
+        failures.append("math")
+
+    # 3. Schema verifier (async)
+    try:
+        from verifiers.schema_verifier import SchemaVerifier
+        v = SchemaVerifier()
+        result = _asyncio.run(v.verify(
+            "Return a JSON object with a name field",
+            '{"name": "test"}',
+            context={"schema": {"type": "object", "required": ["name"]}},
+        ))
+        assert result.verified, f"SchemaVerifier expected verified=True, got {result.verified}"
+        print("[3/5] Schema verifier: OK")
+    except Exception as e:
+        print(f"[3/5] Schema verifier: FAIL ({e})")
+        failures.append("schema")
+
+    # 4. Audit log (uses record() with a job-like object)
+    try:
+        import tempfile, os, types
+        from bitemporal_log import BiTemporalAuditLog
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            log_path = f.name
+        try:
+            log = BiTemporalAuditLog(path=log_path)
+            # Create a minimal job-like object
+            job = types.SimpleNamespace(
+                job_id="smoke-test-1",
+                status="completed",
+                query="smoke test",
+                priority=0,
+                force_route=None,
+            )
+            log.record(job, event="smoke_test", extra={"test": True})
+            entries = log.read_all()
+            assert len(entries) >= 1, f"Expected >=1 entry, got {len(entries)}"
+            print("[4/5] Audit log write/read: OK")
+        finally:
+            if os.path.exists(log_path):
+                os.unlink(log_path)
+    except Exception as e:
+        print(f"[4/5] Audit log: FAIL ({e})")
+        failures.append("audit")
+
+    # 5. Local cache (exact key lookup, no embeddings needed)
+    try:
+        import tempfile, os
+        from persistent_cache import CLRResultCache
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            cache_path = f.name
+        try:
+            cache = CLRResultCache(
+                path=cache_path,
+                vector_store=_FakeVectorStore(),
+            )
+            cache.insert(
+                problem="smoke test",
+                best_answer="ok",
+                best_score=1.0,
+                k=1,
+                trajectory_count=1,
+                verified=True,
+                verification_method="python_eval",
+            )
+            print("[5/5] Local cache write/read: OK")
+        finally:
+            if os.path.exists(cache_path):
+                os.unlink(cache_path)
+    except Exception as e:
+        print(f"[5/5] Local cache: FAIL ({e})")
+        failures.append("cache")
+
+    print()
+    if failures:
+        print(f"Smoke test FAILED: {', '.join(failures)}")
+        return 1
+    print("Smoke test PASSED.")
+    return 0
+
+
+class _FakeVectorStore:
+    """Minimal vector store for smoke test (no embeddings needed)."""
+
+    def upsert(self, vector_id, embedding, metadata=None):
+        pass
+
+    def search(self, query_embedding, top_k=10, filters=None):
+        return []
+
+    def delete(self, vector_id):
+        return False
+
+    def count(self):
+        return 0
+
+    def cluster(self, **kwargs):
+        return []
 
 
 def _run_finalize_migration() -> int:

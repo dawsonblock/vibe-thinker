@@ -14,6 +14,8 @@ import json
 
 import pytest
 
+pytestmark = [pytest.mark.federation, pytest.mark.web]
+
 import fakeredis.aioredis
 
 from web.app import (

@@ -2,9 +2,12 @@
 
 import json
 import os
-import numpy as np
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
+
+pytestmark = pytest.mark.embeddings
+
+import numpy as np
 
 from persistent_cache import VerifiedTrajectoryStore, _clear_embedding_model_cache
 

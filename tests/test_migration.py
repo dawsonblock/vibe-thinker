@@ -11,6 +11,8 @@ import pytest
 import importlib.util
 from unittest.mock import patch, MagicMock
 
+pytestmark = pytest.mark.embeddings
+
 import numpy as np
 
 # Load the migration script as a module (it's not in a package).

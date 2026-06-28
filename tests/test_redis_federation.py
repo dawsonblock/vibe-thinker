@@ -18,6 +18,8 @@ import asyncio
 
 import pytest
 
+pytestmark = [pytest.mark.federation, pytest.mark.web]
+
 import fakeredis.aioredis
 
 from federation_server import (

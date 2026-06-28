@@ -15,6 +15,8 @@ import tempfile
 
 import pytest
 
+pytestmark = pytest.mark.embeddings
+
 from vector_store import (
     LocalVectorStore,
     AgentDBVectorStore,

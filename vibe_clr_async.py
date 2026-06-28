@@ -355,17 +355,31 @@ class VibeThinkerCLRAsync:
         if guardrail.warning:
             print(f"[CLR] Hardware guardrail: {guardrail.warning}")
 
-        # --- RuvLLM in-process binding (v0.3.9, optional) ---
+        # --- RuvLLM in-process binding (v0.3.9, optional, EXPERIMENTAL) ---
         # When ruvllm_py is installed (PyO3 wrapper around the Rust ruvllm
         # crate), prefer it over llama-cpp-python for TurboQuant KV cache
         # compression. Falls back to llama-cpp-python if not installed.
-        try:
-            from ruvllm_adapter import is_ruvllm_binding_available, RuvLLMBinding
-        except ImportError:
-            is_ruvllm_binding_available = lambda: False  # type: ignore
-            RuvLLMBinding = None  # type: ignore
+        #
+        # v0.4.0-alpha: RuvLLM is EXPERIMENTAL. It requires
+        # VIBE_RUVLLM=enabled to activate the in-process binding. Without
+        # this env var, the binding is not used even if installed.
+        ruvllm_enabled = os.environ.get("VIBE_RUVLLM", "disabled") == "enabled"
+        if not ruvllm_enabled:
+            use_ruvllm = False
+            RuvLLMBinding = None
+        else:
+            try:
+                from ruvllm_adapter import is_ruvllm_binding_available, RuvLLMBinding
+            except ImportError:
+                is_ruvllm_binding_available = lambda: False  # type: ignore
+                RuvLLMBinding = None  # type: ignore
 
-        use_ruvllm = is_ruvllm_binding_available()
+            use_ruvllm = is_ruvllm_binding_available()
+            if not use_ruvllm:
+                print("[CLR] RuvLLM backend requested (VIBE_RUVLLM=enabled) but "
+                      "unavailable. Install with the rust extra and run "
+                      "maturin develop, or use HTTP backend. "
+                      "See: ./scripts/check_ruvllm.sh")
         if use_ruvllm:
             print(f"[CLR] RuvLLM PyO3 binding detected — preferring over "
                   f"llama-cpp-python for TurboQuant KV cache compression.")

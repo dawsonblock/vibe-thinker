@@ -7,6 +7,8 @@ that allow the web UI server to act as a federation coordinator.
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
+pytestmark = [pytest.mark.web, pytest.mark.federation]
+
 
 @pytest.fixture
 def web_client():

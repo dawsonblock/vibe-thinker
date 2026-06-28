@@ -1,15 +1,85 @@
 # vibe-thinker
 
-Hybrid reasoning orchestrator for local LLMs. Routes queries between a
-high-precision reasoning specialist (VibeThinker-3B with Claim-Level
-Reliability) and a generalist model, with a priority async job queue,
-bi-temporal audit logging, deterministic verifiers, and an interactive CLI.
+Verifier-driven local reasoning engine with adaptive compute. Routes
+queries between a high-precision reasoning specialist and a generalist
+model, with deterministic verifiers, bi-temporal audit logging, and an
+interactive CLI.
 
-## Status: ALPHA SOFTWARE (v0.3.9)
+## Current status: ALPHA (v0.4.0-alpha)
 
-**This is alpha software.** It is a local reasoning control plane prototype,
-not a production reasoning engine. The following limitations are real and
-intentional:
+**Not production-safe.** This is alpha software. See `docs/roadmap.md`
+for the stabilization plan and frozen feature scope.
+
+## What works
+
+- adaptive CLR (Claim-Level Reliability)
+- verifier scoring (math, schema, code, factual, logic)
+- local JSON/SQLite cache
+- bi-temporal audit log with HMAC/Ed25519 signatures
+- interactive CLI (`vibe-thinker`)
+- `vibe-thinker doctor` and `vibe-thinker smoke` health checks
+- basic federation components (in-memory + Redis)
+
+## What is experimental
+
+- RuvLLM (Rust inference engine — requires `VIBE_RUVLLM=enabled`)
+- Redis federation
+- web PubSub dashboard
+- Docker sandbox egress enforcement
+
+## What is not safe yet
+
+- hostile-code sandboxing (see Security status below)
+- production autonomous operation
+- real distributed trust
+
+## Quickstart: Mac local
+
+```bash
+# Create a venv and install core deps (no Docker/Redis/Rust needed)
+./scripts/mac_setup.sh
+
+# Run the smoke test
+source .venv/bin/activate
+export $(grep -v '^#' profiles/mac-local.env | xargs)
+vibe-thinker doctor
+vibe-thinker smoke
+```
+
+Point at a local llama.cpp server:
+```bash
+llama-server -m /path/to/model.gguf -c 4096 --host 127.0.0.1 --port 8080
+export VIBE_MODEL_BACKEND=http
+export VIBE_MODEL_BASE_URL=http://127.0.0.1:8080
+vibe-thinker
+```
+
+## Test layers
+
+```bash
+# Core tests (no optional deps required)
+./scripts/test_core.sh
+
+# Optional tests (requires optional deps)
+pip install -e ".[dev,test,logic,embeddings,federation,web,sandbox]"
+./scripts/test_optional.sh
+
+# Full suite + wheel build
+./scripts/test_all.sh
+```
+
+## Security status
+
+**The current best-effort proxy mode is NOT a security boundary.** It
+only affects clients that respect `HTTP_PROXY`/`HTTPS_PROXY` environment
+variables. It does not prevent raw socket egress, DNS bypasses, or
+direct IP connections.
+
+Do not run hostile code with network access enabled. Use sandbox network
+mode `disabled` unless you have validated enforced gateway mode.
+
+See `sandbox/sni_proxy.py` for the documented SNI spoofing limitation
+and `sandbox/network_allowlist.py` for the IPv6 limitation.
 
 - **Self-claim verification is capped at 0.65.** The model checking its own
   claims is a weak heuristic, not independent verification. The runtime

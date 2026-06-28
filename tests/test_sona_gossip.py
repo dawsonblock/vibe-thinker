@@ -6,6 +6,8 @@ orchestrator's SONA export/import methods.
 
 import pytest
 
+pytestmark = [pytest.mark.web, pytest.mark.federation]
+
 from federation_server import create_federation_app
 
 
