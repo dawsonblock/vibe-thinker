@@ -81,6 +81,23 @@ The verifier **refuses to run** if no sandbox is available and
 `allow_unsafe=False`. It does not fall back to host execution for
 untrusted code.
 
+## Sandbox network status
+
+The default safe mode is `DISABLED`, which runs candidate code with
+Docker `--network none`.
+
+`BEST_EFFORT_PROXY` is not a security boundary. It only affects clients
+that respect proxy environment variables. Code may bypass it with raw
+sockets, direct IP connections, custom DNS, or clients that ignore
+proxy variables.
+
+`ENFORCED_GATEWAY` is experimental. Command wiring and fail-closed
+behavior are tested, but real egress enforcement is not considered
+proven until Docker bypass tests pass for raw sockets, DNS bypass,
+direct IP HTTPS, metadata service access, and host-LAN access.
+
+Do not run hostile code with network access enabled.
+
 ## Running vibe-thinker in an sbx microVM
 
 ```bash

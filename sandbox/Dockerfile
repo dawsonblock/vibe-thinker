@@ -2,9 +2,9 @@
 #
 # This image is purpose-built for the DockerSandboxExecutor. It includes:
 #   - Python 3.12 (slim base)
-#   - iptables + ip6tables (legacy in-container firewall; DEPRECATED in
-#     favor of host-level SNI-proxy / Envoy egress — kept for opt-in
-#     fallback via `docker run --user root`)
+#   - iptables + ip6tables (legacy in-container firewall; DEPRECATED.
+#     The host-level SNI-proxy / Envoy egress path is also experimental
+#     — kept for opt-in fallback via `docker run --user root`)
 #   - curl (for integration tests that verify network denial)
 #   - A non-root user 'sandbox' (uid 1000) — the DEFAULT runtime user
 #

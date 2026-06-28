@@ -106,15 +106,22 @@ pip install -e ".[dev,test,logic,embeddings,federation,web,sandbox]"
 ./scripts/test_all.sh
 ```
 
-## Security status
+## Sandbox network status
 
-**The current best-effort proxy mode is NOT a security boundary.** It
-only affects clients that respect `HTTP_PROXY`/`HTTPS_PROXY` environment
-variables. It does not prevent raw socket egress, DNS bypasses, or
-direct IP connections.
+The default safe mode is `DISABLED`, which runs candidate code with
+Docker `--network none`.
 
-Do not run hostile code with network access enabled. Use sandbox network
-mode `disabled` unless you have validated enforced gateway mode.
+`BEST_EFFORT_PROXY` is not a security boundary. It only affects clients
+that respect proxy environment variables. Code may bypass it with raw
+sockets, direct IP connections, custom DNS, or clients that ignore
+proxy variables.
+
+`ENFORCED_GATEWAY` is experimental. Command wiring and fail-closed
+behavior are tested, but real egress enforcement is not considered
+proven until Docker bypass tests pass for raw sockets, DNS bypass,
+direct IP HTTPS, metadata service access, and host-LAN access.
+
+Do not run hostile code with network access enabled.
 
 See `sandbox/sni_proxy.py` for the documented SNI spoofing limitation
 and `sandbox/network_allowlist.py` for the IPv6 limitation.
@@ -580,9 +587,14 @@ search (fail-closed: searches return empty if AgentDB is down). The
 — operators cut over to AgentDB-only directly (run `finalize-migration`
 first to archive local JSON, then restart with `--agentdb-url`).
 
-### RuvLLM inference backend (`ruvllm_adapter.py`)
+### RuvLLM inference backend (`ruvllm_adapter.py`) — experimental
 
 RuvLLM is a Rust inference engine with TurboQuant KV cache compression.
+It is **experimental**: the default Rust build may be a stub, the main
+Python wheel does not include `ruvllm_py`, and real inference requires
+Rust + maturin + Candle/Metal features. It is used only when explicitly
+installed and enabled.
+
 It exposes the same OpenAI-compatible HTTP API as llama-server, so the
 simplest integration is to point `--vibe` at the RuvLLM port:
 
@@ -601,8 +613,9 @@ python rfsn_cli.py --ruvllm-url http://127.0.0.1:8080
 | `--ruvllm-url` / `RUVLLM_URL` | empty | RuvLLM HTTP endpoint (overrides `--vibe`) |
 | `--fast-code-specialist` / `RFSN_FAST_CODE_SPECIALIST` | false | Bump `CODE_CANDIDATES` to 15 for ultra-fast 0.5B code models |
 
-When the `ruvllm_py` PyO3 binding is installed (not yet published), the
-in-process backend prefers it over `llama-cpp-python` for zero-HTTP-
+When the `ruvllm_py` PyO3 binding is installed (not yet published; used
+only when explicitly installed and enabled; experimental), the
+in-process backend can use it over `llama-cpp-python` for zero-HTTP-
 overhead inference with native TurboQuant compression.
 
 ### Federated job queue (`federated_queue.py`)

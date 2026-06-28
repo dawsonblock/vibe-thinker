@@ -2,8 +2,9 @@
 
 ## v0.4.6a0
 
-Stabilization-only release. No new features. Documentation cleanup
-and FastAPI deprecation fix addressing the v30 validation report.
+Stabilization-only release. No new features. Release-engineering
+stabilization, documentation cleanup, and FastAPI deprecation fix
+addressing the v30/v31 validation reports.
 
 ### Fixed
 - CLI help text: removed remaining iptables references from
@@ -13,9 +14,29 @@ and FastAPI deprecation fix addressing the v30 validation report.
 - `sandbox/entrypoint.sh`: "production path" → neutral wording.
   "NEVER set in production" → "NEVER set in normal operation".
 - `sandbox/network_allowlist.py`: module docstring now explicitly
-  marks the in-container iptables path as DEPRECATED, with the
-  SNI proxy / Envoy sidecar as the default and recommended mode.
-  ENFORCED egress marked EXPERIMENTAL / not production-safe.
+  marks the in-container iptables path as DEPRECATED. The SNI proxy /
+  Envoy sidecar is described as a legacy/prototype egress path (not
+  "recommended"), and ENFORCED egress is marked EXPERIMENTAL / not
+  production-safe.
+- `sandbox/Dockerfile`: removed "in favor of" SNI proxy recommendation;
+  both iptables and SNI proxy paths are now described as
+  experimental/deprecated.
+- `README.md`: replaced the ad-hoc "Security status" section with the
+  canonical "Sandbox network status" block describing all three network
+  modes (`DISABLED`, `BEST_EFFORT_PROXY`, `ENFORCED_GATEWAY`) with
+  honest enforcement claims.
+- `sandbox/README.md`: added the same canonical "Sandbox network
+  status" block.
+- `README.md`: RuvLLM section now explicitly marked **experimental**
+  (default Rust build may be stub; main wheel does not include
+  `ruvllm_py`; "preferred backend" wording replaced with "used only
+  when explicitly installed and enabled; experimental").
+- `scripts/build_clean_zip.py`: added `--use-current-env` and
+  `--self-contained` mode flags. `--self-contained` creates a temp
+  venv, installs `.[dev,test]`, and runs the core gate there (best for
+  release use). Default mode now fails if pytest is missing instead of
+  silently skipping. Added `require_test_deps()` check with actionable
+  remediation message.
 - FastAPI `on_event` deprecation warnings eliminated: `web/app.py`
   and `federation_server.py` now use the modern `lifespan` context
   manager pattern instead of the deprecated `@app.on_event`

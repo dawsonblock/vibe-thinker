@@ -6,9 +6,10 @@ executor applies these rules inside the container before running the
 candidate code, replacing the binary --network=none / --network=default
 choice with fine-grained egress control.
 
-NOTE: The in-container iptables path is DEPRECATED. The default and
-recommended egress mode is the host-level SNI proxy / Envoy sidecar,
-which inspects TLS SNI / HTTP Host headers instead of IP addresses.
+NOTE: The in-container iptables path is DEPRECATED. The host-level SNI
+proxy / Envoy sidecar (which inspects TLS SNI / HTTP Host headers
+instead of IP addresses) is the current default enforcement path, but
+it is a legacy/prototype egress path — use only after local validation.
 The iptables path is retained for defense-in-depth fallback and for
 environments where the SNI proxy is not available. ENFORCED egress
 is EXPERIMENTAL — not production-safe until real Docker bypass tests

@@ -12,18 +12,32 @@ creates the ZIP. The output filename is derived from the version in
 
 The pytest step uses no --timeout flags so it works with plain pytest
 (no pytest-timeout required). A subprocess timeout provides the outer
-guard. If pytest is not installed at all, the test step is skipped with
-a clear warning (compileall still runs).
+guard.
+
+Mode flags:
+    (default)          Run compile + core tests in the current Python
+                       environment. Fails if test deps (pytest) are
+                       missing — install with: pip install -e '.[dev,test]'
+    --use-current-env  Explicit alias for the default: run tests in the
+                       current environment.
+    --self-contained   Create a temporary venv, install .[dev,test], run
+                       core tests there, then build the ZIP. Best for
+                       release use — proves the repo works from clean.
+    --no-tests         Skip the pytest gate entirely (compileall only).
+    --tests            Force the pytest gate; fail if pytest is absent.
 
 Usage:
     python scripts/build_clean_zip.py
+    python scripts/build_clean_zip.py --no-tests
+    python scripts/build_clean_zip.py --use-current-env
+    python scripts/build_clean_zip.py --self-contained
 
 Output:
-    dist/vibe-thinker-v<version>.zip   (e.g. dist/vibe-thinker-v0.4.4a0.zip)
+    dist/vibe-thinker-v<version>.zip   (e.g. dist/vibe-thinker-v0.4.6a0.zip)
 
-Exit code is nonzero if compileall fails, or if pytest is available but
-the core gate fails. If pytest is absent, the ZIP is still created (with
-a warning) — compileall is the mandatory gate, pytest is best-effort.
+Exit code is nonzero if compileall fails, or if the core pytest gate
+fails. If pytest is absent and tests are not skipped (--no-tests), the
+build fails with a clear remediation message.
 """
 
 import compileall
@@ -163,35 +177,109 @@ def _pytest_available() -> bool:
         return False
 
 
+def require_test_deps() -> None:
+    """Fail with a clear message if pytest is not installed.
+
+    Called before running the pytest gate in current-env mode so the
+    error is actionable instead of a silent skip.
+    """
+    if not _pytest_available():
+        raise SystemExit(
+            "Missing test dependency: pytest\n"
+            "Install with: pip install -e '.[dev,test]'\n"
+            "Or run with --no-tests to skip the pytest gate."
+        )
+
+
 def _parse_args() -> tuple:
     """Parse command-line flags.
 
-    --no-tests : skip the pytest gate (compileall only). Use this when
-        building the ZIP outside a dev/test environment.
-    --tests    : force the pytest gate even if pytest is missing (will
-        fail with a clear error instead of skipping).
+    Returns (no_tests, force_tests, self_contained).
+
+    --no-tests        : skip the pytest gate (compileall only).
+    --tests           : force the pytest gate; fail if pytest is absent.
+    --use-current-env : explicit alias for the default (run tests in the
+                        current environment).
+    --self-contained  : create a temp venv, install .[dev,test], run core
+                        tests there, then build the ZIP.
     """
     no_tests = False
     force_tests = False
+    self_contained = False
     args = sys.argv[1:]
     for arg in args:
         if arg == "--no-tests":
             no_tests = True
         elif arg == "--tests":
             force_tests = True
+        elif arg == "--use-current-env":
+            pass  # explicit alias for default; no flag needed
+        elif arg == "--self-contained":
+            self_contained = True
         elif arg in ("--help", "-h"):
             print(__doc__)
             sys.exit(0)
         else:
             print(f"Unknown argument: {arg}", file=sys.stderr)
-            print("Usage: python scripts/build_clean_zip.py [--no-tests]",
+            print("Usage: python scripts/build_clean_zip.py "
+                  "[--no-tests|--use-current-env|--self-contained]",
                   file=sys.stderr)
             sys.exit(2)
-    return no_tests, force_tests
+    return no_tests, force_tests, self_contained
+
+
+def _run_self_contained_tests(staging: str) -> int:
+    """Create a temp venv, install .[dev,test], run core tests.
+
+    Returns 0 on success, nonzero on failure. The temp venv is cleaned
+    up by the caller.
+    """
+    venv_dir = tempfile.mkdtemp(prefix="vibe_zip_venv_")
+    try:
+        venv_python = os.path.join(venv_dir, "bin", "python")
+        print("  Creating isolated venv for self-contained test...")
+        subprocess.run(
+            [sys.executable, "-m", "venv", venv_dir],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            [venv_python, "-m", "pip", "install", "-q", "--upgrade",
+             "pip", "setuptools", "wheel"],
+            check=True, capture_output=True,
+        )
+        print("  Installing .[dev,test] in isolated venv...")
+        subprocess.run(
+            [venv_python, "-m", "pip", "install", "-q", "-e",
+             ".[dev,test]"],
+            check=True, capture_output=True, cwd=PROJECT_ROOT,
+        )
+        print("  Running core pytest gate in isolated venv...")
+        try:
+            result = subprocess.run(
+                [venv_python, "-m", "pytest",
+                 staging + "/tests", "-q",
+                 "-m", CORE_MARKERS],
+                capture_output=True, text=True, cwd=staging,
+                timeout=300, check=False,
+            )
+        except subprocess.TimeoutExpired:
+            print("  pytest: TIMED OUT (300s outer limit)",
+                  file=sys.stderr)
+            return 1
+        if result.returncode == 0:
+            print("  pytest: OK (self-contained)")
+            return 0
+        else:
+            print("  pytest: FAILED (self-contained)")
+            print(result.stdout[-800:])
+            print(result.stderr[-800:])
+            return 1
+    finally:
+        shutil.rmtree(venv_dir, ignore_errors=True)
 
 
 def main() -> int:
-    no_tests, force_tests = _parse_args()
+    no_tests, force_tests, self_contained = _parse_args()
     staging = tempfile.mkdtemp(prefix="vibe_build_")
     try:
         # Copy included dirs
@@ -219,31 +307,35 @@ def main() -> int:
                 if d == "__pycache__":
                     shutil.rmtree(os.path.join(root, d), ignore_errors=True)
 
-        # --- Validation: core pytest gate (best-effort) ---
+        # --- Validation: core pytest gate ---
         # Run ONLY the core marker filter (same as scripts/test_core.sh).
         # No --timeout flags are used so this works with plain pytest
         # (pytest-timeout is not required). A subprocess timeout provides
         # the outer guard.
         #
         # Behavior:
-        #   --no-tests  : skip the pytest gate entirely (compileall only).
-        #   --tests     : force the gate; fail if pytest is absent.
-        #   (default)   : run if pytest is available, skip with warning
-        #                 if not. This is the best-effort mode.
+        #   --no-tests        : skip the pytest gate entirely.
+        #   --self-contained  : temp venv + install .[dev,test] + test.
+        #   --tests           : force the gate; fail if pytest is absent.
+        #   (default)         : run in current env; fail if pytest absent.
         if no_tests:
             print("Running core pytest gate...")
             print("  pytest: SKIPPED (--no-tests)")
+        elif self_contained:
+            print("Running core pytest gate (self-contained)...")
+            rc = _run_self_contained_tests(staging)
+            if rc != 0:
+                return rc
         elif force_tests and not _pytest_available():
             print("Running core pytest gate...")
             print("  pytest: FAILED (--tests requested but pytest not "
                   "installed)")
             return 1
         elif not _pytest_available():
+            # Default/current-env mode: fail if deps are missing instead
+            # of silently skipping — the operator should know.
             print("Running core pytest gate...")
-            print("  pytest: SKIPPED (pytest not installed in current "
-                  "environment)")
-            print("  (use --no-tests to silence, or install with: "
-                  "pip install -e '.[dev,test]')")
+            require_test_deps()  # raises SystemExit with remediation
         else:
             print("Running core pytest gate...")
             try:
