@@ -1,5 +1,11 @@
 # vibe-thinker — project notes for agents
 
+> **Version-tag convention:** Tags like `v3.2`, `v3.2.1`, `v0.3.9`,
+> `v1.1`, `v1.2` etc. refer to **historical internal phase numbering**
+> from earlier development cycles. They do NOT correspond to the
+> package version (currently `v0.4.6a0`, set in `pyproject.toml`).
+> Treat them as historical context labels, not current release markers.
+
 ## Verify / test
 - Full suite: `python3 -m pytest -q` (~1173 tests, ~110s, no live servers needed)
 - v3.2 verifier golden-set regression suite: `python3 -m pytest tests/test_verifier_golden_set.py -q`
