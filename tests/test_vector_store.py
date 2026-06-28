@@ -11,11 +11,11 @@ When agentdb_url is set, AgentDB is used directly (no local fallback).
 """
 
 import os
+import sys
 import tempfile
+import types
 
 import pytest
-
-pytestmark = pytest.mark.embeddings
 
 from vector_store import (
     LocalVectorStore,
@@ -23,6 +23,8 @@ from vector_store import (
     make_vector_store,
     VectorStore,
 )
+
+pytestmark = pytest.mark.embeddings
 
 
 # Skip tests that need numpy/sklearn if not installed.
@@ -36,6 +38,21 @@ except ImportError:
 skip_no_embeddings = pytest.mark.skipif(
     not embeddings_available,
     reason="numpy/sklearn not installed — LocalVectorStore tests skipped",
+)
+
+# Skip dual-write tests that need sentence-transformers to produce real
+# embeddings. Without it, the cache skips vector upserts (by design —
+# empty embeddings must not be upserted), so vs.count() == 0.
+sentence_transformers_available = True
+try:
+    from sentence_transformers import SentenceTransformer  # noqa: F401
+except ImportError:
+    sentence_transformers_available = False
+
+skip_no_sentence_transformers = pytest.mark.skipif(
+    not sentence_transformers_available,
+    reason="sentence-transformers not installed — dual-write tests "
+           "need real embeddings",
 )
 
 
@@ -159,15 +176,23 @@ class TestMakeVectorStoreFactory:
         """v3.2: when the ruvllm_py HNSW binding is available AND dim is
         provided AND no agentdb_url, RuvLLMVectorStore is preferred over
         LocalVectorStore."""
-        import sys, types
         # Inject a fake ruvllm_py with HnswIndex so
         # is_ruvllm_vector_store_available() returns True.
         fake = types.ModuleType("ruvllm_py")
+
         class _HnswIndex:
-            def __init__(self, **kw): pass
-            def add(self, *a, **kw): pass
-            def search(self, *a, **kw): return []
-            def stats(self): return {"total_vectors": 0}
+            def __init__(self, **kw):
+                pass
+
+            def add(self, *a, **kw):
+                pass
+
+            def search(self, *a, **kw):
+                return []
+
+            def stats(self):
+                return {"total_vectors": 0}
+
         fake.HnswIndex = _HnswIndex
         monkeypatch.setitem(sys.modules, "ruvllm_py", fake)
         from vector_store import RuvLLMVectorStore
@@ -178,10 +203,12 @@ class TestMakeVectorStoreFactory:
         """v3.2: without dim, RuvLLMVectorStore can't be constructed (HNSW
         needs the dimension), so we fall back to LocalVectorStore even
         if the binding is available."""
-        import sys, types
         fake = types.ModuleType("ruvllm_py")
+
         class _HnswIndex:
-            def __init__(self, **kw): pass
+            def __init__(self, **kw):
+                pass
+
         fake.HnswIndex = _HnswIndex
         monkeypatch.setitem(sys.modules, "ruvllm_py", fake)
         s = make_vector_store()  # no dim
@@ -190,10 +217,12 @@ class TestMakeVectorStoreFactory:
     def test_prefer_ruvllm_false_forces_local(self, monkeypatch):
         """v3.2: prefer_ruvllm=False forces LocalVectorStore even when
         the binding is available and dim is given."""
-        import sys, types
         fake = types.ModuleType("ruvllm_py")
+
         class _HnswIndex:
-            def __init__(self, **kw): pass
+            def __init__(self, **kw):
+                pass
+
         fake.HnswIndex = _HnswIndex
         monkeypatch.setitem(sys.modules, "ruvllm_py", fake)
         s = make_vector_store(dim=384, prefer_ruvllm=False)
@@ -209,14 +238,17 @@ class TestVectorStoreClustering:
     """
 
     def test_local_cluster_finds_two_clusters(self):
-        """5 near-identical + 5 near-identical (different direction) = 2 clusters."""
+        """5 near-identical + 5 near-identical (different direction)
+        = 2 clusters."""
         import numpy as np
         s = LocalVectorStore()
         np.random.seed(42)
         for i in range(5):
-            s.upsert(f"a_{i}", [1.0 + np.random.randn() * 0.01, 0.01, 0.01, 0.01])
+            v = [1.0 + np.random.randn() * 0.01, 0.01, 0.01, 0.01]
+            s.upsert(f"a_{i}", v)
         for i in range(5):
-            s.upsert(f"b_{i}", [0.01, 1.0 + np.random.randn() * 0.01, 0.01, 0.01])
+            v = [0.01, 1.0 + np.random.randn() * 0.01, 0.01, 0.01]
+            s.upsert(f"b_{i}", v)
         clusters = s.cluster(similarity_threshold=0.85, min_cluster_size=3)
         assert len(clusters) == 2
         assert len(clusters[0]) == 5
@@ -263,11 +295,11 @@ class TestVectorStoreClustering:
         s = LocalVectorStore()
         np.random.seed(42)
         for i in range(5):
-            s.upsert(f"math_{i}", [1.0 + np.random.randn() * 0.01, 0.01, 0.01, 0.01],
-                     {"task_type": "math"})
+            v = [1.0 + np.random.randn() * 0.01, 0.01, 0.01, 0.01]
+            s.upsert(f"math_{i}", v, {"task_type": "math"})
         for i in range(5):
-            s.upsert(f"code_{i}", [0.01, 1.0 + np.random.randn() * 0.01, 0.01, 0.01],
-                     {"task_type": "code"})
+            v = [0.01, 1.0 + np.random.randn() * 0.01, 0.01, 0.01]
+            s.upsert(f"code_{i}", v, {"task_type": "code"})
         # Filter to only math
         math_clusters = s.cluster(
             similarity_threshold=0.85, min_cluster_size=3,
@@ -282,7 +314,8 @@ class TestVectorStoreClustering:
         assert s.cluster() == []
 
     def test_local_cluster_fewer_than_min(self):
-        """Store with fewer entries than min_cluster_size returns no clusters."""
+        """Store with fewer entries than min_cluster_size
+        returns no clusters."""
         s = LocalVectorStore()
         s.upsert("a", [1.0, 0.0])
         s.upsert("b", [1.0, 0.0])
@@ -290,7 +323,9 @@ class TestVectorStoreClustering:
 
     def test_agentdb_cluster_fail_closed_when_down(self):
         """AgentDBVectorStore.cluster() returns [] when sidecar is down."""
-        s = AgentDBVectorStore(base_url="http://127.0.0.1:9999", collection="test")
+        s = AgentDBVectorStore(
+            base_url="http://127.0.0.1:9999", collection="test",
+        )
         assert s.cluster() == []
 
 
@@ -335,7 +370,9 @@ class TestCacheIntegration:
         """v3.2.1: agentdb_url always creates an AgentDBVectorStore
         directly (no ShadowVectorStore wrapper)."""
         from persistent_cache import VerifiedTrajectoryStore
-        store = VerifiedTrajectoryStore(cache_path, agentdb_url="http://127.0.0.1:1")
+        store = VerifiedTrajectoryStore(
+            cache_path, agentdb_url="http://127.0.0.1:1",
+        )
         assert store._vector_store is not None
         assert isinstance(store._vector_store, AgentDBVectorStore)
 
@@ -359,7 +396,9 @@ class TestCacheIntegration:
         assert cache._vector_store is not None
         assert isinstance(cache._vector_store, AgentDBVectorStore)
 
-    def test_clr_cache_agentdb_only_false_also_creates_agentdb(self, cache_path):
+    def test_clr_cache_agentdb_only_false_also_creates_agentdb(
+        self, cache_path,
+    ):
         """v3.2.1: agentdb_only=False now ALSO creates an AgentDBVectorStore
         (previously created a ShadowVectorStore). The flag is a no-op."""
         from persistent_cache import CLRResultCache
@@ -370,7 +409,9 @@ class TestCacheIntegration:
         )
         assert isinstance(cache._vector_store, AgentDBVectorStore)
 
-    def test_trajectory_store_agentdb_only_creates_agentdb_directly(self, cache_path):
+    def test_trajectory_store_agentdb_only_creates_agentdb_directly(
+        self, cache_path,
+    ):
         """agentdb_only=True for trajectory store creates AgentDB directly."""
         from persistent_cache import VerifiedTrajectoryStore
         store = VerifiedTrajectoryStore(
@@ -381,9 +422,15 @@ class TestCacheIntegration:
         assert store._vector_store is not None
         assert isinstance(store._vector_store, AgentDBVectorStore)
 
+    @skip_no_sentence_transformers
     def test_clr_cache_dual_writes_to_vector_store(self, cache_path):
         """Insert into CLRResultCache should also upsert to the vector store
-        (delegated similarity search)."""
+        (delegated similarity search).
+
+        Requires sentence-transformers to produce real embeddings. Without
+        it, the cache skips vector upserts (empty embeddings are not
+        upserted by design — see persistent_cache.py insert()).
+        """
         from persistent_cache import CLRResultCache
         vs = LocalVectorStore()
         cache = CLRResultCache(cache_path, vector_store=vs)
@@ -398,12 +445,19 @@ class TestCacheIntegration:
         )
         # The vector store should have received the upsert
         assert vs.count() == 1
-        results = vs.search([0.0] * 384, top_k=1)  # dim doesn't matter for count
+        # dim doesn't matter for count check
+        results = vs.search([0.0] * 384, top_k=1)
         assert len(results) == 1
 
+    @skip_no_sentence_transformers
     def test_trajectory_store_dual_writes_to_vector_store(self, cache_path):
         """Store into VerifiedTrajectoryStore should also upsert to the vector
-        store (delegated similarity search)."""
+        store (delegated similarity search).
+
+        Requires sentence-transformers to produce real embeddings. Without
+        it, the store skips vector upserts (empty embeddings are not
+        upserted by design — see persistent_cache.py store()).
+        """
         from persistent_cache import VerifiedTrajectoryStore
         vs = LocalVectorStore()
         store = VerifiedTrajectoryStore(cache_path, vector_store=vs)
@@ -424,10 +478,13 @@ class TestCacheIntegration:
         class BrokenVectorStore:
             def upsert(self, *args, **kwargs):
                 raise RuntimeError("AgentDB is down")
+
             def search(self, *args, **kwargs):
                 return []
+
             def count(self):
                 return 0
+
             def delete(self, *args):
                 return False
 
@@ -455,7 +512,10 @@ class TestRuvLLMVectorStore:
     @pytest.fixture
     def store(self):
         """Create a RuvLLMVectorStore with dim=4."""
-        from vector_store import RuvLLMVectorStore, is_ruvllm_vector_store_available
+        from vector_store import (
+            RuvLLMVectorStore,
+            is_ruvllm_vector_store_available,
+        )
         if not is_ruvllm_vector_store_available():
             pytest.skip("ruvllm_py HNSW binding not installed")
         return RuvLLMVectorStore(dim=4, m=8, ef_construction=50, ef_search=16)
@@ -495,7 +555,9 @@ class TestRuvLLMVectorStore:
         """Filters exclude entries whose metadata doesn't match."""
         store.upsert("v1", [1.0, 0.0, 0.0, 0.0], {"type": "math"})
         store.upsert("v2", [0.0, 1.0, 0.0, 0.0], {"type": "code"})
-        results = store.search([0.5, 0.5, 0.0, 0.0], top_k=10, filters={"type": "math"})
+        results = store.search(
+            [0.5, 0.5, 0.0, 0.0], top_k=10, filters={"type": "math"},
+        )
         assert len(results) == 1
         assert results[0][0] == "v1"
 

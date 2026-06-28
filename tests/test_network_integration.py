@@ -42,7 +42,10 @@ def _sandbox_image_available():
         return False
     try:
         result = subprocess.run(
-            ["docker", "image", "inspect", SANDBOX_IMAGE, "--format", "{{.Id}}"],
+            [
+                "docker", "image", "inspect", SANDBOX_IMAGE,
+                "--format", "{{.Id}}",
+            ],
             capture_output=True, text=True, timeout=5,
         )
         return result.returncode == 0
@@ -50,7 +53,8 @@ def _sandbox_image_available():
         return False
 
 
-# Skip all tests in this module if Docker or the sandbox image is not available.
+# Skip all tests in this module if Docker or the sandbox image
+# is not available.
 pytestmark = pytest.mark.skipif(
     not _sandbox_image_available(),
     reason="Docker not available or vibe-thinker-sandbox image not built. "
@@ -61,7 +65,8 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture
 def executor():
-    """Create a DockerSandboxExecutor with a longer timeout for integration tests.
+    """Create a DockerSandboxExecutor with a longer timeout
+    for integration tests.
 
     v2.0: The iptables egress path was removed. These integration tests
     now exercise the SNI-proxy egress path (the only mode). A running
@@ -95,7 +100,8 @@ class TestDenyAllWithEmptyAllowlist:
             "  s.close()\n"
         )
         result = await executor.execute(script, timeout=15.0)
-        # The connection should be denied (either network=none or iptables DROP).
+        # The connection should be denied
+        # (either network=none or iptables DROP).
         assert "DENIED" in result.stdout or "CONNECTED" not in result.stdout
 
 
@@ -187,7 +193,8 @@ class TestIPv6Denial:
         executor.set_allowlist(al)
         script = (
             "import os\n"
-            "print(f'HTTPS_PROXY={os.environ.get(\"HTTPS_PROXY\", \"NONE\")}')\n"
+            "print(f'HTTPS_PROXY="
+            "{os.environ.get(\"HTTPS_PROXY\", \"NONE\")}')\n"
         )
         result = await executor.execute(script, timeout=20.0)
         # Proxy mode is active — env var is set.
@@ -209,7 +216,8 @@ class TestPrivilegeDropping:
         executor.set_allowlist(al)
         script = (
             "import subprocess\n"
-            "r = subprocess.run(['cat', '/proc/1/status'], capture_output=True, text=True)\n"
+            "r = subprocess.run(['cat', '/proc/1/status'],\n"
+            "    capture_output=True, text=True)\n"
             "print(r.stdout.strip())\n"
         )
         result = await executor.execute(script, timeout=15.0)
@@ -238,16 +246,21 @@ class TestPrivilegeDropping:
         (no NET_ADMIN capability — --cap-drop ALL in v2.0)."""
         al = NetworkAllowList.from_string("1.1.1.1:443")
         executor.set_allowlist(al)
-        # Try to flush iptables — should fail (permission denied or not found).
+        # Try to flush iptables — should fail
+        # (permission denied or not found).
         script = (
             "import subprocess\n"
-            "r = subprocess.run(['iptables', '-F'], capture_output=True, text=True)\n"
+            "r = subprocess.run(['iptables', '-F'],\n"
+            "    capture_output=True, text=True)\n"
             "print(f'exit={r.returncode} stderr={r.stderr.strip()}')\n"
         )
         result = await executor.execute(script, timeout=15.0)
         # iptables -F should fail (permission denied or not found).
         # The candidate should NOT have NET_ADMIN.
-        assert "exit=0" not in result.stdout or "Permission denied" in result.stdout
+        assert (
+            "exit=0" not in result.stdout
+            or "Permission denied" in result.stdout
+        )
 
 
 class TestAuditEvidence:
@@ -259,7 +272,8 @@ class TestAuditEvidence:
         al = NetworkAllowList.from_string("1.1.1.1:443")
         executor.set_allowlist(al)
         result = await executor.execute("print('hello')", timeout=15.0)
-        assert result.evidence.get("network_mode") == "proxy"
+        # v0.4.2: network_mode is now the NetworkMode enum value.
+        assert result.evidence.get("network_mode") == "best_effort_proxy"
         assert "proxy_egress" in result.evidence
 
     @pytest.mark.asyncio
@@ -276,7 +290,9 @@ class TestAuditEvidence:
         """Without an allow-list, there should be no proxy evidence."""
         result = await executor.execute("print('hello')", timeout=15.0)
         assert "proxy_egress" not in result.evidence
-        assert result.evidence.get("network_mode") in ("none", "default")
+        # v0.4.2: network_mode is now the NetworkMode enum value.
+        # Without an allow-list, the effective mode is "disabled".
+        assert result.evidence.get("network_mode") == "disabled"
 
 
 # ---------------------------------------------------------------------- #

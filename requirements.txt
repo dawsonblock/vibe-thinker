@@ -1,67 +1,23 @@
-# Core async HTTP + env config (required)
+# vibe-thinker requirements
+#
+# The base install only needs two packages (aiohttp + python-dotenv).
+# All other dependencies are opt-in. Install only what you need:
+#
+#   pip install -r requirements-core.txt        # minimal (base only)
+#   pip install -r requirements-dev.txt         # testing
+#   pip install -r requirements-embeddings.txt  # semantic routing + cache
+#   pip install -r requirements-federation.txt  # web UI + Redis federation
+#   pip install -r requirements-sandbox.txt     # wasmtime + Ed25519
+#   pip install -r requirements-models.txt      # local models + retrieval
+#
+# Or use pyproject.toml extras (preferred for editable installs):
+#   pip install -e '.[dev,embeddings,federation,web,sandbox]'
+#
+# To install everything (legacy full install):
+#   pip install -r requirements-legacy-full.txt
+#
+# NOTE: This file is kept for backward compatibility. New installs
+# should use the split files above or pyproject.toml extras.
+
 aiohttp>=3.10.11,<4
 python-dotenv>=1.0,<2
-
-# Optional: web UI + federation server
-fastapi>=0.109.1,<1
-uvicorn>=0.23,<1
-
-# Optional: HA federation (Redis-backed coordinator state + web UI Pub/Sub
-# fan-out). Without it, federation_server.py and web/app.py use in-memory
-# single-process state (the default). Install with: pip install redis
-redis>=5.0,<6
-
-# Optional: semantic routing + CLR result cache
-# Install these for the full experience (embedding-based routing + semantic cache).
-# Without them, the orchestrator falls back to keyword routing and skips the CLR cache.
-sentence-transformers>=2.2,<3
-scikit-learn>=1.3,<2
-numpy>=1.24,<2
-
-# Optional: testing
-pytest>=7.0,<9
-pytest-asyncio>=0.21,<1
-pytest-timeout>=2.0,<3
-httpx>=0.24,<1
-
-# Optional: in-process specialist backend (eliminates HTTP overhead for tiny
-# models like ruvltra-claude-code-0.5b). Only needed when using
-# --local-specialist-model / VIBE_THINKER_LOCAL_MODEL. Without it, the
-# orchestrator falls back to the HTTP /completion endpoint.
-# Install with Metal acceleration on Apple Silicon:
-#   CMAKE_ARGS="-DGGML_METAL=on" pip install llama-cpp-python
-llama-cpp-python>=0.2.70,<1
-
-# Optional: Ed25519 asymmetric audit-log signatures (v0.3.9).
-# Only needed for SLSA L2 compliant provenance (Ed25519Signer). Without it,
-# the audit log uses HMAC-SHA256 (symmetric, stdlib) — the v0.3.8 default.
-# Install with: pip install cryptography
-cryptography>=43.0.1,<46
-
-# Optional: free factual retrieval backends (v3.1).
-# When paid Serper/SearchApi keys are absent, the FactualVerifier falls back
-# to these free backends so it can still fetch real source text. Without them,
-# the factory returns None and the verifier fail-closes to unsupported_factual.
-# Install with: pip install duckduckgo_search wikipedia
-duckduckgo_search>=4.0,<5
-wikipedia>=1.4,<2
-
-# Optional: ONNX embedding fallback (v3.1).
-# When sentence-transformers is absent, RuvLLMBinding.get_embeddings() falls
-# back to the quantized all-MiniLM-L6-v2 ONNX model via onnxruntime. Without
-# it (and without sentence-transformers), get_embeddings fail-closes to [].
-# Install with: pip install onnxruntime huggingface_hub tokenizers
-onnxruntime>=1.17,<2
-huggingface_hub>=0.20,<1
-tokenizers>=0.15,<1
-
-# Optional: Wasmtime sandbox fallback (v3.1).
-# When the Generalist fails to generate unit tests, the code verification
-# loop falls back to sandboxed execution. wasmtime provides a strict Wasm
-# sandbox where file system and network handles do not exist. Without it,
-# the fallback uses the Docker sandbox (if available) or the deprecated
-# AST static analysis. Requires a pre-compiled Python-to-Wasm module
-# (configured via VIBE_WASM_PYTHON_MODULE env var).
-# Install with: pip install wasmtime
-wasmtime>=10.0,<20
-

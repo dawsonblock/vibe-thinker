@@ -1,0 +1,7 @@
+# Core dependencies — required for vibe-thinker to run.
+# This is the minimal install: pip install -r requirements-core.txt
+# All other functionality is opt-in via the requirements-*.txt files
+# or pyproject.toml extras (pip install -e '.[embeddings,dev,...]').
+
+aiohttp>=3.10.11,<4
+python-dotenv>=1.0,<2

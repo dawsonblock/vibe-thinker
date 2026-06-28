@@ -11,11 +11,26 @@ Runs Python code in a Docker container with hardening:
   - --pids-limit=64 (process count limit)
   - --entrypoint python3 (bypass sandbox image entrypoint, v2.0)
 
-When a NetworkAllowList is provided, the executor uses SNI-proxy egress
-mode (v2.0): --network=default with HTTP_PROXY/HTTPS_PROXY env vars
-pointing at an SNI-aware proxy (default 127.0.0.1:8888). The proxy
-inspects the TLS SNI / HTTP Host header and allows/denies based on the
-domain — solving CDN IP rotation. No NET_ADMIN cap needed.
+## NetworkMode (v0.4.2)
+
+The executor's network behavior is controlled by :class:`NetworkMode`:
+
+  - ``DISABLED`` (default): ``--network none``. No network access at all.
+    The safest mode. Used for all untrusted code execution.
+  - ``BEST_EFFORT_PROXY``: ``--network default`` with HTTP_PROXY/HTTPS_PROXY
+    env vars pointing at an SNI-aware proxy. NOT a security boundary —
+    clients that ignore proxy env vars (raw sockets, direct IP) can bypass
+    it. Use only with trusted code that respects proxy conventions.
+  - ``ENFORCED_GATEWAY``: the container runs on a Docker ``--internal``
+    network with no direct internet access. All egress goes through a
+    gateway container that enforces the allow-list at the network level.
+    This IS a security boundary (when correctly configured). Requires
+    Docker and a pre-created internal network + gateway container.
+
+When a NetworkAllowList is provided AND network_mode is BEST_EFFORT_PROXY
+or ENFORCED_GATEWAY, the executor uses domain-level egress filtering.
+When network_mode is DISABLED, the allow-list is ignored — no network
+access is granted regardless.
 
 ## Security architecture (v3.1)
 
@@ -54,7 +69,7 @@ import asyncio
 import time
 from typing import Dict, Optional, TYPE_CHECKING
 
-from sandbox.base import ExecutionResult
+from sandbox.base import ExecutionResult, NetworkMode
 
 if TYPE_CHECKING:
     from sandbox.network_allowlist import NetworkAllowList
@@ -73,13 +88,18 @@ FALLBACK_IMAGE = "python:3.12-slim"
 # --proxy-egress.
 DEFAULT_PROXY_EGRESS = "127.0.0.1:8888"
 
+# Docker internal network name for ENFORCED_GATEWAY mode. The executor
+# creates this network if it doesn't exist. The network is --internal
+# (no direct internet access); egress goes through a gateway container.
+GATEWAY_NETWORK_NAME = "vibe-thinker-gateway-net"
+
 
 class DockerSandboxExecutor:
     """Execute Python code in a hardened Docker container.
 
     This is the production executor for CodeVerifier. It provides:
       - filesystem isolation (read-only root, writable /tmp only)
-      - network isolation (no network by default, or SNI-proxy egress)
+      - network isolation (controlled by NetworkMode)
       - memory limits (default 128m)
       - process limits (64 PIDs)
       - no privilege escalation
@@ -91,14 +111,18 @@ class DockerSandboxExecutor:
             `vibe-thinker-sandbox` image.
         timeout: default execution timeout in seconds.
         allowlist: optional NetworkAllowList for granular egress
-            filtering. When set, the executor uses domain-level
-            egress filtering via an SNI-aware proxy (v2.0 default
-            and only path — the v0.4.0 iptables path was removed).
+            filtering. When set AND network_mode allows network access,
+            the executor uses domain-level egress filtering via an
+            SNI-aware proxy.
         dns_resolver: optional IP address of a DNS resolver to restrict
-            DNS queries to (prevents DNS-based data exfiltration). When
-            None, DNS is allowed to any resolver (needed for hostname
-            resolution in the allow-list). When set, only the specified
-            resolver can receive DNS queries.
+            DNS queries to (prevents DNS-based data exfiltration).
+        network_mode: controls the Docker network configuration.
+            See :class:`NetworkMode` for the three modes. Default is
+            ``NetworkMode.DISABLED`` (no network access).
+        gateway_network: name of the Docker --internal network to use
+            for ENFORCED_GATEWAY mode. Defaults to
+            ``vibe-thinker-gateway-net``. The executor creates this
+            network if it doesn't exist.
     """
 
     name = "docker_sandbox"
@@ -109,12 +133,34 @@ class DockerSandboxExecutor:
         timeout: float = 10.0,
         allowlist: Optional["NetworkAllowList"] = None,
         dns_resolver: Optional[str] = None,
+        network_mode: Optional[NetworkMode] = None,
+        gateway_network: str = GATEWAY_NETWORK_NAME,
     ):
         self.image = image
         self.default_timeout = timeout
         self._allowlist = allowlist
         self._dns_resolver = dns_resolver
         self._proxy_egress: Optional[str] = None
+        # network_mode=None means auto-detect: BEST_EFFORT_PROXY when an
+        # allow-list is present (backward compat with pre-v0.4.2 behavior),
+        # DISABLED otherwise. Explicitly setting a mode overrides this.
+        self._network_mode = network_mode
+        self._gateway_network = gateway_network
+        self._gateway_network_created = False
+
+    def _effective_network_mode(self) -> NetworkMode:
+        """Resolve the effective network mode.
+
+        If an explicit mode was set, use it. Otherwise auto-detect:
+        BEST_EFFORT_PROXY when an allow-list is present (preserving the
+        pre-v0.4.2 behavior where allow-list → proxy mode), DISABLED
+        otherwise.
+        """
+        if self._network_mode is not None:
+            return self._network_mode
+        if self._allowlist is not None and not self._allowlist.is_empty:
+            return NetworkMode.BEST_EFFORT_PROXY
+        return NetworkMode.DISABLED
 
     def set_allowlist(self, allowlist: Optional["NetworkAllowList"]) -> None:
         """Update the network allow-list (e.g. from a CLI flag after init)."""
@@ -133,6 +179,56 @@ class DockerSandboxExecutor:
         """
         self._proxy_egress = proxy_addr
 
+    def set_network_mode(self, mode: Optional[NetworkMode]) -> None:
+        """Update the network mode (e.g. from a CLI flag after init).
+
+        Pass None to revert to auto-detect mode (BEST_EFFORT_PROXY when
+        an allow-list is present, DISABLED otherwise).
+        """
+        self._network_mode = mode
+
+    async def _ensure_gateway_network(self) -> Optional[str]:
+        """Create the Docker --internal network for ENFORCED_GATEWAY mode.
+
+        Returns the network name if successful, None if Docker is not
+        available or network creation failed. The network is --internal
+        (no direct internet access); egress must go through a gateway
+        container that the operator runs separately.
+        """
+        if self._gateway_network_created:
+            return self._gateway_network
+        try:
+            # Check if the network already exists.
+            check = await asyncio.create_subprocess_exec(
+                "docker", "network", "inspect", self._gateway_network,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await check.wait()
+            if check.returncode == 0:
+                self._gateway_network_created = True
+                return self._gateway_network
+            # Create the internal network.
+            create = await asyncio.create_subprocess_exec(
+                "docker", "network", "create",
+                "--internal",
+                "--driver", "bridge",
+                self._gateway_network,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await create.communicate()
+            if create.returncode == 0:
+                self._gateway_network_created = True
+                print(f"[DockerSandbox] Created internal gateway network: "
+                      f"{self._gateway_network}")
+                return self._gateway_network
+            print(f"[DockerSandbox] Failed to create gateway network: "
+                  f"{stderr.decode().strip()}")
+        except Exception as e:
+            print(f"[DockerSandbox] Gateway network setup failed: {e}")
+        return None
+
     async def execute(
         self,
         script: str,
@@ -142,34 +238,68 @@ class DockerSandboxExecutor:
         memory_limit: str = "128m",
         env: Optional[Dict[str, str]] = None,
     ) -> ExecutionResult:
-        """Execute a Python script in a Docker container."""
+        """Execute a Python script in a Docker container.
+
+        The network configuration is determined by ``self._network_mode``:
+          - DISABLED: ``--network none`` (ignores the ``network`` flag
+            and any allow-list — no network access, period).
+          - BEST_EFFORT_PROXY: ``--network default`` with proxy env vars
+            when an allow-list is present. Falls back to ``--network none``
+            if no allow-list is configured.
+          - ENFORCED_GATEWAY: ``--network <internal-net>`` with no direct
+            internet access. Egress goes through a gateway container.
+        """
         start = time.monotonic()
 
-        # Determine network mode:
-        # - If an allow-list is configured, use SNI-proxy egress (v2.0).
-        #   The proxy inspects TLS SNI / HTTP Host (domain-level filtering),
-        #   solving CDN IP rotation. No NET_ADMIN cap needed.
-        # - Otherwise, use --network=none / --network=default based on the
-        #   `network` flag (unchanged behavior).
         use_allowlist = self._allowlist is not None and not self._allowlist.is_empty
         proxy_addr = self._proxy_egress or DEFAULT_PROXY_EGRESS
-        use_proxy = use_allowlist
+        effective_mode = self._effective_network_mode()
+
+        # Determine the Docker network configuration based on the
+        # effective network mode.
+        if effective_mode == NetworkMode.DISABLED:
+            # No network access at all. This is the default and the safest
+            # mode. The `network` flag and allow-list are both ignored.
+            docker_network = "none"
+            use_proxy = False
+            use_gateway = False
+        elif effective_mode == NetworkMode.ENFORCED_GATEWAY:
+            # Internal network with no direct internet access. Egress
+            # goes through a gateway container. This IS a security
+            # boundary (when the gateway is correctly configured).
+            gateway_net = await self._ensure_gateway_network()
+            if gateway_net is not None:
+                docker_network = gateway_net
+                use_gateway = True
+                use_proxy = use_allowlist  # proxy env vars for the gateway
+            else:
+                # Gateway network setup failed — fail-closed to no network.
+                print("[DockerSandbox] WARNING: ENFORCED_GATEWAY network "
+                      "setup failed — falling back to --network none "
+                      "(fail-closed).")
+                docker_network = "none"
+                use_proxy = False
+                use_gateway = False
+        else:
+            # BEST_EFFORT_PROXY: use proxy env vars when an allow-list
+            # is present. Falls back to --network none if no allow-list.
+            use_proxy = use_allowlist
+            use_gateway = False
+            if use_proxy:
+                docker_network = "default"
+            else:
+                docker_network = "none" if not network else "default"
 
         if use_proxy:
-            # SNI proxy egress mode (v2.0). The container routes traffic
+            # SNI proxy egress mode. The container routes traffic
             # through the proxy via HTTP_PROXY/HTTPS_PROXY env vars. The
             # proxy inspects the TLS SNI / HTTP Host header and allows/denies
             # based on the domain — solving CDN IP rotation. No iptables
             # needed, no NET_ADMIN needed.
-            # --entrypoint python3: bypass the sandbox image's iptables
-            # entrypoint (which needs SETGID/SETUID caps). Proxy mode
-            # runs python3 directly — no privilege dropping needed since
-            # the container has --cap-drop ALL and --security-opt
-            # no-new-privileges.
             cmd = [
                 "docker", "run", "--rm",
                 "--init",
-                "--network", "default",
+                "--network", docker_network,
                 "--memory", memory_limit,
                 "--read-only",
                 "--security-opt", "no-new-privileges",
@@ -180,11 +310,9 @@ class DockerSandboxExecutor:
                 "--workdir", "/tmp",
                 "--entrypoint", "python3",
             ]
-            # v3.1: DNS exfiltration fix — inject allow-listed domains
+            # DNS exfiltration fix — inject allow-listed domains
             # via --add-host so the container can route to them without
-            # DNS access. This closes the loophole where malicious code
-            # could exfiltrate data via socket.gethostbyname() to an
-            # attacker-controlled DNS server.
+            # DNS access.
             if self._allowlist is not None:
                 cmd.extend(self._allowlist.generate_add_host_args())
             # Set proxy env vars so HTTP clients in the container use the proxy.
@@ -204,15 +332,12 @@ class DockerSandboxExecutor:
                 cmd.extend(["--env", f"{key}={value}"])
             cmd.extend([self.image, "-c", script])
         else:
-            # No allow-list -> --network=none (or --network=default if
-            # network=True is explicitly passed). No proxy, no firewall.
-            # --entrypoint python3: bypass the sandbox image's iptables
-            # entrypoint (v2.0 removed the iptables path, so the entrypoint
-            # is no longer needed).
+            # No proxy — either DISABLED mode, or BEST_EFFORT_PROXY with
+            # no allow-list. Use the determined docker_network.
             cmd = [
                 "docker", "run", "--rm",
                 "--init",
-                "--network", "none" if not network else "default",
+                "--network", docker_network,
                 "--memory", memory_limit,
                 "--read-only",
                 "--security-opt", "no-new-privileges",
@@ -266,16 +391,18 @@ class DockerSandboxExecutor:
             )
 
             # Attach audit evidence for the network configuration.
+            result.evidence["network_mode"] = effective_mode.value
+            result.evidence["docker_network"] = docker_network
             if use_proxy:
-                result.evidence["network_mode"] = "proxy"
                 result.evidence["proxy_egress"] = proxy_addr
                 result.evidence["dns_restricted"] = bool(self._dns_resolver)
                 result.evidence["dns_injection"] = (
                     self._allowlist is not None
                     and not self._allowlist.is_empty
                 )
-            else:
-                result.evidence["network_mode"] = "none" if not network else "default"
+            if use_gateway:
+                result.evidence["gateway_network"] = self._gateway_network
+                result.evidence["enforced"] = True
 
             return result
 

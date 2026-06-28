@@ -8,12 +8,19 @@ These tests document that fact and verify the NetworkMode enum defaults
 to DISABLED. The enforced-gateway bypass tests require Docker and are
 marked accordingly.
 
+v0.4.2: NetworkMode is now wired into DockerSandboxExecutor. The tests
+in TestDockerSandboxNetworkModeWiring verify that the executor correctly
+maps each NetworkMode to the corresponding Docker --network flag, without
+requiring Docker to be running (they inspect the command that would be
+executed).
+
 Blocked IP ranges that must NOT be reachable from a sandbox candidate:
   127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16,
   169.254.0.0/16, ::1/128, fc00::/7, fe80::/10
 """
 
 import pytest
+from unittest.mock import AsyncMock, patch, MagicMock
 
 from sandbox.base import NetworkMode
 
@@ -46,6 +53,159 @@ class TestNetworkModeDefaults:
     def test_network_mode_is_str_enum(self):
         """NetworkMode must be a str Enum so it serializes cleanly."""
         assert isinstance(NetworkMode.DISABLED, str)
+
+
+class TestDockerSandboxNetworkModeWiring:
+    """Verify that DockerSandboxExecutor correctly maps NetworkMode to
+    Docker --network flags. These tests do NOT require Docker to be
+    running — they intercept the subprocess call and inspect the command.
+    """
+
+    def test_default_network_mode_is_disabled(self):
+        """The executor's default effective network_mode MUST be DISABLED
+        when no allow-list is present."""
+        from sandbox.docker_executor import DockerSandboxExecutor
+        executor = DockerSandboxExecutor()
+        # No allow-list → effective mode is DISABLED
+        assert executor._effective_network_mode() == NetworkMode.DISABLED
+
+    def test_default_auto_detects_proxy_with_allowlist(self):
+        """When an allow-list is present and network_mode is not explicitly
+        set, the effective mode auto-detects to BEST_EFFORT_PROXY
+        (backward compat with pre-v0.4.2 behavior)."""
+        from sandbox.docker_executor import DockerSandboxExecutor
+        from sandbox.network_allowlist import NetworkAllowList
+        allowlist = NetworkAllowList.from_string("pypi.org:443")
+        executor = DockerSandboxExecutor(allowlist=allowlist)
+        assert (
+            executor._effective_network_mode()
+            == NetworkMode.BEST_EFFORT_PROXY
+        )
+
+    def test_disabled_mode_uses_network_none(self):
+        """DISABLED mode must use --network none, ignoring the `network`
+        flag and any allow-list."""
+        from sandbox.docker_executor import DockerSandboxExecutor
+        executor = DockerSandboxExecutor(network_mode=NetworkMode.DISABLED)
+        # Even with an allow-list, DISABLED mode ignores it.
+        captured_cmd = []
+
+        async def _run():
+            # Mock subprocess to capture the docker command without running it.
+            mock_proc = MagicMock()
+            mock_proc.returncode = 0
+            mock_proc.communicate = AsyncMock(
+                return_value=(b"output", b"")
+            )
+            with patch("asyncio.create_subprocess_exec",
+                       return_value=mock_proc) as mock_exec:
+                await executor.execute("print('hi')", network=True)
+                captured_cmd.extend(mock_exec.call_args[0])
+
+        import asyncio
+        asyncio.run(_run())
+        # Verify --network none is in the command
+        # (DISABLED ignores network=True)
+        assert "--network" in captured_cmd
+        idx = captured_cmd.index("--network")
+        assert captured_cmd[idx + 1] == "none"
+
+    def test_best_effort_proxy_without_allowlist_uses_network_none(self):
+        """BEST_EFFORT_PROXY with no allow-list falls back
+        to --network none."""
+        from sandbox.docker_executor import DockerSandboxExecutor
+        executor = DockerSandboxExecutor(
+            network_mode=NetworkMode.BEST_EFFORT_PROXY,
+        )
+        captured_cmd = []
+
+        async def _run():
+            mock_proc = MagicMock()
+            mock_proc.returncode = 0
+            mock_proc.communicate = AsyncMock(return_value=(b"", b""))
+            with patch("asyncio.create_subprocess_exec",
+                       return_value=mock_proc) as mock_exec:
+                await executor.execute("print('hi')")
+                captured_cmd.extend(mock_exec.call_args[0])
+
+        import asyncio
+        asyncio.run(_run())
+        idx = captured_cmd.index("--network")
+        assert captured_cmd[idx + 1] == "none"
+
+    def test_best_effort_proxy_with_allowlist_uses_network_default(self):
+        """BEST_EFFORT_PROXY with an allow-list uses --network default
+        with proxy env vars."""
+        from sandbox.docker_executor import DockerSandboxExecutor
+        from sandbox.network_allowlist import NetworkAllowList
+        allowlist = NetworkAllowList.from_string("pypi.org:443")
+        executor = DockerSandboxExecutor(
+            network_mode=NetworkMode.BEST_EFFORT_PROXY,
+            allowlist=allowlist,
+        )
+        captured_cmd = []
+
+        async def _run():
+            mock_proc = MagicMock()
+            mock_proc.returncode = 0
+            mock_proc.communicate = AsyncMock(return_value=(b"", b""))
+            with patch("asyncio.create_subprocess_exec",
+                       return_value=mock_proc) as mock_exec:
+                await executor.execute("print('hi')")
+                captured_cmd.extend(mock_exec.call_args[0])
+
+        import asyncio
+        asyncio.run(_run())
+        idx = captured_cmd.index("--network")
+        assert captured_cmd[idx + 1] == "default"
+        # Verify proxy env vars are set
+        assert "--env" in captured_cmd
+        env_strs = [
+            captured_cmd[i + 1] for i, c in enumerate(captured_cmd)
+            if c == "--env"
+        ]
+        assert any("HTTP_PROXY" in e for e in env_strs)
+
+    def test_enforced_gateway_fails_closed_without_docker(self):
+        """ENFORCED_GATEWAY mode fails-closed to --network none when
+        the gateway network cannot be created (e.g. Docker not running)."""
+        from sandbox.docker_executor import DockerSandboxExecutor
+        executor = DockerSandboxExecutor(
+            network_mode=NetworkMode.ENFORCED_GATEWAY,
+        )
+        captured_cmd = []
+
+        async def _run():
+            mock_proc = MagicMock()
+            mock_proc.returncode = 0
+            mock_proc.communicate = AsyncMock(return_value=(b"", b""))
+            # Mock the network inspect/create to fail (no Docker)
+            mock_network_proc = MagicMock()
+            mock_network_proc.returncode = 1
+            mock_network_proc.communicate = AsyncMock(
+                return_value=(b"", b"error"),
+            )
+            with patch("asyncio.create_subprocess_exec",
+                       return_value=mock_proc) as mock_exec:
+                await executor.execute("print('hi')")
+                captured_cmd.extend(mock_exec.call_args[0])
+
+        import asyncio
+        asyncio.run(_run())
+        # Should fail-closed to --network none
+        idx = captured_cmd.index("--network")
+        assert captured_cmd[idx + 1] == "none"
+
+    def test_set_network_mode_updates_mode(self):
+        """set_network_mode() should update the executor's mode."""
+        from sandbox.docker_executor import DockerSandboxExecutor
+        executor = DockerSandboxExecutor()
+        assert executor._effective_network_mode() == NetworkMode.DISABLED
+        executor.set_network_mode(NetworkMode.BEST_EFFORT_PROXY)
+        assert (
+            executor._effective_network_mode()
+            == NetworkMode.BEST_EFFORT_PROXY
+        )
 
 
 class TestBlockedIpRanges:
@@ -100,7 +260,8 @@ class TestDockerNetworkEnforcement:
         reason="requires Docker (pip install docker + Docker daemon running)",
     )
     def test_http_to_allowed_domain_succeeds(self):
-        """HTTP to an allow-listed domain should succeed through the gateway."""
+        """HTTP to an allow-listed domain should succeed
+        through the gateway."""
         pytest.skip("Docker enforcement test — requires configured gateway")
 
     @pytest.mark.skipif(

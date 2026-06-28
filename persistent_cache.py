@@ -34,20 +34,34 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from vector_store import VectorStore, LocalVectorStore, make_vector_store
 
-# Optional deps for semantic CLR cache
-try:
-    import numpy as np
-    from sentence_transformers import SentenceTransformer
-    from sklearn.metrics.pairwise import cosine_similarity
+# Optional deps for semantic CLR cache — each imported independently so
+# that the absence of one does not mask the availability of another.
+# Previously these were coupled in a single try/except, which meant that
+# if sentence-transformers was missing, numpy and cosine_similarity were
+# also undefined even when numpy and sklearn were installed. This caused
+# NameError crashes in environments with partial optional deps.
+np = None
+cosine_similarity = None
+SentenceTransformer = None
 
-    EMBEDDINGS_AVAILABLE = True
+try:
+    import numpy as np  # noqa: F811
 except ImportError:
-    EMBEDDINGS_AVAILABLE = False
+    pass
+
+try:
+    from sklearn.metrics.pairwise import cosine_similarity  # noqa: F811
+except ImportError:
+    pass
+
+try:
+    from sentence_transformers import SentenceTransformer  # noqa: F811
+except ImportError:
     # Define a sentinel so `patch("persistent_cache.SentenceTransformer")`
     # in tests doesn't raise AttributeError when sentence-transformers is
     # not installed. The sentinel is never called in production when
-    # EMBEDDINGS_AVAILABLE is False — code paths check the flag first.
-    # Tests that patch it set EMBEDDINGS_AVAILABLE=True via mocking.
+    # SentenceTransformer is None — code paths check the flag first.
+    # Tests that patch it set SentenceTransformer to a mock.
     class SentenceTransformer:  # type: ignore[no-redef]
         """Stub used when sentence-transformers is not installed.
 
@@ -62,6 +76,11 @@ except ImportError:
                 "sentence-transformers is not installed. "
                 "Install with: pip install sentence-transformers"
             )
+
+# EMBEDDINGS_AVAILABLE is True only when ALL three deps are present.
+# This preserves backward compatibility: the flag gates the semantic
+# similarity code path, which needs all three.
+EMBEDDINGS_AVAILABLE = np is not None and cosine_similarity is not None and SentenceTransformer is not None
 
 
 # ====================================================================== #
@@ -291,6 +310,15 @@ def _load_json(path: str) -> Optional[Any]:
         with open(path, "r") as f:
             return json.load(f)
     except (json.JSONDecodeError, OSError) as e:
+        # Silently handle empty files (e.g. temp files created by smoke
+        # tests). Only print a warning for non-empty files that fail to
+        # parse — those might be corrupted cache files the user should
+        # know about.
+        try:
+            if os.path.getsize(path) == 0:
+                return None
+        except OSError:
+            pass
         print(f"[PersistentCache] Failed to load {path}: {e}")
         return None
 
@@ -694,7 +722,13 @@ class CLRResultCache:
         # embeddings matrix remains the primary read path; the vector
         # store is the shadow that receives writes for migration to
         # AgentDB. Failures are non-fatal (shadow is best-effort).
-        if self._vector_store is not None:
+        #
+        # CRITICAL: do NOT upsert empty embeddings. When the embedding
+        # model is unavailable (self.model is None), embedding is [].
+        # Upserting a zero-dimensional vector causes sklearn
+        # cosine_similarity to raise ValueError("Found array with 0
+        # feature(s)"). Instead, skip the vector upsert with a warning.
+        if self._vector_store is not None and embedding:
             try:
                 self._vector_store.upsert(
                     f"clr_{len(self.entries) - 1}",
@@ -710,6 +744,10 @@ class CLRResultCache:
                 )
             except Exception:
                 pass  # shadow write failure is non-fatal
+        elif self._vector_store is not None and not embedding:
+            print("[CLRResultCache] WARNING: vector store configured but no "
+                  "embedding model available — skipping vector upsert. "
+                  "Install sentence-transformers or use HASH similarity mode.")
 
     def clear(self) -> None:
         self.entries = []
@@ -1041,7 +1079,12 @@ class VerifiedTrajectoryStore:
             self.save()
         # Shadow-mode dual-write: mirror to the vector store (e.g. AgentDB)
         # for migration. Non-fatal on failure.
-        if self._vector_store is not None:
+        #
+        # CRITICAL: do NOT upsert empty embeddings. When the embedding
+        # model is unavailable (self.model is None), embedding is [].
+        # Upserting a zero-dimensional vector causes sklearn
+        # cosine_similarity to raise ValueError. Skip with a warning.
+        if self._vector_store is not None and embedding:
             try:
                 self._vector_store.upsert(
                     f"traj_{len(self.entries) - 1}",
@@ -1056,6 +1099,10 @@ class VerifiedTrajectoryStore:
                 )
             except Exception:
                 pass  # shadow write failure is non-fatal
+        elif self._vector_store is not None and not embedding:
+            print("[TrajectoryStore] WARNING: vector store configured but no "
+                  "embedding model available — skipping vector upsert. "
+                  "Install sentence-transformers or use HASH similarity mode.")
 
     def clear(self) -> None:
         self.entries = []

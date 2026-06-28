@@ -4,12 +4,27 @@ Python bindings for the [RuvLLM](https://github.com/ruvnet/ruvllm) Rust
 inference engine with TurboQuant KV cache compression. Built with
 [PyO3](https://pyo3.rs) and [maturin](https://www.maturin.rs/).
 
-## Status: STUB (v0.1.0)
+## Status: EXPERIMENTAL (v0.2.0)
 
-The `ruvllm` Rust crate is not yet published. This scaffold compiles and
-installs but returns empty responses from `complete()`. When the crate is
-published, uncomment the `ruvllm` dependency in `Cargo.toml` and replace
-the stub forward pass in `src/lib.rs` with the real inference call.
+The `ruvllm` 2.3 crate is referenced in `Cargo.toml`. The default build
+(`cargo build --release`) compiles as a **stub** — `Engine.complete()`
+returns an empty response because the real inference path
+(`CandleBackend` + `candle-core`) is gated behind the `candle` feature.
+Enable real inference with:
+
+```bash
+# CPU inference:
+cargo build --release --features candle
+
+# Apple Silicon Metal acceleration:
+cargo build --release --features inference-metal
+```
+
+Without one of these features, the binding compiles and installs but
+does NOT perform inference. This binding is **not included in the main
+vibe-thinker Python wheel** — it must be built separately with a Rust
+toolchain + maturin. The HTTP sidecar path (`--ruvllm-url`) is the
+recommended integration mode for most users.
 
 ## Why PyO3 instead of HTTP?
 

@@ -1,0 +1,9 @@
+# Federation + web UI dependencies.
+# Enables the federation coordinator server, Redis-backed HA state,
+# and the web UI. Without these, federation uses in-memory single-
+# process state (the default).
+# pip install -r requirements-federation.txt
+
+fastapi>=0.109.1,<1
+uvicorn>=0.23,<1
+redis>=5.0,<6

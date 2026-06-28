@@ -1,0 +1,9 @@
+# Sandbox and security dependencies.
+# - wasmtime: Wasm sandbox for code verification (strict fs/network isolation)
+# - cryptography: Ed25519 asymmetric audit-log signatures (SLSA L2)
+# Without these, the system falls back to Docker sandbox (if available)
+# or HMAC-SHA256 audit signatures (stdlib).
+# pip install -r requirements-sandbox.txt
+
+wasmtime>=10.0,<20
+cryptography>=43.0.1,<46

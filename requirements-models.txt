@@ -1,0 +1,15 @@
+# Local model inference + retrieval dependencies.
+# - llama-cpp-python: in-process specialist backend (eliminates HTTP
+#   overhead for tiny models). Install with Metal on Apple Silicon:
+#   CMAKE_ARGS="-DGGML_METAL=on" pip install llama-cpp-python
+# - onnxruntime + huggingface_hub + tokenizers: ONNX embedding fallback
+#   when sentence-transformers is absent
+# - duckduckgo_search + wikipedia: free factual retrieval backends
+# pip install -r requirements-models.txt
+
+llama-cpp-python>=0.2.70,<1
+onnxruntime>=1.17,<2
+huggingface_hub>=0.20,<1
+tokenizers>=0.15,<1
+duckduckgo_search>=4.0,<5
+wikipedia>=1.4,<2

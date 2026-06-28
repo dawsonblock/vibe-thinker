@@ -2930,9 +2930,31 @@ class HybridReasoningOrchestrator:
             entries_removed, masters_stored, errors}.
         """
         if not self.use_trajectory_store or self.trajectory_store is None:
-            return {"error": "trajectory store not enabled"}
+            return {
+                "ok": False,
+                "error": "trajectory store not enabled",
+                "clusters_found": 0,
+                "clusters_synthesized": 0,
+                "entries_removed": 0,
+                "masters_stored": 0,
+                "masters_reverified": 0,
+                "candidates_examined": 0,
+                "errors": [],
+                "warnings": [],
+            }
         if self.trajectory_store is None:
-            return {"error": "trajectory store not enabled"}
+            return {
+                "ok": False,
+                "error": "trajectory store not enabled",
+                "clusters_found": 0,
+                "clusters_synthesized": 0,
+                "entries_removed": 0,
+                "masters_stored": 0,
+                "masters_reverified": 0,
+                "candidates_examined": 0,
+                "errors": [],
+                "warnings": [],
+            }
 
         clusters = self.trajectory_store.find_clusters(
             similarity_threshold=similarity_threshold,
@@ -2943,9 +2965,15 @@ class HybridReasoningOrchestrator:
             print("[Synthesis] No clusters of similar trajectories found — "
                   "nothing to synthesize")
             return {
-                "clusters_found": 0, "clusters_synthesized": 0,
-                "entries_removed": 0, "masters_stored": 0,
-                "masters_reverified": 0, "errors": [],
+                "ok": True,
+                "clusters_found": 0,
+                "clusters_synthesized": 0,
+                "entries_removed": 0,
+                "masters_stored": 0,
+                "masters_reverified": 0,
+                "candidates_examined": 0,
+                "errors": [],
+                "warnings": [],
             }
 
         clusters = clusters[:max_clusters]
@@ -3048,12 +3076,17 @@ class HybridReasoningOrchestrator:
             self.trajectory_store.remove_entries(unique_indices)
 
         return {
+            "ok": True,
             "clusters_found": len(clusters),
             "clusters_synthesized": masters_stored,
             "entries_removed": entries_removed,
             "masters_stored": masters_stored,
             "masters_reverified": masters_reverified,
+            "candidates_examined": sum(
+                len(c) for c in clusters
+            ),
             "errors": errors,
+            "warnings": [],
         }
 
     # ------------------------------------------------------------------ #

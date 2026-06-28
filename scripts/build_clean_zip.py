@@ -23,7 +23,7 @@ import tempfile
 import zipfile
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-VERSION = "0.3.2"
+VERSION = "0.4.2a0"
 DIST_DIR = os.path.join(PROJECT_ROOT, "dist")
 ZIP_NAME = f"vibe-thinker-v{VERSION}.zip"
 
@@ -34,7 +34,11 @@ INCLUDE_FILES = [
     "persistent_cache.py", "rfsn_job_queue.py", "bitemporal_log.py",
     "rfsn_cli.py", "scoring.py", "math_solver.py", "demo.py", "test_demo.py",
     "test_full_stack.py", "test_clr.py",
-    "README.md", "LICENSE", "pyproject.toml", "requirements.txt",
+    "README.md", "LICENSE", "pyproject.toml", "AGENTS.md",
+    "requirements.txt", "requirements-core.txt", "requirements-dev.txt",
+    "requirements-embeddings.txt", "requirements-federation.txt",
+    "requirements-sandbox.txt", "requirements-models.txt",
+    "requirements-legacy-full.txt",
     ".env.example", ".gitignore",
 ]
 # Also include tests/__init__.py, verifiers/__init__.py etc. (handled by dir copy)
@@ -67,6 +71,13 @@ def copy_tree_clean(src: str, dst: str) -> None:
             dst_path = os.path.join(dst, rel)
             os.makedirs(os.path.dirname(dst_path), exist_ok=True)
             shutil.copy2(os.path.join(root, fname), dst_path)
+            # Ensure shell scripts are executable in the staging dir.
+            # shutil.copy2 preserves source permissions, but if the
+            # source lost its +x bit (e.g. via git on a filesystem that
+            # doesn't track exec bits), force it here so the ZIP
+            # preserves it.
+            if fname.endswith(".sh"):
+                os.chmod(dst_path, 0o755)
 
 
 def main() -> int:
@@ -132,7 +143,18 @@ def main() -> int:
                         continue
                     fpath = os.path.join(root, fname)
                     arcname = os.path.relpath(fpath, staging)
-                    zf.write(fpath, arcname)
+                    # Preserve Unix file permissions in the ZIP so that
+                    # executable scripts (e.g. scripts/*.sh) remain
+                    # executable after extraction. Without this, some
+                    # unzip tools default to 644 for all entries.
+                    zinfo = zipfile.ZipInfo.from_file(fpath, arcname)
+                    # For .sh files, ensure the executable bit is set
+                    # even if the source file lost it during staging.
+                    if fname.endswith(".sh"):
+                        st = os.stat(fpath)
+                        mode = st.st_mode | 0o111  # set execute bits
+                        zinfo.external_attr = (mode & 0xFFFF) << 16
+                    zf.write(zinfo, fpath)
 
         print(f"\nClean ZIP created: {zip_path}")
         print(f"  Size: {os.path.getsize(zip_path)} bytes")
