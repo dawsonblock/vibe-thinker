@@ -1,22 +1,23 @@
 """Tests for trajectory synthesis / memory pruning (Phase 4.1)."""
 
 import json
-import os
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 pytestmark = pytest.mark.embeddings
 
-# numpy is an embeddings-extra dependency; skip cleanly when absent so
-# collection does not crash without the embeddings extra.
-pytest.importorskip("numpy", reason="requires numpy for trajectory synthesis tests")
+# numpy is an embeddings-extra dependency; skip cleanly when absent.
+pytest.importorskip(
+    "numpy", reason="requires numpy for trajectory synthesis tests",
+)
 import numpy as np  # noqa: E402
 
-from persistent_cache import (
+import persistent_cache  # noqa: E402
+from persistent_cache import (  # noqa: E402
     VerifiedTrajectoryStore,
     _clear_embedding_model_cache,
 )
-import persistent_cache
 
 
 @pytest.fixture(autouse=True)
@@ -64,10 +65,17 @@ class TestFindClusters:
         # Patch SentenceTransformer to avoid needing the real model.
         mock_model = MagicMock()
         # Return identity-like embeddings so similarity is predictable.
+
         def _encode(texts, **kw):
-            return np.array([[float(hash(t) % 100) / 100] * 4 for t in texts])
+            return np.array(
+                [[float(hash(t) % 100) / 100] * 4 for t in texts]
+            )
+
         mock_model.encode = _encode
-        with patch("persistent_cache.get_sentence_transformer_class", return_value=lambda model_name: mock_model):
+        with patch(
+            "persistent_cache.get_sentence_transformer_class",
+            return_value=lambda model_name: mock_model,
+        ):
             store = VerifiedTrajectoryStore(path=path, autosave=True)
         return store
 
@@ -96,7 +104,8 @@ class TestFindClusters:
             self._entry(f"q{i}", f"a{i}", embedding=emb) for i in range(5)
         ]
         store = self._make_store(tmp_path, entries)
-        clusters = store.find_clusters(similarity_threshold=0.9, min_cluster_size=3)
+        clusters = store.find_clusters(
+            similarity_threshold=0.9, min_cluster_size=3)
         assert len(clusters) >= 1
         # All 5 should be in one cluster (identical embeddings -> sim=1.0).
         total_in_clusters = sum(len(c) for c in clusters)
@@ -131,7 +140,8 @@ class TestFindClusters:
             self._entry("q2", "a2", embedding=[0.0, 0.0, 1.0, 0.0]),
         ]
         store = self._make_store(tmp_path, entries)
-        clusters = store.find_clusters(similarity_threshold=0.5, min_cluster_size=2)
+        clusters = store.find_clusters(
+            similarity_threshold=0.5, min_cluster_size=2)
         assert clusters == []
 
 
@@ -151,10 +161,15 @@ class TestRemoveEntries:
                 "claim_count": 10,
             })
         with open(path, "w") as f:
-            json.dump({"model_name": "test", "schema_version": 3, "entries": entries}, f)
+            data = {"model_name": "test", "schema_version": 3,
+                    "entries": entries}
+            json.dump(data, f)
         mock_model = MagicMock()
         mock_model.encode = _mock_encode([0.1, 0.2, 0.3, 0.4])
-        with patch("persistent_cache.get_sentence_transformer_class", return_value=lambda model_name: mock_model):
+        with patch(
+            "persistent_cache.get_sentence_transformer_class",
+            return_value=lambda model_name: mock_model,
+        ):
             store = VerifiedTrajectoryStore(path=path, autosave=True)
         assert len(store) == 5
         store.remove_entries([0, 2, 4])
@@ -175,10 +190,15 @@ class TestRemoveEntries:
             "claim_count": 10,
         }]
         with open(path, "w") as f:
-            json.dump({"model_name": "test", "schema_version": 3, "entries": entries}, f)
+            data = {"model_name": "test", "schema_version": 3,
+                    "entries": entries}
+            json.dump(data, f)
         mock_model = MagicMock()
         mock_model.encode = _mock_encode([0.1, 0.2, 0.3, 0.4])
-        with patch("persistent_cache.get_sentence_transformer_class", return_value=lambda model_name: mock_model):
+        with patch(
+            "persistent_cache.get_sentence_transformer_class",
+            return_value=lambda model_name: mock_model,
+        ):
             store = VerifiedTrajectoryStore(path=path, autosave=True)
         store.remove_entries([])
         assert len(store) == 1
@@ -191,14 +211,20 @@ class TestStoreSynthesized:
     def test_synthesized_entry_stored_with_correct_metadata(self, tmp_path):
         path = str(tmp_path / "trajectories.json")
         with open(path, "w") as f:
-            json.dump({"model_name": "test", "schema_version": 3, "entries": []}, f)
+            data = {"model_name": "test", "schema_version": 3,
+                    "entries": []}
+            json.dump(data, f)
         mock_model = MagicMock()
         mock_model.encode = _mock_encode([0.1, 0.2, 0.3, 0.4])
-        with patch("persistent_cache.get_sentence_transformer_class", return_value=lambda model_name: mock_model):
+        with patch(
+            "persistent_cache.get_sentence_transformer_class",
+            return_value=lambda model_name: mock_model,
+        ):
             store = VerifiedTrajectoryStore(path=path, autosave=True)
         store.store_synthesized(
             query="general math pattern",
-            answer="To solve recurrence relations, use characteristic equations.",
+            answer="To solve recurrence relations, "
+            "use characteristic equations.",
             task_type="math",
             source_count=5,
             source_queries=["q1", "q2", "q3", "q4", "q5"],
@@ -223,7 +249,8 @@ class TestStoreSynthesized:
                 "query": "verified q", "answer": "verified a", "score": 0.9,
                 "verification_method": "math_verifier", "verified": True,
                 "embedding": emb, "task_type": "math", "schema_version": 3,
-                "best_answer": "verified a", "best_score": 0.9, "claim_count": 10,
+                "best_answer": "verified a", "best_score": 0.9,
+                "claim_count": 10,
             },
             {
                 "query": "synth q", "answer": "synth a", "score": 0.0,
@@ -234,10 +261,15 @@ class TestStoreSynthesized:
             },
         ]
         with open(path, "w") as f:
-            json.dump({"model_name": "test", "schema_version": 3, "entries": entries}, f)
+            data = {"model_name": "test", "schema_version": 3,
+                    "entries": entries}
+            json.dump(data, f)
         mock_model = MagicMock()
         mock_model.encode = _mock_encode(emb)
-        with patch("persistent_cache.get_sentence_transformer_class", return_value=lambda model_name: mock_model):
+        with patch(
+            "persistent_cache.get_sentence_transformer_class",
+            return_value=lambda model_name: mock_model,
+        ):
             store = VerifiedTrajectoryStore(path=path, autosave=True)
         results = store.retrieve("verified q", task_type="math")
         # Only the verified entry should be returned — synthesized excluded.
@@ -247,10 +279,15 @@ class TestStoreSynthesized:
     def test_empty_answer_not_stored(self, tmp_path):
         path = str(tmp_path / "trajectories.json")
         with open(path, "w") as f:
-            json.dump({"model_name": "test", "schema_version": 3, "entries": []}, f)
+            data = {"model_name": "test", "schema_version": 3,
+                    "entries": []}
+            json.dump(data, f)
         mock_model = MagicMock()
         mock_model.encode = _mock_encode([0.1, 0.2, 0.3, 0.4])
-        with patch("persistent_cache.get_sentence_transformer_class", return_value=lambda model_name: mock_model):
+        with patch(
+            "persistent_cache.get_sentence_transformer_class",
+            return_value=lambda model_name: mock_model,
+        ):
             store = VerifiedTrajectoryStore(path=path, autosave=True)
         store.store_synthesized("q", "", "math", 3, ["q1", "q2", "q3"])
         assert len(store) == 0
@@ -265,14 +302,20 @@ class TestStoreSynthesizedVerified:
         verified=True and verification_method='synthesized_and_proven'."""
         path = str(tmp_path / "trajectories.json")
         with open(path, "w") as f:
-            json.dump({"model_name": "test", "schema_version": 3, "entries": []}, f)
+            data = {"model_name": "test", "schema_version": 3,
+                    "entries": []}
+            json.dump(data, f)
         mock_model = MagicMock()
         mock_model.encode = _mock_encode([0.1, 0.2, 0.3, 0.4])
-        with patch("persistent_cache.get_sentence_transformer_class", return_value=lambda model_name: mock_model):
+        with patch(
+            "persistent_cache.get_sentence_transformer_class",
+            return_value=lambda model_name: mock_model,
+        ):
             store = VerifiedTrajectoryStore(path=path, autosave=True)
         store.store_synthesized_verified(
             query="general math pattern",
-            answer="To solve recurrence relations, use characteristic equations.",
+            answer="To solve recurrence relations, "
+            "use characteristic equations.",
             task_type="math",
             source_count=5,
             source_queries=["q1", "q2", "q3", "q4", "q5"],
@@ -297,15 +340,21 @@ class TestStoreSynthesizedVerified:
                 "verification_method": "synthesized_and_proven",
                 "verified": True, "synthesized": True,
                 "embedding": emb, "task_type": "math", "schema_version": 3,
-                "best_answer": "synth a", "best_score": 0.65, "claim_count": 10,
+                "best_answer": "synth a", "best_score": 0.65,
+                "claim_count": 10,
                 "source_count": 3, "source_queries": ["q1", "q2", "q3"],
             },
         ]
         with open(path, "w") as f:
-            json.dump({"model_name": "test", "schema_version": 3, "entries": entries}, f)
+            data = {"model_name": "test", "schema_version": 3,
+                    "entries": entries}
+            json.dump(data, f)
         mock_model = MagicMock()
         mock_model.encode = _mock_encode(emb)
-        with patch("persistent_cache.get_sentence_transformer_class", return_value=lambda model_name: mock_model):
+        with patch(
+            "persistent_cache.get_sentence_transformer_class",
+            return_value=lambda model_name: mock_model,
+        ):
             store = VerifiedTrajectoryStore(path=path, autosave=True)
         results = store.retrieve("synth q", task_type="math")
         # The re-verified synthesized master IS retrievable.
@@ -316,12 +365,18 @@ class TestStoreSynthesizedVerified:
         """Empty answer is not stored even for re-verified masters."""
         path = str(tmp_path / "trajectories.json")
         with open(path, "w") as f:
-            json.dump({"model_name": "test", "schema_version": 3, "entries": []}, f)
+            data = {"model_name": "test", "schema_version": 3,
+                    "entries": []}
+            json.dump(data, f)
         mock_model = MagicMock()
         mock_model.encode = _mock_encode([0.1, 0.2, 0.3, 0.4])
-        with patch("persistent_cache.get_sentence_transformer_class", return_value=lambda model_name: mock_model):
+        with patch(
+            "persistent_cache.get_sentence_transformer_class",
+            return_value=lambda model_name: mock_model,
+        ):
             store = VerifiedTrajectoryStore(path=path, autosave=True)
-        store.store_synthesized_verified("q", "", "math", 3, ["q1", "q2", "q3"])
+        store.store_synthesized_verified(
+            "q", "", "math", 3, ["q1", "q2", "q3"])
         assert len(store) == 0
 
 
@@ -348,10 +403,15 @@ class TestOrchestratorSynthesize:
         # Empty store -> no clusters.
         path = str(tmp_path / "trajectories.json")
         with open(path, "w") as f:
-            json.dump({"model_name": "test", "schema_version": 3, "entries": []}, f)
+            data = {"model_name": "test", "schema_version": 3,
+                    "entries": []}
+            json.dump(data, f)
         mock_model = MagicMock()
         mock_model.encode = _mock_encode([0.1, 0.2, 0.3, 0.4])
-        with patch("persistent_cache.get_sentence_transformer_class", return_value=lambda model_name: mock_model):
+        with patch(
+            "persistent_cache.get_sentence_transformer_class",
+            return_value=lambda model_name: mock_model,
+        ):
             o = HybridReasoningOrchestrator(
                 vibe_endpoint="http://localhost:0",
                 generalist_endpoint="http://localhost:0",
@@ -377,21 +437,27 @@ class TestOrchestratorSynthesize:
         emb = [0.5, 0.5, 0.5, 0.5]
         entries = [
             {
-                "query": f"Solve a_{i+1} = a_i + 2, a_1 = 1",
+                "query": f"Solve a_{i + 1} = a_i + 2, a_1 = 1",
                 "answer": f"a_n = 2n - 1 (variant {i})",
                 "score": 0.9,
                 "verification_method": "math_verifier",
                 "verified": True, "embedding": emb, "task_type": "math",
-                "schema_version": 3, "best_answer": f"a_n = 2n - 1 (variant {i})",
+                "schema_version": 3,
+                "best_answer": f"a_n = 2n - 1 (variant {i})",
                 "best_score": 0.9, "claim_count": 10,
             }
             for i in range(5)
         ]
         with open(path, "w") as f:
-            json.dump({"model_name": "test", "schema_version": 3, "entries": entries}, f)
+            data = {"model_name": "test", "schema_version": 3,
+                    "entries": entries}
+            json.dump(data, f)
         mock_model = MagicMock()
         mock_model.encode = _mock_encode(emb)
-        with patch("persistent_cache.get_sentence_transformer_class", return_value=lambda model_name: mock_model):
+        with patch(
+            "persistent_cache.get_sentence_transformer_class",
+            return_value=lambda model_name: mock_model,
+        ):
             o = HybridReasoningOrchestrator(
                 vibe_endpoint="http://localhost:0",
                 generalist_endpoint="http://localhost:0",
@@ -428,22 +494,28 @@ class TestOrchestratorSynthesize:
         emb = [0.5, 0.5, 0.5, 0.5]
         entries = [
             {
-                "query": f"Solve a_{i+1} = a_i + 2, a_1 = 1",
+                "query": f"Solve a_{i + 1} = a_i + 2, a_1 = 1",
                 "answer": f"a_n = 2n - 1 (variant {i})",
                 "score": 0.9,
                 "verification_method": "math_verifier",
                 "verified": True, "embedding": emb, "task_type": "math",
-                "schema_version": 3, "best_answer": f"a_n = 2n - 1 (variant {i})",
+                "schema_version": 3,
+                "best_answer": f"a_n = 2n - 1 (variant {i})",
                 "best_score": 0.9, "claim_count": 10,
                 "verification_context": {"expected_answer": str(2 * i + 1)},
             }
             for i in range(5)
         ]
         with open(path, "w") as f:
-            json.dump({"model_name": "test", "schema_version": 3, "entries": entries}, f)
+            data = {"model_name": "test", "schema_version": 3,
+                    "entries": entries}
+            json.dump(data, f)
         mock_model = MagicMock()
         mock_model.encode = _mock_encode(emb)
-        with patch("persistent_cache.get_sentence_transformer_class", return_value=lambda model_name: mock_model):
+        with patch(
+            "persistent_cache.get_sentence_transformer_class",
+            return_value=lambda model_name: mock_model,
+        ):
             o = HybridReasoningOrchestrator(
                 vibe_endpoint="http://localhost:0",
                 generalist_endpoint="http://localhost:0",
@@ -461,7 +533,10 @@ class TestOrchestratorSynthesize:
             verified=True, score=1.0, method="numeric_comparison",
             evidence={},
         ))
-        with patch("hybrid_orchestrator.select_verifier", return_value=mock_verifier):
+        with patch(
+            "hybrid_orchestrator.select_verifier",
+            return_value=mock_verifier,
+        ):
             result = await o.synthesize_trajectories(
                 similarity_threshold=0.9, min_cluster_size=3,
             )
@@ -474,7 +549,9 @@ class TestOrchestratorSynthesize:
         assert entry["verification_method"] == "synthesized_and_proven"
 
     @pytest.mark.asyncio
-    async def test_synthesis_not_reverified_when_verifier_fails(self, tmp_path):
+    async def test_synthesis_not_reverified_when_verifier_fails(
+        self, tmp_path,
+    ):
         """v3.1: When the master fails re-verification, it's stored as
         unverified (the v0.4.0 fallback behavior)."""
         from hybrid_orchestrator import HybridReasoningOrchestrator
@@ -492,10 +569,15 @@ class TestOrchestratorSynthesize:
             for i in range(4)
         ]
         with open(path, "w") as f:
-            json.dump({"model_name": "test", "schema_version": 3, "entries": entries}, f)
+            data = {"model_name": "test", "schema_version": 3,
+                    "entries": entries}
+            json.dump(data, f)
         mock_model = MagicMock()
         mock_model.encode = _mock_encode(emb)
-        with patch("persistent_cache.get_sentence_transformer_class", return_value=lambda model_name: mock_model):
+        with patch(
+            "persistent_cache.get_sentence_transformer_class",
+            return_value=lambda model_name: mock_model,
+        ):
             o = HybridReasoningOrchestrator(
                 vibe_endpoint="http://localhost:0",
                 generalist_endpoint="http://localhost:0",
@@ -510,7 +592,10 @@ class TestOrchestratorSynthesize:
             verified=False, score=0.0, method="numeric_comparison",
             evidence={}, error="answer mismatch",
         ))
-        with patch("hybrid_orchestrator.select_verifier", return_value=mock_verifier):
+        with patch(
+            "hybrid_orchestrator.select_verifier",
+            return_value=mock_verifier,
+        ):
             result = await o.synthesize_trajectories(
                 similarity_threshold=0.9, min_cluster_size=3,
             )
@@ -522,7 +607,8 @@ class TestOrchestratorSynthesize:
 
     @pytest.mark.asyncio
     async def test_generalist_failure_keeps_raw_entries(self, tmp_path):
-        """If the generalist fails, raw entries are NOT removed (no data loss)."""
+        """If the generalist fails, raw entries are NOT removed
+        (no data loss)."""
         from hybrid_orchestrator import HybridReasoningOrchestrator
         path = str(tmp_path / "trajectories.json")
         emb = [0.5, 0.5, 0.5, 0.5]
@@ -536,10 +622,15 @@ class TestOrchestratorSynthesize:
             for i in range(4)
         ]
         with open(path, "w") as f:
-            json.dump({"model_name": "test", "schema_version": 3, "entries": entries}, f)
+            data = {"model_name": "test", "schema_version": 3,
+                    "entries": entries}
+            json.dump(data, f)
         mock_model = MagicMock()
         mock_model.encode = _mock_encode(emb)
-        with patch("persistent_cache.get_sentence_transformer_class", return_value=lambda model_name: mock_model):
+        with patch(
+            "persistent_cache.get_sentence_transformer_class",
+            return_value=lambda model_name: mock_model,
+        ):
             o = HybridReasoningOrchestrator(
                 vibe_endpoint="http://localhost:0",
                 generalist_endpoint="http://localhost:0",
