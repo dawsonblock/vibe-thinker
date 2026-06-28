@@ -50,6 +50,12 @@ from persistent_cache import (
     should_cache,
     EMBEDDINGS_AVAILABLE,
 )
+from verifiers import (
+    MathVerifier, CodeVerifier, FactualVerifier,
+    SchemaVerifier, LogicVerifier,
+)
+from sandbox import WarmDockerPool
+from math_solver import solve as solve_math
 
 
 def empty_synthesis_result(ok: bool = True) -> Dict[str, Any]:
@@ -69,9 +75,6 @@ def empty_synthesis_result(ok: bool = True) -> Dict[str, Any]:
         "errors": [],
         "warnings": [],
     }
-from verifiers import MathVerifier, CodeVerifier, FactualVerifier, SchemaVerifier, LogicVerifier
-from sandbox import WarmDockerPool
-from math_solver import solve as solve_math
 
 # Sentinel for "argument not provided" — distinct from an explicit None
 # (which means "disable the code verifier / verified loop").

@@ -760,7 +760,8 @@ class CLRResultCache:
         # Upserting a zero-dimensional vector causes sklearn
         # cosine_similarity to raise ValueError("Found array with 0
         # feature(s)"). Instead, skip the vector upsert with a warning.
-        if self._vector_store is not None and _is_valid_embedding_vector(embedding):
+        if (self._vector_store is not None
+                and _is_valid_embedding_vector(embedding)):
             try:
                 self._vector_store.upsert(
                     f"clr_{len(self.entries) - 1}",
@@ -776,7 +777,8 @@ class CLRResultCache:
                 )
             except Exception:
                 pass  # shadow write failure is non-fatal
-        elif self._vector_store is not None and not _is_valid_embedding_vector(embedding):
+        elif (self._vector_store is not None
+              and not _is_valid_embedding_vector(embedding)):
             print("[CLRResultCache] WARNING: vector store configured but no "
                   "embedding model available — skipping vector upsert. "
                   "Install sentence-transformers or use HASH similarity mode.")
@@ -1116,7 +1118,8 @@ class VerifiedTrajectoryStore:
         # model is unavailable (self.model is None), embedding is [].
         # Upserting a zero-dimensional vector causes sklearn
         # cosine_similarity to raise ValueError. Skip with a warning.
-        if self._vector_store is not None and _is_valid_embedding_vector(embedding):
+        if (self._vector_store is not None
+                and _is_valid_embedding_vector(embedding)):
             try:
                 self._vector_store.upsert(
                     f"traj_{len(self.entries) - 1}",
@@ -1131,7 +1134,8 @@ class VerifiedTrajectoryStore:
                 )
             except Exception:
                 pass  # shadow write failure is non-fatal
-        elif self._vector_store is not None and not _is_valid_embedding_vector(embedding):
+        elif (self._vector_store is not None
+              and not _is_valid_embedding_vector(embedding)):
             print("[TrajectoryStore] WARNING: vector store configured but no "
                   "embedding model available — skipping vector upsert. "
                   "Install sentence-transformers or use HASH similarity mode.")
