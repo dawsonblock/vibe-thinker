@@ -40,9 +40,16 @@ from vector_store import VectorStore, LocalVectorStore, make_vector_store
 # if sentence-transformers was missing, numpy and cosine_similarity were
 # also undefined even when numpy and sklearn were installed. This caused
 # NameError crashes in environments with partial optional deps.
+#
+# v0.4.2: The stub SentenceTransformer class was removed. It caused
+# false-positive EMBEDDINGS_AVAILABLE in partial environments. Now
+# _SentenceTransformer is None when the package is absent, and
+# EMBEDDINGS_AVAILABLE is True only when all three deps are present.
+# Tests should patch get_sentence_transformer_class() instead of
+# patching SentenceTransformer directly.
 np = None
 cosine_similarity = None
-SentenceTransformer = None
+_SentenceTransformer = None
 
 try:
     import numpy as np  # noqa: F811
@@ -55,32 +62,31 @@ except ImportError:
     pass
 
 try:
-    from sentence_transformers import SentenceTransformer  # noqa: F811
+    from sentence_transformers import (
+        SentenceTransformer as _SentenceTransformer,  # noqa: F811
+    )
 except ImportError:
-    # Define a sentinel so `patch("persistent_cache.SentenceTransformer")`
-    # in tests doesn't raise AttributeError when sentence-transformers is
-    # not installed. The sentinel is never called in production when
-    # SentenceTransformer is None — code paths check the flag first.
-    # Tests that patch it set SentenceTransformer to a mock.
-    class SentenceTransformer:  # type: ignore[no-redef]
-        """Stub used when sentence-transformers is not installed.
+    pass
 
-        This exists so that ``patch("persistent_cache.SentenceTransformer")``
-        in tests works whether or not the real package is installed.
-        It is never instantiated in production when
-        ``EMBEDDINGS_AVAILABLE`` is False.
-        """
 
-        def __init__(self, *args, **kwargs):
-            raise ImportError(
-                "sentence-transformers is not installed. "
-                "Install with: pip install sentence-transformers"
-            )
+def get_sentence_transformer_class():
+    """Return the SentenceTransformer class if available, else None.
+
+    Used by the cache constructors to decide whether embedding-based
+    similarity is possible without raising at import time. Tests should
+    patch this function instead of patching SentenceTransformer directly.
+    """
+    return _SentenceTransformer
+
 
 # EMBEDDINGS_AVAILABLE is True only when ALL three deps are present.
-# This preserves backward compatibility: the flag gates the semantic
-# similarity code path, which needs all three.
-EMBEDDINGS_AVAILABLE = np is not None and cosine_similarity is not None and SentenceTransformer is not None
+# Do NOT create a stub class and use it to decide availability — that
+# masks the absence of sentence-transformers in partial environments.
+EMBEDDINGS_AVAILABLE = (
+    np is not None
+    and cosine_similarity is not None
+    and _SentenceTransformer is not None
+)
 
 
 # ====================================================================== #
@@ -103,19 +109,6 @@ class CacheSimilarityMode(str, Enum):
     NONE = "none"
     HASH = "hash"
     EMBEDDINGS = "embeddings"
-
-
-def get_sentence_transformer_class():
-    """Return the SentenceTransformer class if available, else None.
-
-    Used by the cache constructors to decide whether embedding-based
-    similarity is possible without raising at import time.
-    """
-    try:
-        from sentence_transformers import SentenceTransformer as _ST
-        return _ST
-    except Exception:
-        return None
 
 
 def _resolve_similarity_mode(
@@ -149,7 +142,7 @@ def _resolve_similarity_mode(
 # Previously, CLRResultCache, VerifiedTrajectoryStore, and EmbeddingRouter
 # each loaded their own SentenceTransformer instance (~100-300MB each).
 # This singleton ensures only one instance per model name is loaded.
-_EMBEDDING_MODELS: Dict[str, "SentenceTransformer"] = {}
+_EMBEDDING_MODELS: Dict[str, Any] = {}
 
 
 def get_shared_embedding_model(model_name: str = "all-MiniLM-L6-v2"):
@@ -161,18 +154,57 @@ def get_shared_embedding_model(model_name: str = "all-MiniLM-L6-v2"):
     """
     if not EMBEDDINGS_AVAILABLE:
         raise ImportError(
-            "Embeddings need: pip install sentence-transformers "
-            "scikit-learn numpy"
+            "Embedding similarity mode requires sentence-transformers, "
+            "numpy, and scikit-learn. Install with: "
+            "pip install -e '.[embeddings]'"
+        )
+    transformer_cls = get_sentence_transformer_class()
+    if transformer_cls is None:
+        raise ImportError(
+            "sentence-transformers is not installed. "
+            "Install with: pip install -e '.[embeddings]'"
         )
     if model_name not in _EMBEDDING_MODELS:
         print(f"[EmbeddingModel] Loading shared model: {model_name}")
-        _EMBEDDING_MODELS[model_name] = SentenceTransformer(model_name)
+        _EMBEDDING_MODELS[model_name] = transformer_cls(model_name)
     return _EMBEDDING_MODELS[model_name]
 
 
 def _clear_embedding_model_cache() -> None:
     """Clear the shared embedding model cache (for testing)."""
     _EMBEDDING_MODELS.clear()
+
+
+def _is_valid_embedding_vector(vec) -> bool:
+    """Check if an embedding vector is valid (non-None, non-empty).
+
+    Used before vector-store upserts to prevent zero-dimensional vectors
+    from reaching sklearn cosine_similarity (which raises
+    ValueError("Found array with 0 feature(s)"))."""
+    if vec is None:
+        return False
+    try:
+        return len(vec) > 0
+    except TypeError:
+        return False
+
+
+class FakeEmbedder:
+    """Test-only embedder that returns deterministic vectors.
+
+    Use in tests that need vector upserts without sentence-transformers:
+
+        cache = CLRResultCache(
+            vector_store=vs,
+            embedder=FakeEmbedder(),
+            similarity_mode=CacheSimilarityMode.EMBEDDINGS,
+        )
+    """
+
+    def encode(self, texts, **kwargs):
+        if isinstance(texts, str):
+            return [0.1, 0.2, 0.3]
+        return [[0.1, 0.2, 0.3] for _ in texts]
 
 
 # ====================================================================== #
@@ -728,7 +760,7 @@ class CLRResultCache:
         # Upserting a zero-dimensional vector causes sklearn
         # cosine_similarity to raise ValueError("Found array with 0
         # feature(s)"). Instead, skip the vector upsert with a warning.
-        if self._vector_store is not None and embedding:
+        if self._vector_store is not None and _is_valid_embedding_vector(embedding):
             try:
                 self._vector_store.upsert(
                     f"clr_{len(self.entries) - 1}",
@@ -744,7 +776,7 @@ class CLRResultCache:
                 )
             except Exception:
                 pass  # shadow write failure is non-fatal
-        elif self._vector_store is not None and not embedding:
+        elif self._vector_store is not None and not _is_valid_embedding_vector(embedding):
             print("[CLRResultCache] WARNING: vector store configured but no "
                   "embedding model available — skipping vector upsert. "
                   "Install sentence-transformers or use HASH similarity mode.")
@@ -1084,7 +1116,7 @@ class VerifiedTrajectoryStore:
         # model is unavailable (self.model is None), embedding is [].
         # Upserting a zero-dimensional vector causes sklearn
         # cosine_similarity to raise ValueError. Skip with a warning.
-        if self._vector_store is not None and embedding:
+        if self._vector_store is not None and _is_valid_embedding_vector(embedding):
             try:
                 self._vector_store.upsert(
                     f"traj_{len(self.entries) - 1}",
@@ -1099,7 +1131,7 @@ class VerifiedTrajectoryStore:
                 )
             except Exception:
                 pass  # shadow write failure is non-fatal
-        elif self._vector_store is not None and not embedding:
+        elif self._vector_store is not None and not _is_valid_embedding_vector(embedding):
             print("[TrajectoryStore] WARNING: vector store configured but no "
                   "embedding model available — skipping vector upsert. "
                   "Install sentence-transformers or use HASH similarity mode.")

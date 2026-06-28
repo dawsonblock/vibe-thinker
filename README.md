@@ -5,7 +5,7 @@ queries between a high-precision reasoning specialist and a generalist
 model, with deterministic verifiers, bi-temporal audit logging, and an
 interactive CLI.
 
-## Current status: ALPHA (v0.4.1a0)
+## Current status: ALPHA (v0.4.2a0)
 
 **Not production-safe.** This is alpha software. See `docs/roadmap.md`
 for the stabilization plan and frozen feature scope.
@@ -32,6 +32,33 @@ for the stabilization plan and frozen feature scope.
 - hostile-code sandboxing (see Security status below)
 - production autonomous operation
 - real distributed trust
+
+## Install profiles
+
+```bash
+# Core (minimal — aiohttp + python-dotenv only):
+pip install -e .
+
+# Dev/test:
+pip install -e ".[dev,test]"
+
+# Embeddings (semantic routing + CLR cache + trajectory synthesis):
+pip install -e ".[dev,test,embeddings]"
+
+# Logic (Z3/SMT constraint verification):
+pip install -e ".[dev,test,logic]"
+
+# Federation/web (FastAPI + Redis + web UI):
+pip install -e ".[dev,test,federation,web]"
+
+# Sandbox (wasmtime + Ed25519 signatures):
+pip install -e ".[dev,test,sandbox]"
+
+# Legacy full (everything at once):
+pip install -r requirements-legacy-full.txt
+```
+
+Do NOT install the old giant blob unless you explicitly want legacy full.
 
 ## Quickstart: Mac local
 

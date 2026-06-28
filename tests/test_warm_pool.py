@@ -162,14 +162,19 @@ class TestWarmPoolUnit:
         pool._run_docker = mock_run_docker
 
         # Mock create_subprocess_exec to return a fake process whose
-        # communicate() times out (matching the real code path)
+        # communicate() times out (matching the real code path).
+        # The production code calls asyncio.wait_for(proc.communicate(),
+        # timeout=timeout). We patch wait_for to raise TimeoutError
+        # immediately. To avoid "coroutine was never awaited" warnings
+        # from the un-awaited communicate() coroutine, we use a Mock
+        # (not AsyncMock) that returns a dummy value — wait_for raises
+        # before the coroutine is ever scheduled.
         mock_proc = MagicMock()
         mock_proc.returncode = None
-
-        async def mock_communicate():
-            raise asyncio.TimeoutError()
-
-        mock_proc.communicate = mock_communicate
+        # communicate() returns a dummy coroutine that is never awaited
+        # because wait_for raises first. Using MagicMock (not AsyncMock)
+        # means no real coroutine object is created.
+        mock_proc.communicate = MagicMock(return_value=(b"", b""))
         mock_proc.kill = MagicMock()
         mock_proc.wait = AsyncMock(return_value=0)
 

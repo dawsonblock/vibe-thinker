@@ -12,15 +12,27 @@ pytestmark = pytest.mark.embeddings
 pytest.importorskip("numpy", reason="requires numpy for trajectory synthesis tests")
 import numpy as np  # noqa: E402
 
-from persistent_cache import VerifiedTrajectoryStore, _clear_embedding_model_cache
+from persistent_cache import (
+    VerifiedTrajectoryStore,
+    _clear_embedding_model_cache,
+)
+import persistent_cache
 
 
 @pytest.fixture(autouse=True)
 def _clear_model_cache():
     """Clear the shared embedding model cache before each test so mocks
-    are used instead of cached real models (Phase 5 singleton fix)."""
+    are used instead of cached real models (Phase 5 singleton fix).
+
+    Also force EMBEDDINGS_AVAILABLE=True so the embedding code paths are
+    exercised even in partial environments where sentence-transformers
+    is not installed (the tests patch get_sentence_transformer_class).
+    """
     _clear_embedding_model_cache()
+    original = persistent_cache.EMBEDDINGS_AVAILABLE
+    persistent_cache.EMBEDDINGS_AVAILABLE = True
     yield
+    persistent_cache.EMBEDDINGS_AVAILABLE = original
     _clear_embedding_model_cache()
 
 
@@ -55,7 +67,7 @@ class TestFindClusters:
         def _encode(texts, **kw):
             return np.array([[float(hash(t) % 100) / 100] * 4 for t in texts])
         mock_model.encode = _encode
-        with patch("persistent_cache.SentenceTransformer", return_value=mock_model):
+        with patch("persistent_cache.get_sentence_transformer_class", return_value=lambda model_name: mock_model):
             store = VerifiedTrajectoryStore(path=path, autosave=True)
         return store
 
@@ -142,7 +154,7 @@ class TestRemoveEntries:
             json.dump({"model_name": "test", "schema_version": 3, "entries": entries}, f)
         mock_model = MagicMock()
         mock_model.encode = _mock_encode([0.1, 0.2, 0.3, 0.4])
-        with patch("persistent_cache.SentenceTransformer", return_value=mock_model):
+        with patch("persistent_cache.get_sentence_transformer_class", return_value=lambda model_name: mock_model):
             store = VerifiedTrajectoryStore(path=path, autosave=True)
         assert len(store) == 5
         store.remove_entries([0, 2, 4])
@@ -166,7 +178,7 @@ class TestRemoveEntries:
             json.dump({"model_name": "test", "schema_version": 3, "entries": entries}, f)
         mock_model = MagicMock()
         mock_model.encode = _mock_encode([0.1, 0.2, 0.3, 0.4])
-        with patch("persistent_cache.SentenceTransformer", return_value=mock_model):
+        with patch("persistent_cache.get_sentence_transformer_class", return_value=lambda model_name: mock_model):
             store = VerifiedTrajectoryStore(path=path, autosave=True)
         store.remove_entries([])
         assert len(store) == 1
@@ -182,7 +194,7 @@ class TestStoreSynthesized:
             json.dump({"model_name": "test", "schema_version": 3, "entries": []}, f)
         mock_model = MagicMock()
         mock_model.encode = _mock_encode([0.1, 0.2, 0.3, 0.4])
-        with patch("persistent_cache.SentenceTransformer", return_value=mock_model):
+        with patch("persistent_cache.get_sentence_transformer_class", return_value=lambda model_name: mock_model):
             store = VerifiedTrajectoryStore(path=path, autosave=True)
         store.store_synthesized(
             query="general math pattern",
@@ -225,7 +237,7 @@ class TestStoreSynthesized:
             json.dump({"model_name": "test", "schema_version": 3, "entries": entries}, f)
         mock_model = MagicMock()
         mock_model.encode = _mock_encode(emb)
-        with patch("persistent_cache.SentenceTransformer", return_value=mock_model):
+        with patch("persistent_cache.get_sentence_transformer_class", return_value=lambda model_name: mock_model):
             store = VerifiedTrajectoryStore(path=path, autosave=True)
         results = store.retrieve("verified q", task_type="math")
         # Only the verified entry should be returned — synthesized excluded.
@@ -238,7 +250,7 @@ class TestStoreSynthesized:
             json.dump({"model_name": "test", "schema_version": 3, "entries": []}, f)
         mock_model = MagicMock()
         mock_model.encode = _mock_encode([0.1, 0.2, 0.3, 0.4])
-        with patch("persistent_cache.SentenceTransformer", return_value=mock_model):
+        with patch("persistent_cache.get_sentence_transformer_class", return_value=lambda model_name: mock_model):
             store = VerifiedTrajectoryStore(path=path, autosave=True)
         store.store_synthesized("q", "", "math", 3, ["q1", "q2", "q3"])
         assert len(store) == 0
@@ -256,7 +268,7 @@ class TestStoreSynthesizedVerified:
             json.dump({"model_name": "test", "schema_version": 3, "entries": []}, f)
         mock_model = MagicMock()
         mock_model.encode = _mock_encode([0.1, 0.2, 0.3, 0.4])
-        with patch("persistent_cache.SentenceTransformer", return_value=mock_model):
+        with patch("persistent_cache.get_sentence_transformer_class", return_value=lambda model_name: mock_model):
             store = VerifiedTrajectoryStore(path=path, autosave=True)
         store.store_synthesized_verified(
             query="general math pattern",
@@ -293,7 +305,7 @@ class TestStoreSynthesizedVerified:
             json.dump({"model_name": "test", "schema_version": 3, "entries": entries}, f)
         mock_model = MagicMock()
         mock_model.encode = _mock_encode(emb)
-        with patch("persistent_cache.SentenceTransformer", return_value=mock_model):
+        with patch("persistent_cache.get_sentence_transformer_class", return_value=lambda model_name: mock_model):
             store = VerifiedTrajectoryStore(path=path, autosave=True)
         results = store.retrieve("synth q", task_type="math")
         # The re-verified synthesized master IS retrievable.
@@ -307,7 +319,7 @@ class TestStoreSynthesizedVerified:
             json.dump({"model_name": "test", "schema_version": 3, "entries": []}, f)
         mock_model = MagicMock()
         mock_model.encode = _mock_encode([0.1, 0.2, 0.3, 0.4])
-        with patch("persistent_cache.SentenceTransformer", return_value=mock_model):
+        with patch("persistent_cache.get_sentence_transformer_class", return_value=lambda model_name: mock_model):
             store = VerifiedTrajectoryStore(path=path, autosave=True)
         store.store_synthesized_verified("q", "", "math", 3, ["q1", "q2", "q3"])
         assert len(store) == 0
@@ -327,7 +339,8 @@ class TestOrchestratorSynthesize:
             use_clr_cache=False, use_trajectory_store=False,
         )
         result = await o.synthesize_trajectories()
-        assert "error" in result
+        assert result["ok"] is False
+        assert len(result["errors"]) > 0
 
     @pytest.mark.asyncio
     async def test_no_clusters_found(self, tmp_path):
@@ -338,7 +351,7 @@ class TestOrchestratorSynthesize:
             json.dump({"model_name": "test", "schema_version": 3, "entries": []}, f)
         mock_model = MagicMock()
         mock_model.encode = _mock_encode([0.1, 0.2, 0.3, 0.4])
-        with patch("persistent_cache.SentenceTransformer", return_value=mock_model):
+        with patch("persistent_cache.get_sentence_transformer_class", return_value=lambda model_name: mock_model):
             o = HybridReasoningOrchestrator(
                 vibe_endpoint="http://localhost:0",
                 generalist_endpoint="http://localhost:0",
@@ -378,7 +391,7 @@ class TestOrchestratorSynthesize:
             json.dump({"model_name": "test", "schema_version": 3, "entries": entries}, f)
         mock_model = MagicMock()
         mock_model.encode = _mock_encode(emb)
-        with patch("persistent_cache.SentenceTransformer", return_value=mock_model):
+        with patch("persistent_cache.get_sentence_transformer_class", return_value=lambda model_name: mock_model):
             o = HybridReasoningOrchestrator(
                 vibe_endpoint="http://localhost:0",
                 generalist_endpoint="http://localhost:0",
@@ -430,7 +443,7 @@ class TestOrchestratorSynthesize:
             json.dump({"model_name": "test", "schema_version": 3, "entries": entries}, f)
         mock_model = MagicMock()
         mock_model.encode = _mock_encode(emb)
-        with patch("persistent_cache.SentenceTransformer", return_value=mock_model):
+        with patch("persistent_cache.get_sentence_transformer_class", return_value=lambda model_name: mock_model):
             o = HybridReasoningOrchestrator(
                 vibe_endpoint="http://localhost:0",
                 generalist_endpoint="http://localhost:0",
@@ -482,7 +495,7 @@ class TestOrchestratorSynthesize:
             json.dump({"model_name": "test", "schema_version": 3, "entries": entries}, f)
         mock_model = MagicMock()
         mock_model.encode = _mock_encode(emb)
-        with patch("persistent_cache.SentenceTransformer", return_value=mock_model):
+        with patch("persistent_cache.get_sentence_transformer_class", return_value=lambda model_name: mock_model):
             o = HybridReasoningOrchestrator(
                 vibe_endpoint="http://localhost:0",
                 generalist_endpoint="http://localhost:0",
@@ -526,7 +539,7 @@ class TestOrchestratorSynthesize:
             json.dump({"model_name": "test", "schema_version": 3, "entries": entries}, f)
         mock_model = MagicMock()
         mock_model.encode = _mock_encode(emb)
-        with patch("persistent_cache.SentenceTransformer", return_value=mock_model):
+        with patch("persistent_cache.get_sentence_transformer_class", return_value=lambda model_name: mock_model):
             o = HybridReasoningOrchestrator(
                 vibe_endpoint="http://localhost:0",
                 generalist_endpoint="http://localhost:0",

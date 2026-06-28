@@ -35,8 +35,10 @@ class NetworkMode(str, Enum):
     ENFORCED_GATEWAY: the candidate container runs on a Docker
         --internal network with no direct internet access. All egress
         goes through a gateway/proxy container that enforces the
-        allow-list at the network level. This IS a security boundary
-        (when correctly configured). Requires Docker.
+        allow-list at the network level. EXPERIMENTAL — not validated
+        with bypass tests in all environments. Fail-closes to
+        --network none if the gateway network cannot be created.
+        Requires Docker.
     """
 
     DISABLED = "disabled"

@@ -48,7 +48,27 @@ from persistent_cache import (
     PersistentRouteCache,
     VerifiedTrajectoryStore,
     should_cache,
+    EMBEDDINGS_AVAILABLE,
 )
+
+
+def empty_synthesis_result(ok: bool = True) -> Dict[str, Any]:
+    """Return a stable trajectory synthesis result dict.
+
+    Every return path of synthesize_trajectories() must return a dict
+    with these exact keys. Use this helper to guarantee the contract.
+    """
+    return {
+        "ok": ok,
+        "clusters_found": 0,
+        "clusters_synthesized": 0,
+        "entries_removed": 0,
+        "masters_stored": 0,
+        "masters_reverified": 0,
+        "candidates_examined": 0,
+        "errors": [],
+        "warnings": [],
+    }
 from verifiers import MathVerifier, CodeVerifier, FactualVerifier, SchemaVerifier, LogicVerifier
 from sandbox import WarmDockerPool
 from math_solver import solve as solve_math
@@ -2930,31 +2950,24 @@ class HybridReasoningOrchestrator:
             entries_removed, masters_stored, errors}.
         """
         if not self.use_trajectory_store or self.trajectory_store is None:
-            return {
-                "ok": False,
-                "error": "trajectory store not enabled",
-                "clusters_found": 0,
-                "clusters_synthesized": 0,
-                "entries_removed": 0,
-                "masters_stored": 0,
-                "masters_reverified": 0,
-                "candidates_examined": 0,
-                "errors": [],
-                "warnings": [],
-            }
+            result = empty_synthesis_result(ok=False)
+            result["errors"].append(
+                "trajectory store is not configured"
+            )
+            return result
         if self.trajectory_store is None:
-            return {
-                "ok": False,
-                "error": "trajectory store not enabled",
-                "clusters_found": 0,
-                "clusters_synthesized": 0,
-                "entries_removed": 0,
-                "masters_stored": 0,
-                "masters_reverified": 0,
-                "candidates_examined": 0,
-                "errors": [],
-                "warnings": [],
-            }
+            result = empty_synthesis_result(ok=False)
+            result["errors"].append(
+                "trajectory store is not configured"
+            )
+            return result
+        if not EMBEDDINGS_AVAILABLE:
+            result = empty_synthesis_result(ok=False)
+            result["errors"].append(
+                "trajectory synthesis requires embedding dependencies; "
+                "install with pip install -e '.[embeddings]'"
+            )
+            return result
 
         clusters = self.trajectory_store.find_clusters(
             similarity_threshold=similarity_threshold,
@@ -2964,17 +2977,7 @@ class HybridReasoningOrchestrator:
         if not clusters:
             print("[Synthesis] No clusters of similar trajectories found — "
                   "nothing to synthesize")
-            return {
-                "ok": True,
-                "clusters_found": 0,
-                "clusters_synthesized": 0,
-                "entries_removed": 0,
-                "masters_stored": 0,
-                "masters_reverified": 0,
-                "candidates_examined": 0,
-                "errors": [],
-                "warnings": [],
-            }
+            return empty_synthesis_result(ok=True)
 
         clusters = clusters[:max_clusters]
         print(f"[Synthesis] Found {len(clusters)} cluster(s) to synthesize "
@@ -3075,19 +3078,17 @@ class HybridReasoningOrchestrator:
             unique_indices = sorted(set(all_removed_indices), reverse=True)
             self.trajectory_store.remove_entries(unique_indices)
 
-        return {
-            "ok": True,
-            "clusters_found": len(clusters),
-            "clusters_synthesized": masters_stored,
-            "entries_removed": entries_removed,
-            "masters_stored": masters_stored,
-            "masters_reverified": masters_reverified,
-            "candidates_examined": sum(
-                len(c) for c in clusters
-            ),
-            "errors": errors,
-            "warnings": [],
-        }
+        result = empty_synthesis_result(ok=True)
+        result["clusters_found"] = len(clusters)
+        result["clusters_synthesized"] = masters_stored
+        result["entries_removed"] = entries_removed
+        result["masters_stored"] = masters_stored
+        result["masters_reverified"] = masters_reverified
+        result["candidates_examined"] = sum(
+            len(c) for c in clusters
+        )
+        result["errors"] = errors
+        return result
 
     # ------------------------------------------------------------------ #
     # Lifecycle: warm pool start/cleanup

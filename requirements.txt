@@ -1,23 +1,2 @@
-# vibe-thinker requirements
-#
-# The base install only needs two packages (aiohttp + python-dotenv).
-# All other dependencies are opt-in. Install only what you need:
-#
-#   pip install -r requirements-core.txt        # minimal (base only)
-#   pip install -r requirements-dev.txt         # testing
-#   pip install -r requirements-embeddings.txt  # semantic routing + cache
-#   pip install -r requirements-federation.txt  # web UI + Redis federation
-#   pip install -r requirements-sandbox.txt     # wasmtime + Ed25519
-#   pip install -r requirements-models.txt      # local models + retrieval
-#
-# Or use pyproject.toml extras (preferred for editable installs):
-#   pip install -e '.[dev,embeddings,federation,web,sandbox]'
-#
-# To install everything (legacy full install):
-#   pip install -r requirements-legacy-full.txt
-#
-# NOTE: This file is kept for backward compatibility. New installs
-# should use the split files above or pyproject.toml extras.
-
 aiohttp>=3.10.11,<4
 python-dotenv>=1.0,<2

@@ -34,7 +34,7 @@ INCLUDE_FILES = [
     "persistent_cache.py", "rfsn_job_queue.py", "bitemporal_log.py",
     "rfsn_cli.py", "scoring.py", "math_solver.py", "demo.py", "test_demo.py",
     "test_full_stack.py", "test_clr.py",
-    "README.md", "LICENSE", "pyproject.toml", "AGENTS.md",
+    "README.md", "LICENSE", "pyproject.toml", "AGENTS.md", "CHANGELOG.md",
     "requirements.txt", "requirements-core.txt", "requirements-dev.txt",
     "requirements-embeddings.txt", "requirements-federation.txt",
     "requirements-sandbox.txt", "requirements-models.txt",

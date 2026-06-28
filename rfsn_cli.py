@@ -1055,13 +1055,15 @@ def _run_smoke() -> int:
     # 5. Local cache (exact key lookup, no embeddings needed)
     try:
         import tempfile, os
-        from persistent_cache import CLRResultCache
+        from persistent_cache import CLRResultCache, CacheSimilarityMode
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
             cache_path = f.name
         try:
+            # Use similarity_mode=NONE so no embedding model is loaded.
+            # The smoke test verifies the exact-match cache path only.
             cache = CLRResultCache(
                 path=cache_path,
-                vector_store=_FakeVectorStore(),
+                similarity_mode=CacheSimilarityMode.NONE,
             )
             cache.insert(
                 problem="smoke test",
