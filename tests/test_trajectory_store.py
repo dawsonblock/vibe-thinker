@@ -12,18 +12,35 @@ These tests require the embeddings extra (numpy + sentence-transformers)
 for semantic retrieval. They skip cleanly when numpy is absent.
 """
 
+import importlib.util
 import os
 import tempfile
 
 import pytest
 
-pytestmark = pytest.mark.embeddings
+
+def _has_module(name: str) -> bool:
+    """Check if a module is importable without importing it."""
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ModuleNotFoundError, ImportError):
+        return False
+
+
+_NUMPY_AVAILABLE = _has_module("numpy")
+
+pytestmark = [
+    pytest.mark.embeddings,
+    pytest.mark.skipif(
+        not _NUMPY_AVAILABLE,
+        reason="requires numpy for trajectory store semantic retrieval tests",
+    ),
+]
 
 # numpy is needed for the embedding matrix operations. The store itself
 # can construct in NONE mode without numpy, but these tests exercise the
-# semantic retrieval path which requires it.
-pytest.importorskip("numpy", reason="requires numpy for trajectory store semantic retrieval tests")
-
+# semantic retrieval path which requires it. The import is guarded so
+# collection succeeds without numpy; tests are skipped via skipif above.
 from persistent_cache import VerifiedTrajectoryStore
 
 

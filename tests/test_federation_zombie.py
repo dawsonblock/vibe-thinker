@@ -5,22 +5,48 @@ InMemoryFederationState and the federation server endpoints.
 """
 
 import asyncio
+import importlib.util
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-pytestmark = [pytest.mark.web, pytest.mark.federation]
 
-# fastapi is required both for TestClient and for federation_server itself.
-pytest.importorskip("fastapi", reason="requires fastapi for federation zombie tests")
-from fastapi.testclient import TestClient  # noqa: E402
+def _has_module(name: str) -> bool:
+    """Check if a module is importable without importing it."""
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ModuleNotFoundError, ImportError):
+        return False
 
-from federation_server import (
-    InMemoryFederationState,
-    FederatedJob,
-    create_federation_app,
-)
+
+_FASTAPI_AVAILABLE = _has_module("fastapi")
+
+pytestmark = [
+    pytest.mark.web,
+    pytest.mark.federation,
+    pytest.mark.skipif(
+        not _FASTAPI_AVAILABLE,
+        reason="requires fastapi web extra (pip install -e '.[web]')",
+    ),
+]
+
+# Guard the fastapi/federation_server imports: federation_server imports
+# fastapi at module load time. When deps are absent the names are set to
+# None; they are never referenced at runtime because all tests are
+# skipped via skipif above.
+if _FASTAPI_AVAILABLE:
+    from fastapi.testclient import TestClient  # noqa: E402
+    from federation_server import (
+        InMemoryFederationState,
+        FederatedJob,
+        create_federation_app,
+    )
+else:
+    TestClient = None  # type: ignore[assignment]
+    InMemoryFederationState = None  # type: ignore[assignment]
+    FederatedJob = None  # type: ignore[assignment]
+    create_federation_app = None  # type: ignore[assignment]
 
 
 class TestHeartbeat:

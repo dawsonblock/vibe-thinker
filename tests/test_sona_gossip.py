@@ -4,14 +4,37 @@ Tests the federation server's /api/sona/sync endpoints and the
 orchestrator's SONA export/import methods.
 """
 
+import importlib.util
+
 import pytest
 
-pytestmark = [pytest.mark.web, pytest.mark.federation]
 
-# federation_server imports fastapi at module load time.
-pytest.importorskip("fastapi", reason="requires fastapi for SONA federation tests")
+def _has_module(name: str) -> bool:
+    """Check if a module is importable without importing it."""
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ModuleNotFoundError, ImportError):
+        return False
 
-from federation_server import create_federation_app
+
+_FASTAPI_AVAILABLE = _has_module("fastapi")
+
+pytestmark = [
+    pytest.mark.web,
+    pytest.mark.federation,
+    pytest.mark.skipif(
+        not _FASTAPI_AVAILABLE,
+        reason="requires fastapi web extra (pip install -e '.[web]')",
+    ),
+]
+
+# Guard the federation_server import: it imports fastapi at module load
+# time. When deps are absent the name is set to None; it is never
+# referenced at runtime because all tests are skipped via skipif above.
+if _FASTAPI_AVAILABLE:
+    from federation_server import create_federation_app
+else:
+    create_federation_app = None  # type: ignore[assignment]
 
 
 class TestSonaSyncEndpoint:

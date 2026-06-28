@@ -11,11 +11,31 @@ import pytest
 import importlib.util
 from unittest.mock import patch, MagicMock
 
-pytestmark = pytest.mark.embeddings
 
-# numpy is an embeddings-extra dependency; skip cleanly when absent.
-pytest.importorskip("numpy", reason="requires numpy for migration tests")
-import numpy as np  # noqa: E402
+def _has_module(name: str) -> bool:
+    """Check if a module is importable without importing it."""
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ModuleNotFoundError, ImportError):
+        return False
+
+
+_NUMPY_AVAILABLE = _has_module("numpy")
+
+pytestmark = [
+    pytest.mark.embeddings,
+    pytest.mark.skipif(
+        not _NUMPY_AVAILABLE,
+        reason="requires numpy for migration tests",
+    ),
+]
+
+# numpy is an embeddings-extra dependency. Guard the import so collection
+# succeeds without numpy; tests are skipped via skipif above.
+if _NUMPY_AVAILABLE:
+    import numpy as np  # noqa: E402
+else:
+    np = None  # type: ignore[assignment]
 
 # Load the migration script as a module (it's not in a package).
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

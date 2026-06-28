@@ -1,17 +1,34 @@
 """Tests for trajectory synthesis / memory pruning (Phase 4.1)."""
 
+import importlib.util
 import json
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-pytestmark = pytest.mark.embeddings
 
-# numpy is an embeddings-extra dependency; skip cleanly when absent.
-pytest.importorskip(
-    "numpy", reason="requires numpy for trajectory synthesis tests",
-)
-import numpy as np  # noqa: E402
+def _has_module(name: str) -> bool:
+    """Check if a module is importable without importing it."""
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ModuleNotFoundError, ImportError):
+        return False
+
+
+_NUMPY_AVAILABLE = _has_module("numpy")
+
+pytestmark = [
+    pytest.mark.embeddings,
+    pytest.mark.skipif(
+        not _NUMPY_AVAILABLE,
+        reason="requires numpy for trajectory synthesis tests",
+    ),
+]
+
+if _NUMPY_AVAILABLE:
+    import numpy as np  # noqa: E402
+else:
+    np = None  # type: ignore[assignment]
 
 import persistent_cache  # noqa: E402
 from persistent_cache import (  # noqa: E402
