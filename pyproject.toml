@@ -4,10 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vibe-thinker"
-version = "0.4.4a0"
+version = "0.4.5a0"
 description = "Verifier-driven local reasoning engine with adaptive CLR, deterministic verifiers, and bi-temporal audit logging"
 readme = "README.md"
-license = {file = "LICENSE"}
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
     "aiohttp>=3.10.11,<4",

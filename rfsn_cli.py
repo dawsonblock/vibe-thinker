@@ -533,7 +533,7 @@ def build_argparser() -> argparse.ArgumentParser:
                         "and enable 4 concurrent trajectories. Each "
                         "instance gets "
                         "n_threads/pool_size CPU threads.")
-    # --- RuvLLM integration (v0.3.9) ---
+    # --- RuvLLM integration ---
     # RuvLLM is a Rust inference engine with TurboQuant KV cache compression.
     # It exposes the same OpenAI-compatible HTTP API as llama-server, so the
     # simplest integration is to point --vibe at the RuvLLM port. This flag
@@ -550,7 +550,7 @@ def build_argparser() -> argparse.ArgumentParser:
                         "See ruvllm_adapter.RuvLLMHTTPBackend for the "
                         "recommended "
                         "start command with TurboQuant flags.")
-    # --- Fast code-specialist preset (v0.3.9) ---
+    # --- Fast code-specialist preset ---
     # Bumps CODE_CANDIDATES to 15 for ultra-fast 0.5B code models (ruvltra).
     # Does NOT hardcode a model path — pair with --code-specialist and/or
     # --local-specialist-model pointing at ruvltra-claude-code-0.5b.
@@ -582,9 +582,9 @@ def build_argparser() -> argparse.ArgumentParser:
                         "compat).")
     p.set_defaults(use_structured_output=_env_bool(
         "RFSN_STRUCTURED_OUTPUT", False))
-    # --- Static-analysis fallback gate (v3.2) ---
-    # AST static analysis is NOT a security boundary. Off by default in
-    # production: when no sandbox (wasmtime/Docker) is available, the code
+    # --- Static-analysis fallback gate ---
+    # AST static analysis is NOT a security boundary. Off by default:
+    # when no sandbox (wasmtime/Docker) is available, the code
     # route returns verified=False / score=0.0 instead of a 0.2 heuristic.
     # Enable for local dev where you want the "parses + no restricted
     # imports" signal but have no sandbox installed.
@@ -603,7 +603,7 @@ def build_argparser() -> argparse.ArgumentParser:
                        "RFSN_AUDIT_LOG",
                        "rfsn_jobs_bitemporal.jsonl"),
                    help="Bi-temporal audit log path (empty disables logging)")
-    # --- Audit-log signing (v0.3.9) ---
+    # --- Audit-log signing ---
     # HMAC-SHA256 (symmetric, stdlib) or Ed25519 (asymmetric, SLSA L2).
     # Ed25519 takes precedence when both are set. When neither is set,
     # the log is tamper-evident only (hash chain, no signatures).
@@ -633,7 +633,7 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Hex-encoded Ed25519 public key for verify-only mode "
                         "(nodes that read but don't write the log). Takes "
                         "precedence over --signing-key for verification.")
-    # --- AgentDB vector store (v0.3.9) ---
+    # --- AgentDB vector store ---
     # When set, CLRResultCache and VerifiedTrajectoryStore delegate similarity
     # search to a RuFlo/AgentDB HTTP sidecar (with shadow-mode dual-write to
     # the local JSON file for zero-downtime migration).
@@ -657,7 +657,7 @@ def build_argparser() -> argparse.ArgumentParser:
                         "'finalize-migration' to cut over to AgentDB-only. "
                         "Requires --agentdb-url. Fail-closed: if AgentDB is "
                         "down, searches return empty (no local fallback).")
-    # --- Federated job queue (v0.3.9) ---
+    # --- Federated job queue ---
     # When set, jobs are published to a Python-native federation coordinator
     # over mTLS. Any idle node can claim pending jobs. Fail-closed-fallback
     # to local when the federation is unreachable.
@@ -689,21 +689,19 @@ def build_argparser() -> argparse.ArgumentParser:
                    default=os.environ.get("FEDERATION_MTLS_CA", ""),
                    help="Path to the mTLS CA certificate (PEM) that signed "
                         "all node certs.")
-    # v3.0: Zero-trust federation encryption
+    # Zero-trust federation encryption
     p.add_argument("--federation-secret",
                    default=os.environ.get("FEDERATION_SECRET", ""),
-                   help="Shared secret for zero-trust payload encryption "
-                        "(v3.0). "
+                   help="Shared secret for zero-trust payload encryption. "
                         "When set, all federation payloads (job queries, "
                         "results) "
                         "are encrypted with Fernet AEAD before transmission. "
                         "Nodes without the secret see only opaque ciphertext. "
                         "Requires the 'cryptography' package.")
-    # v3.0: SONA gossip protocol — Distributed Brain
+    # SONA gossip protocol — Distributed Brain
     p.add_argument("--sona-sync-url",
                    default=os.environ.get("SONA_SYNC_URL", ""),
-                   help="Federation coordinator URL for SONA pattern sync "
-                        "(v3.0). "
+                   help="Federation coordinator URL for SONA pattern sync. "
                         "When set, the orchestrator periodically exports its "
                         "learned patterns and imports global patterns from "
                         "other nodes. Enables swarm-wide learning.")
@@ -771,7 +769,7 @@ def build_argparser() -> argparse.ArgumentParser:
                         "iptables IP-based filtering. This solves CDN IP "
                         "rotation: the proxy inspects the TLS SNI / HTTP "
                         "Host header and allows/denies based on the "
-                        "domain, not the IP. v1.2: SNI-proxy is now the "
+                        "domain, not the IP. SNI-proxy is the "
                         "DEFAULT egress mode when an allow-list is present; "
                         "this flag overrides the default address. Run the "
                         "proxy with: python3 -m sandbox.sni_proxy "
@@ -780,7 +778,7 @@ def build_argparser() -> argparse.ArgumentParser:
                    action="store_true",
                    default=os.environ.get("RFSN_ENVOY_SIDECAR", "") != "",
                    help="Launch an Envoy sidecar as the SNI-aware egress "
-                        "proxy (v1.2). When set, the CLI generates an Envoy "
+                        "proxy. When set, the CLI generates an Envoy "
                         "config from the network allow-list and starts "
                         "Envoy as a child process before the orchestrator "
                         "runs. Requires the envoy binary on PATH. The "
@@ -804,7 +802,7 @@ def build_argparser() -> argparse.ArgumentParser:
 async def _amain() -> None:
     args = build_argparser().parse_args()
 
-    # --- RuvLLM URL override (v0.3.9) ---
+    # --- RuvLLM URL override ---
     # When --ruvllm-url is set, it takes precedence over --vibe. The
     # orchestrator's HTTP path handles RuvLLM unchanged (same OpenAI API).
     vibe_endpoint = args.ruvllm_url or args.vibe
@@ -840,7 +838,7 @@ async def _amain() -> None:
         print("[CLI] Encoder NLI judge disabled (--no-encoder-nli). "
               "Using LLM judge for factual verification.")
 
-    # --- AgentDB vector store mode (v3.2.1) ---
+    # --- AgentDB vector store mode ---
     # ShadowVectorStore was removed: when --agentdb-url is set, AgentDB is
     # used directly (no local shadow/fallback). --agentdb-only is kept as
     # a no-op flag for backward CLI compat — setting --agentdb-url alone
@@ -854,10 +852,10 @@ async def _amain() -> None:
         print(f"[CLI] AgentDB mode: vector store is AgentDB at "
               f"{args.agentdb_url} (no local fallback). Fail-closed: "
               f"searches return empty if AgentDB is down. "
-              f"(--agentdb-only is now a no-op; shadow mode was removed in "
-              f"v3.2.1 — run finalize-migration before relying on this.)")
+              f"(--agentdb-only is now a no-op; shadow mode was removed — "
+              f"run finalize-migration before relying on this.)")
 
-    # --- Fast code-specialist preset (v0.3.9) ---
+    # --- Fast code-specialist preset ---
     # Bumps code_candidates to 15 for ultra-fast 0.5B code models.
     code_candidates = args.code_candidates
     if args.fast_code_specialist:
@@ -907,7 +905,7 @@ async def _amain() -> None:
         allow_static_fallback=args.allow_static_fallback,
     )
 
-    # --- Envoy sidecar egress (v1.2) ---
+    # --- Envoy sidecar egress ---
     # When --envoy-sidecar is set, generate an Envoy config from the
     # network allow-list and launch Envoy as a child process. The
     # sandbox routes traffic through the Envoy listener. NOTE: enforced
@@ -945,7 +943,7 @@ async def _amain() -> None:
                 print(f"[CLI] Envoy launch failed: {e}")
                 envoy_proc = None
 
-    # --- Audit-log signing (v0.3.9) ---
+    # --- Audit-log signing ---
     # Ed25519 (asymmetric) takes precedence over HMAC-SHA256 (symmetric).
     signing_key = args.signing_key or None
     ed25519_private = args.ed25519_private_key or None
@@ -955,7 +953,7 @@ async def _amain() -> None:
     elif signing_key:
         print("[CLI] HMAC-SHA256 audit-log signing enabled (symmetric)")
 
-    # --- Queue construction (v0.3.9) ---
+    # --- Queue construction ---
     # Uses make_job_queue so --federation-url switches to FederatedJobQueue
     # (with local fallback). Without --federation-url, a LocalJobQueue is
     # used (wraps JobQueue, same behavior). Signing keys are threaded
@@ -981,7 +979,7 @@ async def _amain() -> None:
         pass
     finally:
         await queue.stop()
-        # Clean up the Envoy sidecar if it was launched (v1.2).
+        # Clean up the Envoy sidecar if it was launched.
         if envoy_proc is not None:
             print("[CLI] Terminating Envoy sidecar...")
             envoy_proc.terminate()

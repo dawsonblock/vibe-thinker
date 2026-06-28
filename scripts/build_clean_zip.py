@@ -163,7 +163,35 @@ def _pytest_available() -> bool:
         return False
 
 
+def _parse_args() -> tuple:
+    """Parse command-line flags.
+
+    --no-tests : skip the pytest gate (compileall only). Use this when
+        building the ZIP outside a dev/test environment.
+    --tests    : force the pytest gate even if pytest is missing (will
+        fail with a clear error instead of skipping).
+    """
+    no_tests = False
+    force_tests = False
+    args = sys.argv[1:]
+    for arg in args:
+        if arg == "--no-tests":
+            no_tests = True
+        elif arg == "--tests":
+            force_tests = True
+        elif arg in ("--help", "-h"):
+            print(__doc__)
+            sys.exit(0)
+        else:
+            print(f"Unknown argument: {arg}", file=sys.stderr)
+            print("Usage: python scripts/build_clean_zip.py [--no-tests]",
+                  file=sys.stderr)
+            sys.exit(2)
+    return no_tests, force_tests
+
+
 def main() -> int:
+    no_tests, force_tests = _parse_args()
     staging = tempfile.mkdtemp(prefix="vibe_build_")
     try:
         # Copy included dirs
@@ -195,12 +223,27 @@ def main() -> int:
         # Run ONLY the core marker filter (same as scripts/test_core.sh).
         # No --timeout flags are used so this works with plain pytest
         # (pytest-timeout is not required). A subprocess timeout provides
-        # the outer guard. If pytest is not installed, skip with a warning.
-        if not _pytest_available():
+        # the outer guard.
+        #
+        # Behavior:
+        #   --no-tests  : skip the pytest gate entirely (compileall only).
+        #   --tests     : force the gate; fail if pytest is absent.
+        #   (default)   : run if pytest is available, skip with warning
+        #                 if not. This is the best-effort mode.
+        if no_tests:
+            print("Running core pytest gate...")
+            print("  pytest: SKIPPED (--no-tests)")
+        elif force_tests and not _pytest_available():
+            print("Running core pytest gate...")
+            print("  pytest: FAILED (--tests requested but pytest not "
+                  "installed)")
+            return 1
+        elif not _pytest_available():
             print("Running core pytest gate...")
             print("  pytest: SKIPPED (pytest not installed in current "
                   "environment)")
-            print("  (install with: pip install -e '.[dev,test]')")
+            print("  (use --no-tests to silence, or install with: "
+                  "pip install -e '.[dev,test]')")
         else:
             print("Running core pytest gate...")
             try:

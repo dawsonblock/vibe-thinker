@@ -13,7 +13,7 @@ and should only be used:
   - in development with trusted test code
   - as a fallback when Docker is not available AND the code is trusted
 
-For any production use, use DockerSandboxExecutor or DockerSbxExecutor.
+For any real use, use DockerSandboxExecutor or DockerSbxExecutor.
 """
 
 import asyncio

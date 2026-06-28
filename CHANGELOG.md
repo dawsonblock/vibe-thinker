@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.4.5a0
+
+Stabilization-only release. No new features. Release-engineering
+polish addressing the v29 validation report.
+
+### Fixed
+- `release_gate.sh` now supports separately callable phases
+  (`build`, `install-smoke`, `core`, `all`) so failures are easier to
+  isolate. pip output is quieted by default (set
+  `RELEASE_GATE_VERBOSE=1` for full logs).
+- `build_clean_zip.py` now accepts `--no-tests` (skip the pytest gate,
+  compileall only) and `--tests` (force the gate, fail if pytest is
+  absent). The default remains best-effort: run if pytest is available,
+  skip with a clear warning if not.
+- `test_zip_release.sh` now quiets pip/build output and uses `-q` for
+  the core pytest run so the self-test completes reliably without
+  timeout from log volume. Set `ZIP_TEST_VERBOSE=1` for full logs.
+- CLI help text: removed all version-tag annotations (v0.3.9, v1.2,
+  v3.0, v3.2, v3.2.1) from user-visible `--help` output. Internal
+  code comments retain historical version notes.
+- README: removed stale version tags from section headers and body
+  text. "RuFlo integration abstractions (v0.3.9)" → "RuFlo integration
+  abstractions"; "v3.2.1" references cleaned.
+- Sandbox/docs: removed remaining "production" overclaims from
+  `sandbox/envoy_sidecar.py`, `sandbox/local_executor.py`,
+  `sandbox/sni_proxy.py`, `docs/roadmap.md`. All egress paths now
+  consistently described as EXPERIMENTAL / not production-safe.
+- `pyproject.toml`: fixed deprecated `license = {file = "LICENSE"}`
+  table syntax → `license = "MIT"` + `license-files = ["LICENSE"]`
+  (eliminates `SetuptoolsDeprecationWarning` during `python -m build`).
+
+### Still experimental
+- Enforced sandbox gateway egress (`NetworkMode.ENFORCED_GATEWAY`).
+- RuvLLM (Rust inference engine — default build is stub).
+- Distributed federation (Redis-backed HA).
+
 ## v0.4.4a0
 
 Stabilization-only release. No new features. Release-engineering fixes

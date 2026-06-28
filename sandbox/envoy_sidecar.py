@@ -1,7 +1,8 @@
 """Envoy sidecar config generator + launcher for SNI-aware egress.
 
 This is the enterprise-grade replacement for the Python `sni_proxy.py`.
-Envoy provides production features the Python proxy lacks:
+Envoy provides features the Python proxy lacks (note: enforced egress
+is EXPERIMENTAL — not production-safe until real bypass tests pass):
 
   - Native SNI/Host filtering via `envoy.filters.listener.tls_inspector`
     + `envoy.filters.network.tcp_proxy` with matcher-based routing.

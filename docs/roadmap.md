@@ -11,7 +11,7 @@ No new features until:
 
 ## Deferred
 
-- RuvLLM production inference
+- RuvLLM inference (currently experimental — stub build only)
 - AgentDB integration
 - distributed federation hardening
 - web dashboard

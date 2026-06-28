@@ -5,7 +5,7 @@ queries between a high-precision reasoning specialist and a generalist
 model, with deterministic verifiers, bi-temporal audit logging, and an
 interactive CLI.
 
-## Current status: ALPHA (v0.4.4a0)
+## Current status: ALPHA (v0.4.5a0)
 
 **Not production-safe.** This is alpha software. See `docs/roadmap.md`
 for the stabilization plan and frozen feature scope.
@@ -523,7 +523,7 @@ Ten fixes from a full codebase audit. All stdlib-only, no new dependencies.
   pending/running jobs to JSONL. On restart, non-terminal jobs are
   recovered and re-queued (crash recovery without Redis).
 
-## RuFlo integration abstractions (v0.3.9)
+## RuFlo integration abstractions
 
 Four pluggable abstractions from the Vibe-Thinker + RuFlo Integration
 Plan. All are opt-in with backward-compatible defaults — no behavior
@@ -576,7 +576,7 @@ python rfsn_cli.py --agentdb-url http://127.0.0.1:8088
 
 When `--agentdb-url` is set, AgentDB is used directly for similarity
 search (fail-closed: searches return empty if AgentDB is down). The
-`ShadowVectorStore` dual-write migration scaffold was removed in v3.2.1
+`ShadowVectorStore` dual-write migration scaffold was removed
 — operators cut over to AgentDB-only directly (run `finalize-migration`
 first to archive local JSON, then restart with `--agentdb-url`).
 
@@ -683,8 +683,8 @@ python test_full_stack.py
   If none are available, it **refuses to verify** rather than running untrusted
   code on the host. See `sandbox/README.md` for the full isolation model.
 - The job queue is in-process by default. For multi-node distribution, use
-  `--federation-url` with mTLS certs (v0.3.9 `FederatedJobQueue`, backed by
-  exo-federation). Without a federation, jobs run locally only.
+  `--federation-url` with mTLS certs (`FederatedJobQueue`, backed by
+  a Python-native federation coordinator). Without a federation, jobs run locally only.
 - The bi-temporal log has hash-chain integrity with strict verification
   (`verify_chain(strict=True)`). For audit-grade tamper-proofing, use
   `--signing-key` (HMAC-SHA256, stdlib) or `--ed25519-private-key`

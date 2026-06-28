@@ -1,9 +1,20 @@
 #!/usr/bin/env bash
 # ZIP release self-test — verifies a release ZIP is clean and shippable.
 # Usage: ./scripts/test_zip_release.sh path/to/release.zip
+#
+# Pip and build output is quieted so failures are easy to isolate. Set
+# ZIP_TEST_VERBOSE=1 for full pip/build logs.
 set -euo pipefail
 
 ZIP_PATH="${1:?usage: scripts/test_zip_release.sh path/to/release.zip}"
+VERBOSE="${ZIP_TEST_VERBOSE:-0}"
+PIP_FLAGS="--quiet"
+BUILD_FLAGS=""
+if [ "$VERBOSE" = "1" ]; then
+    PIP_FLAGS=""
+    BUILD_FLAGS=""
+fi
+
 WORKDIR="$(mktemp -d)"
 
 echo "Testing ZIP in $WORKDIR"
@@ -29,32 +40,33 @@ fi
 echo "No generated junk: OK"
 
 # --- Install + test ---
-echo "=== Creating venv and installing ==="
+echo "=== Creating venv and installing (quiet) ==="
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip setuptools wheel build
-python -m pip install -e ".[dev,test]"
+python -m pip install --upgrade pip setuptools wheel build $PIP_FLAGS
+python -m pip install -e ".[dev,test]" $PIP_FLAGS
 
 echo "=== Compile check ==="
 python -m compileall -q .
 
-echo "=== Build wheel ==="
-python -m build
+echo "=== Build wheel (quiet) ==="
+python -m build $BUILD_FLAGS > /dev/null
 
 echo "=== CLI help ==="
-vibe-thinker --help
+vibe-thinker --help > /dev/null && echo "  --help: OK"
 
 echo "=== Version ==="
 vibe-thinker --version
 
 echo "=== Doctor ==="
-vibe-thinker doctor
+vibe-thinker doctor > /dev/null && echo "  doctor: OK"
 
 echo "=== Smoke ==="
 vibe-thinker smoke
 
 echo "=== Core tests ==="
-./scripts/test_core.sh
+python -m pytest --strict-markers -q \
+  -m "not logic and not embeddings and not federation and not web and not sandbox and not nli and not integration"
 
 deactivate
 rm -rf "$WORKDIR"

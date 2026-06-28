@@ -180,7 +180,7 @@ def is_domain_allowed(
 # sandbox container (no resolver in /etc/resolv.conf, only injected
 # /etc/hosts entries). This closes in-container DNS-tunnel exfiltration.
 #
-# This class adds the second layer the production plan calls for: a host-
+# This class adds the second layer the egress plan calls for: a host-
 # side DNS audit log + per-domain rate limiter on the proxy's OWN
 # resolution path. The SNI proxy resolves allow-listed hostnames on the
 # host before tunneling; logging and rate-limiting those resolutions gives
