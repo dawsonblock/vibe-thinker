@@ -4,6 +4,6 @@ set -euo pipefail
 source .venv/bin/activate
 export $(grep -v '^#' profiles/mac-local.env | xargs)
 python rfsn_cli.py --help
-pytest -m "not logic and not embeddings and not federation and not web and not sandbox and not integration"
+pytest -m "not logic and not embeddings and not federation and not web and not sandbox and not nli and not integration"
 echo ""
 echo "Mac local smoke test passed."

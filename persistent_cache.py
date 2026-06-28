@@ -29,29 +29,9 @@ import threading
 import uuid as _uuid
 from collections import OrderedDict
 from datetime import datetime, timezone
-from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
 from vector_store import VectorStore, LocalVectorStore, make_vector_store
-
-
-class CacheSimilarityMode(str, Enum):
-    """Cache similarity mode (Phase 8 — cache/embedding decoupling).
-
-    NONE (default): exact key lookup only. No embeddings, no similarity
-        search. The lightest mode — works with zero optional deps.
-
-    HASH: cheap lexical/fingerprint similarity. No embeddings needed.
-        Uses a text hash for approximate matching. Faster than embeddings
-        but less semantically accurate.
-
-    EMBEDDINGS: semantic search via sentence-transformers/FAISS. The
-        most accurate mode but requires the [embeddings] extra.
-    """
-
-    NONE = "none"
-    HASH = "hash"
-    EMBEDDINGS = "embeddings"
 
 # Optional deps for semantic CLR cache
 try:
@@ -473,9 +453,11 @@ class CLRResultCache:
         if not self.entries:
             self._embeddings_matrix = None
             return
-        self._embeddings_matrix = np.array(
-            [e["embedding"] for e in self.entries]
-        )
+        embeddings = [e.get("embedding", []) for e in self.entries]
+        if not all(embeddings):
+            self._embeddings_matrix = None
+            return
+        self._embeddings_matrix = np.array(embeddings)
 
     def save(self) -> None:
         with self._save_lock:
@@ -500,6 +482,8 @@ class CLRResultCache:
                 through lookup. Default is False.
         """
         if not self.entries or self._embeddings_matrix is None:
+            return None
+        if self.model is None:
             return None
         q_emb = self.model.encode([problem])[0].reshape(1, -1)
         sims = cosine_similarity(q_emb, self._embeddings_matrix)[0]
@@ -565,7 +549,10 @@ class CLRResultCache:
           - model_failures: number of trajectories that failed at model level
           - schema_version: cache entry format version (3)
         """
-        embedding = self.model.encode([problem])[0].tolist()
+        if self.model is not None:
+            embedding = self.model.encode([problem])[0].tolist()
+        else:
+            embedding = []
         entry = {
             "problem": problem,
             "embedding": embedding,
@@ -741,9 +728,11 @@ class VerifiedTrajectoryStore:
         if not self.entries:
             self._embeddings_matrix = None
             return
-        self._embeddings_matrix = np.array(
-            [e["embedding"] for e in self.entries]
-        )
+        embeddings = [e.get("embedding", []) for e in self.entries]
+        if not all(embeddings):
+            self._embeddings_matrix = None
+            return
+        self._embeddings_matrix = np.array(embeddings)
 
     def save(self) -> None:
         with self._save_lock:
@@ -771,6 +760,8 @@ class VerifiedTrajectoryStore:
           - similarity: cosine similarity to the current query
         """
         if not self.entries or self._embeddings_matrix is None:
+            return []
+        if self.model is None:
             return []
         q_emb = self.model.encode([query])[0].reshape(1, -1)
         sims = cosine_similarity(q_emb, self._embeddings_matrix)[0]
@@ -866,6 +857,8 @@ class VerifiedTrajectoryStore:
             return
         if verification_method == "self_claims_only":
             return  # Never learn from self-claims
+        if self.model is None:
+            return  # Cannot store without embeddings
         embedding = self.model.encode([query])[0].tolist()
         entry = {
             "query": query,

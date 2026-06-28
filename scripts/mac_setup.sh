@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Mac local setup — create a venv and install core deps (no Docker/Redis/Rust).
 set -euo pipefail
-python3.12 -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip setuptools wheel build
 python -m pip install -e ".[dev,test]"

@@ -963,7 +963,7 @@ def _run_doctor() -> int:
 
     # Verdict
     print("\nVerdict:")
-    if py_ok and sandbox_mode == "disabled":
+    if py_ok and sandbox_mode == "disabled" and network_mode == "disabled":
         print("  core local profile is runnable")
         return 0
     else:

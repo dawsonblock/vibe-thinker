@@ -79,6 +79,8 @@ all = [
     "websockets>=12.0,<14",
     "pydantic>=2.0,<3",
     "docker>=6.0,<8",
+    "transformers>=4.40,<5",
+    "torch>=2.2,<3",
 ]
 
 [project.scripts]
@@ -96,6 +98,7 @@ markers = [
     "federation: tests requiring Redis/fakeredis",
     "web: tests requiring FastAPI/WebSocket dependencies",
     "sandbox: tests requiring Docker",
+    "nli: tests requiring transformers/torch",
     "integration: slower integration tests",
 ]
 
