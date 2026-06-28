@@ -10,6 +10,7 @@ Run with:  python3 run_ui.py [--vibe URL] [--generalist URL] [--port 8000]
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import time
@@ -355,16 +356,6 @@ def create_app(
         rate_limit_per_minute: Max requests per IP per minute. 0 = disabled.
         max_request_body_bytes: Max request body size. 0 = disabled.
     """
-    app = FastAPI(title="vibe-thinker UI", docs_url="/api/docs")
-    # Security middleware: API key auth, CORS, rate limiting, body size.
-    configure_security(
-        app,
-        api_key=api_key,
-        allowed_origins=allowed_origins,
-        rate_limit_per_minute=rate_limit_per_minute,
-        max_request_body_bytes=max_request_body_bytes,
-        exempt_paths={"/", "/api/health"},
-    )
     # AppState defaults to a LocalBroadcaster. When redis_url is set,
     # swap in a RedisBroadcaster after the state exists (it needs the
     # state's _send_to_local_clients as the subscriber callback).
@@ -375,6 +366,27 @@ def create_app(
             send_fn=state._send_to_local_clients,
             redis_client=redis_client,
         )
+
+    # Lifespan handler (replaces deprecated @app.on_event("shutdown")).
+    @contextlib.asynccontextmanager
+    async def _lifespan(app: FastAPI):
+        yield
+        await state.cleanup()
+
+    app = FastAPI(
+        title="vibe-thinker UI",
+        docs_url="/api/docs",
+        lifespan=_lifespan,
+    )
+    # Security middleware: API key auth, CORS, rate limiting, body size.
+    configure_security(
+        app,
+        api_key=api_key,
+        allowed_origins=allowed_origins,
+        rate_limit_per_minute=rate_limit_per_minute,
+        max_request_body_bytes=max_request_body_bytes,
+        exempt_paths={"/", "/api/health"},
+    )
     static_dir = Path(__file__).parent / "static"
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
@@ -632,12 +644,5 @@ def create_app(
         finally:
             if ws in state.ws_clients:
                 state.ws_clients.remove(ws)
-
-    # ------------------------------------------------------------------
-    # Shutdown
-    # ------------------------------------------------------------------
-    @app.on_event("shutdown")
-    async def shutdown():
-        await state.cleanup()
 
     return app

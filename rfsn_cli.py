@@ -727,20 +727,20 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="SearchApi.io API key for factual retrieval "
                         "(alternative "
                         "to --serper-key). Same fail-closed behavior.")
-    # --- Network allow-list (v0.4.0) ---
-    # When set, code sandbox execution uses --network=default + iptables
-    # egress filtering instead of --network=none. Only allow-listed
-    # destinations (domains, IPs, CIDRs) are reachable from the sandbox.
-    # Fail-closed: empty allow-list = deny all (same as --network=none).
+    # --- Network allow-list ---
+    # When set, code sandbox execution uses egress filtering instead of
+    # --network=none. Only allow-listed destinations (domains, IPs, CIDRs)
+    # are reachable from the sandbox. Fail-closed: empty allow-list = deny
+    # all (same as --network=none). NOTE: enforced egress is EXPERIMENTAL.
     p.add_argument("--network-allowlist",
                    default=os.environ.get("RFSN_NETWORK_ALLOWLIST", ""),
                    help="Comma-separated list of allowed network destinations "
                         "for sandbox egress (e.g. "
                         "'pypi.org:443,10.0.0.0/24'). "
-                        "When set, the Docker sandbox uses iptables "
-                        "filtering "
-                        "instead of --network=none. Empty = deny all "
-                        "(default).")
+                        "When set, the Docker sandbox uses egress "
+                        "filtering instead of --network=none. "
+                        "EXPERIMENTAL — not production-safe. "
+                        "Empty = deny all (default).")
     p.add_argument("--network-allowlist-file",
                    default=os.environ.get("RFSN_NETWORK_ALLOWLIST_FILE", ""),
                    help="Path to a file with allowed network destinations "
@@ -757,16 +757,15 @@ def build_argparser() -> argparse.ArgumentParser:
                    default=os.environ.get("RFSN_SANDBOX_IMAGE",
                                           "vibe-thinker-sandbox:latest"),
                    help="Docker image for the code sandbox. Defaults to the "
-                        "purpose-built vibe-thinker-sandbox image with "
-                        "iptables "
-                        "baked in. Build it with: docker build -f "
+                        "purpose-built vibe-thinker-sandbox image. "
+                        "Build it with: docker build -f "
                         "sandbox/Dockerfile -t vibe-thinker-sandbox:latest .")
     p.add_argument("--proxy-egress",
                    default=os.environ.get("RFSN_PROXY_EGRESS", ""),
                    help="Address of an SNI-aware egress proxy (e.g. "
                         "127.0.0.1:8888). When set, the sandbox routes "
                         "traffic through the proxy instead of using "
-                        "iptables IP-based filtering. This solves CDN IP "
+                        "IP-based filtering. This solves CDN IP "
                         "rotation: the proxy inspects the TLS SNI / HTTP "
                         "Host header and allows/denies based on the "
                         "domain, not the IP. SNI-proxy is the "

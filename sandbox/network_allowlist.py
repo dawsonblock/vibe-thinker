@@ -6,11 +6,19 @@ executor applies these rules inside the container before running the
 candidate code, replacing the binary --network=none / --network=default
 choice with fine-grained egress control.
 
+NOTE: The in-container iptables path is DEPRECATED. The default and
+recommended egress mode is the host-level SNI proxy / Envoy sidecar,
+which inspects TLS SNI / HTTP Host headers instead of IP addresses.
+The iptables path is retained for defense-in-depth fallback and for
+environments where the SNI proxy is not available. ENFORCED egress
+is EXPERIMENTAL — not production-safe until real Docker bypass tests
+pass.
+
 Trust model (fail-closed):
   - No allow-list -> --network=none (unchanged behavior, no egress)
   - Empty allow-list -> --network=none (deny all, same as no list)
-  - Allow-list with entries -> --network=default + iptables rules that
-    DROP all egress except the allow-listed destinations
+  - Allow-list with entries -> --network=default + egress filtering
+    that DROPs all egress except the allow-listed destinations
   - DNS resolution for allow-listed domains happens at rule-generation
     time (on the host). If a domain doesn't resolve, it's skipped with
     a warning — the candidate code won't be able to reach it, but the

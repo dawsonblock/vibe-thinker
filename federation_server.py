@@ -26,6 +26,7 @@ API:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -852,9 +853,45 @@ def create_federation_app(
         rate_limit_per_minute: Max requests per IP per minute. 0 = disabled.
         max_request_body_bytes: Max request body size. 0 = disabled.
     """
-    app = FastAPI(title="vibe-thinker federation", docs_url="/docs")
     if state is None:
         state = InMemoryFederationState()
+
+    _reaper_claim_timeout = vt_config.reaper_claim_timeout  # 3x heartbeat
+
+    # Lifespan handler (replaces deprecated @app.on_event startup/shutdown).
+    # Starts the background reaper task on startup, cancels it on shutdown.
+    @contextlib.asynccontextmanager
+    async def _lifespan(app: FastAPI):
+        async def _reaper_loop():
+            while True:
+                await asyncio.sleep(_reaper_claim_timeout / 2)
+                try:
+                    reaped = await state.reap_stale_claims(
+                        timeout=_reaper_claim_timeout
+                    )
+                    if reaped:
+                        print(
+                            f"[Federation] Reaped {len(reaped)} zombie "
+                            f"claim(s): {reaped} — re-queued as pending"
+                        )
+                except Exception as e:
+                    print(f"[Federation] Reaper error: {e}")
+
+        reaper_task = asyncio.create_task(_reaper_loop())
+        try:
+            yield
+        finally:
+            reaper_task.cancel()
+            try:
+                await reaper_task
+            except asyncio.CancelledError:
+                pass
+
+    app = FastAPI(
+        title="vibe-thinker federation",
+        docs_url="/docs",
+        lifespan=_lifespan,
+    )
 
     # v3.2: Sybil-resistant node reputation. Bound to the mTLS cert
     # identity (see _extract_identity). /complete updates it from the
@@ -1042,42 +1079,6 @@ def create_federation_app(
     #     reaper timeout (300s) was close to the job timeout (600s),
     #     which could cause duplicate work if a slow worker was
     #     mistakenly reaped.
-    _reaper_claim_timeout = vt_config.reaper_claim_timeout  # 3x heartbeat
-    _reaper_task: Optional[asyncio.Task] = None
-
-    @app.on_event("startup")
-    async def _start_reaper():
-        async def _reaper_loop():
-            while True:
-                await asyncio.sleep(_reaper_claim_timeout / 2)
-                try:
-                    reaped = await state.reap_stale_claims(
-                        timeout=_reaper_claim_timeout
-                    )
-                    if reaped:
-                        print(
-                            f"[Federation] Reaped {len(reaped)} zombie "
-                            f"claim(s): {reaped} — re-queued as pending"
-                        )
-                except Exception as e:
-                    print(f"[Federation] Reaper error: {e}")
-
-        # Store the task so the shutdown handler can cancel it.
-        nonlocal _reaper_task
-        _reaper_task = asyncio.create_task(_reaper_loop())
-
-    @app.on_event("shutdown")
-    async def _stop_reaper():
-        """Cancel the reaper task on shutdown to prevent resource leaks."""
-        nonlocal _reaper_task
-        if _reaper_task is not None:
-            _reaper_task.cancel()
-            try:
-                await _reaper_task
-            except asyncio.CancelledError:
-                pass
-            _reaper_task = None
-
     @app.get("/jobs")
     async def list_jobs():
         return _encrypt(await state.list_jobs())

@@ -39,8 +39,9 @@ set -euo pipefail
 
 # --- Detect whether we are root ---
 if [ "$(id -u)" -ne 0 ]; then
-    # Non-root (the v1.0 default). No iptables possible — host-level
-    # egress filtering (SNI proxy / Envoy) is the production path.
+    # Non-root (the default). No iptables possible — host-level
+    # egress filtering (SNI proxy / Envoy) handles network isolation.
+    # NOTE: enforced egress is EXPERIMENTAL — not production-safe.
     # Just exec the candidate command as the current user.
     exec "$@"
 fi
@@ -119,7 +120,7 @@ fi
 # --- Phase 2: Drop privileges and exec candidate code ---
 
 # If VT_NO_DROP is set, keep running as root (for debugging only).
-# This is NEVER set in production — the executor always drops privileges.
+# This is NEVER set in normal operation — the executor always drops privileges.
 if [ "${VT_NO_DROP:-}" = "1" ]; then
     echo "[vt-entrypoint] WARNING: VT_NO_DROP=1 — running as root (DEBUG ONLY)" >&2
     exec "$@"

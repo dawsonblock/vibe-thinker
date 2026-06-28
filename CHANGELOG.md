@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.4.6a0
+
+Stabilization-only release. No new features. Documentation cleanup
+and FastAPI deprecation fix addressing the v30 validation report.
+
+### Fixed
+- CLI help text: removed remaining iptables references from
+  user-visible `--help` output. Egress filtering help now says
+  "egress filtering" (not "iptables filtering") and marks the feature
+  as EXPERIMENTAL.
+- `sandbox/entrypoint.sh`: "production path" → neutral wording.
+  "NEVER set in production" → "NEVER set in normal operation".
+- `sandbox/network_allowlist.py`: module docstring now explicitly
+  marks the in-container iptables path as DEPRECATED, with the
+  SNI proxy / Envoy sidecar as the default and recommended mode.
+  ENFORCED egress marked EXPERIMENTAL / not production-safe.
+- FastAPI `on_event` deprecation warnings eliminated: `web/app.py`
+  and `federation_server.py` now use the modern `lifespan` context
+  manager pattern instead of the deprecated `@app.on_event`
+  decorators. Web/federation tests now produce 0 FastAPI/Starlette
+  deprecation warnings (down from 21).
+
+### Still experimental
+- Enforced sandbox gateway egress (`NetworkMode.ENFORCED_GATEWAY`).
+- RuvLLM (Rust inference engine — default build is stub).
+- Distributed federation (Redis-backed HA).
+
 ## v0.4.5a0
 
 Stabilization-only release. No new features. Release-engineering
