@@ -106,6 +106,7 @@ markers = [
     "sandbox: tests requiring Docker",
     "nli: tests requiring transformers/torch",
     "integration: slower integration tests",
+    "requires_docker_gateway: tests requiring a real enforced-gateway Docker fixture",
 ]
 
 [tool.setuptools]

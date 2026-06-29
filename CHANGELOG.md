@@ -37,11 +37,33 @@ addressing the v30/v31 validation reports.
   release use). Default mode now fails if pytest is missing instead of
   silently skipping. Added `require_test_deps()` check with actionable
   remediation message.
+- `pyproject.toml`: added `requires_docker_gateway` marker for
+  integration tests that need a real enforced-gateway Docker fixture.
+- `tests/test_sandbox_network_enforcement.py`: Docker bypass tests
+  now marked `@pytest.mark.integration` +
+  `@pytest.mark.requires_docker_gateway` with clearer skip reason
+  ("requires real enforced-gateway Docker fixture"). Added docstring
+  listing the future required bypass tests (raw sockets, DNS bypass,
+  direct IP, metadata service, host LAN, RFC1918, Docker DNS bypass).
 - FastAPI `on_event` deprecation warnings eliminated: `web/app.py`
   and `federation_server.py` now use the modern `lifespan` context
   manager pattern instead of the deprecated `@app.on_event`
   decorators. Web/federation tests now produce 0 FastAPI/Starlette
   deprecation warnings (down from 21).
+
+### Added (demos — not part of release scope)
+- `examples/demo_complex_pipeline.py`: multi-step combinatorics problem
+  (ordered triples with a+b+c=100, a<b<c → answer 784) exercising
+  routing, CLR scoring, math verifier, schema verifier, and code
+  verifier (static analysis + sandbox fallback).
+- `examples/demo_coding_task.py`: LRU cache implementation task with
+  5 candidate solutions verified in real Docker sandbox (correct
+  passes, 4 buggy/dangerous rejected by unit test assertions).
+- `examples/demo_constraint_satisfaction.py`: meeting scheduling CSP
+  (4 meetings, 3 slots, 3 rooms) verified by 4 different verifiers:
+  Z3/SMT (LogicVerifier), JSON schema (SchemaVerifier), NLI judge
+  (FactualVerifier with citation-backed claims), and Docker sandbox
+  (CodeVerifier with Z3-based scheduler code).
 
 ### Still experimental
 - Enforced sandbox gateway egress (`NetworkMode.ENFORCED_GATEWAY`).

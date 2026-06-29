@@ -245,14 +245,31 @@ class TestBlockedIpRanges:
 
 
 @pytest.mark.sandbox
+@pytest.mark.integration
+@pytest.mark.requires_docker_gateway
 class TestDockerNetworkEnforcement:
     """Docker-level network enforcement tests.
 
-    These tests require Docker and a configured --internal network.
-    They verify that a candidate container on the isolated network
-    cannot reach blocked IPs or bypass the egress gateway.
+    These tests require a real enforced-gateway Docker fixture: Docker
+    running, a configured --internal network, and the egress gateway
+    container. They verify that a candidate container on the isolated
+    network cannot reach blocked IPs or bypass the egress gateway.
 
-    SKIPPED when Docker is not available.
+    SKIPPED when Docker or the gateway fixture is not available.
+
+    Future required tests (section 7.2 of the v31 plan):
+      - allowed domain succeeds
+      - blocked domain fails
+      - curl --noproxy blocked domain fails
+      - raw socket to blocked IP fails
+      - direct HTTPS to blocked IP fails
+      - metadata service unreachable
+      - host LAN unreachable
+      - RFC1918 blocked
+      - Docker DNS bypass blocked
+
+    These must be integration tests against actual Docker network
+    behavior — not fake unit tests.
     """
 
     @pytest.mark.skipif(
@@ -262,7 +279,7 @@ class TestDockerNetworkEnforcement:
     def test_http_to_allowed_domain_succeeds(self):
         """HTTP to an allow-listed domain should succeed
         through the gateway."""
-        pytest.skip("Docker enforcement test — requires configured gateway")
+        pytest.skip("requires real enforced-gateway Docker fixture")
 
     @pytest.mark.skipif(
         not _has_docker(),
@@ -270,7 +287,7 @@ class TestDockerNetworkEnforcement:
     )
     def test_http_to_blocked_domain_fails(self):
         """HTTP to a non-allow-listed domain should fail."""
-        pytest.skip("Docker enforcement test — requires configured gateway")
+        pytest.skip("requires real enforced-gateway Docker fixture")
 
     @pytest.mark.skipif(
         not _has_docker(),
@@ -278,7 +295,7 @@ class TestDockerNetworkEnforcement:
     )
     def test_raw_socket_to_blocked_ip_fails(self):
         """Python socket.create_connection to a blocked IP must fail."""
-        pytest.skip("Docker enforcement test — requires configured gateway")
+        pytest.skip("requires real enforced-gateway Docker fixture")
 
     @pytest.mark.skipif(
         not _has_docker(),
@@ -286,7 +303,7 @@ class TestDockerNetworkEnforcement:
     )
     def test_direct_ip_https_fails(self):
         """Direct IP HTTPS to a non-allow-listed IP must fail."""
-        pytest.skip("Docker enforcement test — requires configured gateway")
+        pytest.skip("requires real enforced-gateway Docker fixture")
 
     @pytest.mark.skipif(
         not _has_docker(),
@@ -294,7 +311,7 @@ class TestDockerNetworkEnforcement:
     )
     def test_candidate_cannot_reach_metadata_service(self):
         """Candidate must not reach 169.254.169.254 (cloud metadata)."""
-        pytest.skip("Docker enforcement test — requires configured gateway")
+        pytest.skip("requires real enforced-gateway Docker fixture")
 
     @pytest.mark.skipif(
         not _has_docker(),
@@ -302,4 +319,4 @@ class TestDockerNetworkEnforcement:
     )
     def test_candidate_cannot_reach_host_lan(self):
         """Candidate must not reach host LAN addresses (10.x, 192.168.x)."""
-        pytest.skip("Docker enforcement test — requires configured gateway")
+        pytest.skip("requires real enforced-gateway Docker fixture")
