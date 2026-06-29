@@ -24,6 +24,9 @@ verified_trajectories.json
 # Virtual environments
 .venv/
 .venv-core/
+.venv-docker/
+.venv-embeddings/
+.venv-federation/
 venv/
 env/
 .env

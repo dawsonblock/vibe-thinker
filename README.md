@@ -123,6 +123,26 @@ python rfsn_cli.py smoke     # incl. the orchestrator run() -> CLR spine check
 ./scripts/test_core.sh       # self-contained core gate
 ```
 
+### Release gate profiles
+
+Each profile is a self-contained gate that creates its own isolated venv
+(and installs its own extra) so a fresh clone passes without global deps.
+
+```bash
+./scripts/test_core.sh        # core (no optional deps) — compile, doctor, smoke, pytest
+./scripts/test_docker.sh      # sandbox: tests marked sandbox / requires_docker_gateway
+./scripts/test_embeddings.sh  # embeddings: numpy + sklearn + sentence-transformers + faiss
+./scripts/test_federation.sh  # federation + web: Redis/fakeredis + FastAPI/WebSocket
+./scripts/check_ruvllm.sh     # RuvLLM: cargo check + maturin build + import (needs Rust)
+./scripts/release_gate.sh     # full release: build wheel, clean-install smoke, core gate
+```
+
+The core Python gate never requires Rust. RuvLLM is opt-in: a stub build
+(`import ruvllm_py` with `SUPPORTS_INFERENCE=False`) is validated by the
+core gate's turboquant tests; the real build (candle / inference-metal) is
+validated only by `check_ruvllm.sh`. An optional Rust failure does not
+block the core Python gate.
+
 ## Sandbox network status
 
 The default safe mode is `DISABLED`, which runs candidate code with

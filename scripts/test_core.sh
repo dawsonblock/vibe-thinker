@@ -28,6 +28,8 @@ python -m pip install -e "$ROOT[dev]" >/dev/null
 
 cd "$ROOT"
 python -m compileall -q .
+python rfsn_cli.py doctor
+python rfsn_cli.py smoke
 python -m pytest --strict-markers \
   -m "not logic and not embeddings and not federation and not web and not sandbox and not nli and not integration"
 python rfsn_cli.py --help >/dev/null
