@@ -3,7 +3,7 @@
 > **Version-tag convention:** Tags like `v3.2`, `v3.2.1`, `v0.3.9`,
 > `v1.1`, `v1.2` etc. refer to **historical internal phase numbering**
 > from earlier development cycles. They do NOT correspond to the
-> package version (currently `v0.4.6a0`, set in `pyproject.toml`).
+> package version (currently `v0.4.6a1`, set in `pyproject.toml`).
 > Treat them as historical context labels, not current release markers.
 
 ## Verify / test
@@ -15,6 +15,9 @@
   - Federation/web gate: `./scripts/test_federation.sh` (`.venv-federation`, `federation`/`web` markers)
   - RuvLLM gate: `./scripts/check_ruvllm.sh` (cargo check + maturin build + import; needs Rust)
   - Full release: `./scripts/release_gate.sh` (build wheel + clean-install smoke + core gate)
+- **ZIP release build + self-test**:
+  - Build: `python scripts/build_clean_zip.py` (compile + core pytest gate + ZIP; verifies every `.sh` in the ZIP has the +x bit set in `external_attr`)
+  - Self-test: `./scripts/test_zip_release.sh dist/vibe-thinker-v<version>.zip` (extracts to a temp dir, checks +x bits, no junk, installs in a fresh venv, runs `bash scripts/test_core.sh`)
 - **Anti-regression static checks** (AST-based, no execution):
   - Missing private methods: `python3 -m pytest tests/test_static_missing_self_methods.py -q` (flags `self.<name>()` calls with no defining method on the class)
   - Unreachable dead code: `python3 -m pytest tests/test_static_unreachable_code.py -q` (flags statements after return/raise/break/continue in the same block — the orphaned-method-body bug class)
@@ -248,7 +251,7 @@ CLI flag (and `VIBE_THINKER_NO_ENCODER_NLI` env) to explicitly disable
 it. Fallback chain: EncoderNLIJudge (if available) → LLM judge →
 fail-closed.
 
-### Explicit sandbox network mode (v0.4.6a0)
+### Explicit sandbox network mode (v0.4.6a1)
 `--sandbox-network {auto,none,best-effort-proxy,enforced-gateway}` CLI
 flag (env `VIBE_NETWORK_MODE`, default `auto`) for explicit opt-in to the
 sandbox network mode. `auto` maps to `None` (preserves auto-detect:
@@ -262,7 +265,7 @@ bypass tests pass. Threaded through the orchestrator constructor's
 `network_mode=` param → `executor.set_network_mode()`. Doctor warns for
 both networked modes.
 
-### Trajectory store embedding-model injection (v0.4.6a0)
+### Trajectory store embedding-model injection (v0.4.6a1)
 `VerifiedTrajectoryStore.__init__` accepts `embedding_model=` (any object
 with an `.encode(texts)` method returning numpy arrays). When injected
 (and no explicit mode/vector store is pinned), it forces EMBEDDINGS mode

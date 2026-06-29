@@ -64,9 +64,12 @@ vibe-thinker doctor > /dev/null && echo "  doctor: OK"
 echo "=== Smoke ==="
 vibe-thinker smoke
 
-echo "=== Core tests ==="
-python -m pytest --strict-markers -q \
-  -m "not logic and not embeddings and not federation and not web and not sandbox and not nli and not integration"
+echo "=== Core tests (via scripts/test_core.sh) ==="
+# Actually run the shipped test_core.sh script — not just an equivalent
+# pytest invocation — so we verify the script itself is correct and
+# executable in the extracted ZIP. Use 'bash' prefix as a defensive
+# fallback in case the +x bit was stripped by the extraction tool.
+bash scripts/test_core.sh
 
 deactivate
 rm -rf "$WORKDIR"

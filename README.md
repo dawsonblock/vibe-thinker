@@ -74,6 +74,9 @@ Do NOT install the old giant blob unless you explicitly want legacy full.
 ## Quickstart: Mac local
 
 ```bash
+# Ensure scripts are executable (some ZIP extraction tools drop the bit).
+chmod +x scripts/*.sh
+
 # Create a venv and install core deps (no Docker/Redis/Rust needed)
 ./scripts/mac_setup.sh
 
@@ -114,6 +117,7 @@ pip install -e ".[dev,test,logic,embeddings,federation,web,sandbox]"
 ### Canonical from-zero validation
 
 ```bash
+chmod +x scripts/*.sh        # ensure executable (ZIP extraction may drop the bit)
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -U pip

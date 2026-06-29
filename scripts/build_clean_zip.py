@@ -389,13 +389,35 @@ def main() -> int:
 
         # Verify no junk in the ZIP
         with zipfile.ZipFile(zip_path, "r") as zf:
-            bad = [n for n in zf.namelist()
+            names = zf.namelist()
+            bad = [n for n in names
                    if "__pycache__" in n or n.endswith(".pyc")]
             if bad:
                 print(f"  ERROR: ZIP contains junk files: {bad}")
                 return 1
             print("  Verified: no __pycache__ or .pyc files in ZIP")
-            print(f"  Entries: {len(zf.namelist())}")
+            print(f"  Entries: {len(names)}")
+
+            # Verify every .sh file in the ZIP has the executable bit
+            # set in external_attr. ZIP extraction tools that honor
+            # external_attr will then preserve the +x permission; tools
+            # that ignore it should be caught by test_zip_release.sh.
+            non_exec_sh = []
+            for info in zf.infolist():
+                if not info.filename.endswith(".sh"):
+                    continue
+                # external_attr is the high 16 bits of the UNIX st_mode.
+                # 0o755 -> 0o755 << 16 = 0o7550000.
+                mode = (info.external_attr >> 16) & 0o7777
+                if mode & 0o100 == 0:  # owner-exec bit not set
+                    non_exec_sh.append((info.filename, oct(mode)))
+            if non_exec_sh:
+                print("  ERROR: .sh files missing executable bit in ZIP:")
+                for name, mode in non_exec_sh:
+                    print(f"    {name} (mode={mode})")
+                return 1
+            sh_count = sum(1 for n in names if n.endswith(".sh"))
+            print(f"  Verified: all {sh_count} .sh files have +x bit in ZIP")
 
         return 0
     finally:

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Mac local setup — create a venv and install core deps (no Docker/Redis/Rust).
 set -euo pipefail
+# Ensure scripts are executable (some ZIP extraction tools drop the bit).
+chmod +x scripts/*.sh
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip setuptools wheel build

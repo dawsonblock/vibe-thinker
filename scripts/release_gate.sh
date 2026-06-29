@@ -92,7 +92,9 @@ phase_core() {
     source "$venv/bin/activate"
     python -m pip install --upgrade pip setuptools wheel build $PIP_FLAGS
     python -m pip install -e ".[dev,test]" $PIP_FLAGS
-    ./scripts/test_core.sh
+    # Use 'bash' prefix so this works even if the ZIP extraction lost the
+    # executable bit (some extraction tools / GitHub ZIP downloads do this).
+    bash scripts/test_core.sh
     deactivate
     rm -rf "$(dirname "$venv")"
     echo "[release-gate] phase core: OK"
