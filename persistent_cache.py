@@ -917,11 +917,19 @@ class VerifiedTrajectoryStore:
         agentdb_collection: str = "trajectories",
         agentdb_only: bool = False,
         similarity_mode: Optional[CacheSimilarityMode] = None,
+        embedding_model: Any = None,
     ):
         # Phase 5 (stabilization): decouple from embeddings. See
         # CLRResultCache.__init__ for the full rationale. The store
         # constructs in NONE mode (exact match only) when embeddings are
         # absent, instead of raising ImportError.
+        #
+        # An injected ``embedding_model`` lets unit tests (and custom
+        # backends) exercise the full semantic store/retrieve path WITHOUT
+        # requiring sentence-transformers. When one is provided and the
+        # caller did not pin an explicit mode or vector store, force
+        # EMBEDDINGS mode so the semantic code paths run instead of the
+        # exact-match NONE path (which would silently ignore the model).
         self._vector_store: Optional[VectorStore] = vector_store
         if self._vector_store is None and agentdb_url:
             self._vector_store = make_vector_store(
@@ -929,16 +937,23 @@ class VerifiedTrajectoryStore:
                 collection=agentdb_collection,
             )
 
-        self.similarity_mode = _resolve_similarity_mode(
-            similarity_mode, self._vector_store
-        )
+        if (embedding_model is not None
+                and similarity_mode is None
+                and self._vector_store is None):
+            self.similarity_mode = CacheSimilarityMode.EMBEDDINGS
+        else:
+            self.similarity_mode = _resolve_similarity_mode(
+                similarity_mode, self._vector_store
+            )
 
         if self.similarity_mode == CacheSimilarityMode.EMBEDDINGS:
             cls = get_sentence_transformer_class()
-            if cls is None and self._vector_store is None:
+            if (cls is None
+                    and self._vector_store is None
+                    and embedding_model is None):
                 raise RuntimeError(
                     "Embedding similarity mode requires "
-                    "sentence-transformers. "
+                    "sentence-transformers (or an injected embedding_model). "
                     "Install with: pip install -e '.[embeddings]'"
                 )
 
@@ -949,13 +964,16 @@ class VerifiedTrajectoryStore:
         self.max_few_shot = max_few_shot
         self.autosave = autosave
 
-        # Load the embedding model only in EMBEDDINGS mode.
+        # Load the embedding model: prefer an injected model (for tests /
+        # custom backends), then the shared sentence-transformers model in
+        # EMBEDDINGS mode. NONE mode never has a model.
         if self.similarity_mode == CacheSimilarityMode.EMBEDDINGS:
-            self.model = (
-                get_shared_embedding_model(model_name)
-                if EMBEDDINGS_AVAILABLE
-                else None
-            )
+            if embedding_model is not None:
+                self.model = embedding_model
+            elif EMBEDDINGS_AVAILABLE:
+                self.model = get_shared_embedding_model(model_name)
+            else:
+                self.model = None
         else:
             self.model = None
         self.entries: List[Dict[str, Any]] = []
