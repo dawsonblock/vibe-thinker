@@ -1027,10 +1027,12 @@ def _run_doctor() -> int:
 
     # Core
     print("\nCore:")
-    py_ok = _sys.version_info >= (3, 10)
+    # Must match pyproject.toml requires-python = ">=3.11".
+    py_ok = _sys.version_info >= (3, 11)
     print(f"  Python: {_sys.version.split()[0]} {'OK' if py_ok else 'FAIL'}")
     if not py_ok:
-        print("  Verdict: Python >= 3.10 required")
+        print("  Python version: FAIL, requires >=3.11 "
+              "(pyproject.toml requires-python = \">=3.11\")")
         return 1
 
     # Package install

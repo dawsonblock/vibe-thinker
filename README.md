@@ -95,15 +95,32 @@ vibe-thinker
 ## Test layers
 
 ```bash
-# Core tests (no optional deps required)
+# Core tests — fully self-contained. Creates its own .venv-core, installs
+# -e ".[dev]" (pins pytest<9, pytest-timeout, hypothesis, ruff, mypy), then
+# runs compile + strict-markers pytest + CLI --help. No global deps assumed.
 ./scripts/test_core.sh
 
-# Optional tests (requires optional deps)
+# Optional tests — require an activated venv with the relevant extras.
+# (test_optional.sh / test_all.sh run against the active interpreter, so
+#  activate a venv first — e.g. the .venv from ./scripts/mac_setup.sh.)
+source .venv/bin/activate
 pip install -e ".[dev,test,logic,embeddings,federation,web,sandbox]"
 ./scripts/test_optional.sh
 
-# Full suite + wheel build
+# Full suite + wheel build (also needs the activated venv above)
 ./scripts/test_all.sh
+```
+
+### Canonical from-zero validation
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -U pip
+python -m pip install -e ".[dev]"
+python rfsn_cli.py doctor    # Python >=3.11, package import, optional-dep report
+python rfsn_cli.py smoke     # incl. the orchestrator run() -> CLR spine check
+./scripts/test_core.sh       # self-contained core gate
 ```
 
 ## Sandbox network status
