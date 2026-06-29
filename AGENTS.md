@@ -8,6 +8,19 @@
 
 ## Verify / test
 - Full suite: `python3 -m pytest -q` (~1173 tests, ~110s, no live servers needed)
+- **Release gate profiles** (self-contained venvs, fresh-clone safe):
+  - Core gate: `./scripts/test_core.sh` (creates `.venv-core`, installs `-e ".[dev]"`, runs compile + doctor + smoke + strict-markers pytest)
+  - Docker sandbox gate: `./scripts/test_docker.sh` (`.venv-docker`, `sandbox`/`requires_docker_gateway` markers)
+  - Embeddings gate: `./scripts/test_embeddings.sh` (`.venv-embeddings`, `embeddings` marker)
+  - Federation/web gate: `./scripts/test_federation.sh` (`.venv-federation`, `federation`/`web` markers)
+  - RuvLLM gate: `./scripts/check_ruvllm.sh` (cargo check + maturin build + import; needs Rust)
+  - Full release: `./scripts/release_gate.sh` (build wheel + clean-install smoke + core gate)
+- **Anti-regression static checks** (AST-based, no execution):
+  - Missing private methods: `python3 -m pytest tests/test_static_missing_self_methods.py -q` (flags `self.<name>()` calls with no defining method on the class)
+  - Unreachable dead code: `python3 -m pytest tests/test_static_unreachable_code.py -q` (flags statements after return/raise/break/continue in the same block — the orphaned-method-body bug class)
+- **Orchestrator runtime spine**: `python3 -m pytest tests/test_orchestrator_runtime_spine.py -q` (verifies `_run_clr_with_cache` exists on the class and `run()` flows through the real method)
+- **Lint**: `ruff check .` (green baseline: B + C4 + W rules; B905 ignored)
+- **Smoke + doctor**: `python rfsn_cli.py smoke` (incl. orchestrator spine check) / `python rfsn_cli.py doctor` (Python >=3.11)
 - v3.2 verifier golden-set regression suite: `python3 -m pytest tests/test_verifier_golden_set.py -q`
 - v3.2 tool-callback scaffold: `python3 -m pytest tests/test_tool_callbacks.py -q`
 - v3.2 train-lora diversity stats + gate: `python3 -m pytest tests/test_train_lora.py -q`
@@ -234,6 +247,29 @@ constructor default `prefer_encoder_nli=True`. Added `--no-encoder-nli`
 CLI flag (and `VIBE_THINKER_NO_ENCODER_NLI` env) to explicitly disable
 it. Fallback chain: EncoderNLIJudge (if available) → LLM judge →
 fail-closed.
+
+### Explicit sandbox network mode (v0.4.6a0)
+`--sandbox-network {auto,none,best-effort-proxy,enforced-gateway}` CLI
+flag (env `VIBE_NETWORK_MODE`, default `auto`) for explicit opt-in to the
+sandbox network mode. `auto` maps to `None` (preserves auto-detect:
+BEST_EFFORT_PROXY when an allow-list is present, DISABLED otherwise) —
+zero behavior change. An explicit choice overrides auto-detection so the
+operator's intent is never silently inferred from the allow-list.
+`DISABLED` ignores the allow-list entirely. `BEST_EFFORT_PROXY` is NOT a
+security boundary (bypassable via raw sockets / direct IP). Only
+`ENFORCED_GATEWAY` may be treated as egress enforcement, and only after
+bypass tests pass. Threaded through the orchestrator constructor's
+`network_mode=` param → `executor.set_network_mode()`. Doctor warns for
+both networked modes.
+
+### Trajectory store embedding-model injection (v0.4.6a0)
+`VerifiedTrajectoryStore.__init__` accepts `embedding_model=` (any object
+with an `.encode(texts)` method returning numpy arrays). When injected
+(and no explicit mode/vector store is pinned), it forces EMBEDDINGS mode
+and uses the injected model directly, so the real semantic store/retrieve
+path runs without sentence-transformers. Unit tests inject a deterministic
+bag-of-words fake model. Defaults preserve existing behavior
+(`embedding_model=None` → shared sentence-transformers model).
 
 ## Robust answer extraction (v0.4.1)
 The system relies on regex to parse `\boxed{...}` from model output. Two
