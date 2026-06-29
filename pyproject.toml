@@ -125,6 +125,7 @@ markers = [
     "nli: tests requiring transformers/torch",
     "integration: slower integration tests",
     "requires_docker_gateway: tests requiring a real enforced-gateway Docker fixture",
+    "timeout: per-test timeout marker (enforced when pytest-timeout is installed)",
 ]
 
 [tool.setuptools]

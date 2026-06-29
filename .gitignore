@@ -23,6 +23,7 @@ verified_trajectories.json
 
 # Virtual environments
 .venv/
+.venv-core/
 venv/
 env/
 .env
