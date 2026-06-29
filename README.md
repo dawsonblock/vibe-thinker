@@ -126,17 +126,33 @@ python rfsn_cli.py smoke     # incl. the orchestrator run() -> CLR spine check
 ## Sandbox network status
 
 The default safe mode is `DISABLED`, which runs candidate code with
-Docker `--network none`.
+Docker `--network none`. Network access is opt-in — it is never granted
+unless you explicitly configure it.
 
-`BEST_EFFORT_PROXY` is not a security boundary. It only affects clients
+Select the sandbox network mode explicitly with `--sandbox-network`
+(env: `VIBE_NETWORK_MODE`):
+
+```
+--sandbox-network none               # no network access (safest; ignores any allow-list)
+--sandbox-network best-effort-proxy  # HTTP_PROXY/HTTPS_PROXY env routing
+--sandbox-network enforced-gateway   # Docker --internal network + gateway egress
+--sandbox-network auto               # default: best-effort-proxy when an allow-list
+                                     #          is present, else none
+```
+
+`BEST_EFFORT_PROXY` is **not a security boundary**. It only affects clients
 that respect proxy environment variables. Code may bypass it with raw
 sockets, direct IP connections, custom DNS, or clients that ignore
-proxy variables.
+proxy variables. The mode is never silently promoted to enforcement from
+an allow-list.
 
-`ENFORCED_GATEWAY` is experimental. Command wiring and fail-closed
-behavior are tested, but real egress enforcement is not considered
-proven until Docker bypass tests pass for raw sockets, DNS bypass,
-direct IP HTTPS, metadata service access, and host-LAN access.
+`ENFORCED_GATEWAY` is the **only** mode that may be treated as egress
+enforcement, and **only after bypass tests pass**. It is experimental:
+command wiring and fail-closed behavior are tested, but real egress
+enforcement is not considered proven until Docker bypass tests pass for
+raw sockets, DNS bypass, direct IP HTTPS, metadata service access, and
+host-LAN access. It fail-closes to `--network none` if the gateway
+network cannot be created, and requires Docker.
 
 Do not run hostile code with network access enabled.
 

@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from retrieval import RetrievalBackend
     from sandbox.network_allowlist import NetworkAllowList
+    from sandbox.base import NetworkMode
 
 from vibe_clr_async import CLRResult, VibeThinkerCLRAsync
 from persistent_cache import (
@@ -654,6 +655,7 @@ class HybridReasoningOrchestrator:
         dns_resolver: Optional[str] = None,
         sandbox_image: Optional[str] = None,
         proxy_egress: Optional[str] = None,
+        network_mode: Optional["NetworkMode"] = None,
         use_structured_output: bool = False,
         specialist_transport: str = "completion",
         specialist_api_key: Optional[str] = None,
@@ -737,6 +739,19 @@ class HybridReasoningOrchestrator:
                           f"{proxy_egress}"
                           + (" (domain-level filtering)"
                              if network_allowlist else ""))
+                # Explicit sandbox network mode (Blocker 12 safety cleanup).
+                # network_mode=None means auto-detect (BEST_EFFORT_PROXY when
+                # an allow-list is present, DISABLED otherwise) — the default,
+                # preserving historical behavior. An explicit mode overrides
+                # auto-detection so the operator's choice is never silently
+                # inferred from the allow-list. DISABLED ignores the
+                # allow-list entirely (no network access granted).
+                if (network_mode is not None
+                        and hasattr(executor, "set_network_mode")):
+                    executor.set_network_mode(network_mode)
+                    mode_name = getattr(network_mode, "value", str(network_mode))
+                    print(f"[Orchestrator] Sandbox network mode set to "
+                          f"{mode_name}")
         # If the verifier's executor is a WarmDockerPool, start it eagerly so
         # the first code task doesn't pay the cold-start cost.
         if (self.code_verifier is not None

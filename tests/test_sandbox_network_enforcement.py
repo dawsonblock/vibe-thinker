@@ -62,6 +62,49 @@ class TestNetworkModeDefaults:
         assert isinstance(NetworkMode.DISABLED, str)
 
 
+class TestOrchestratorNetworkModeWiring:
+    """Verify the orchestrator applies an explicit network_mode to the
+    sandbox executor (Blocker 12). The operator's explicit choice must
+    reach the executor and must NEVER be silently inferred as enforcement
+    from an allow-list. network_mode=None (auto) must preserve the
+    historical auto-detect behavior (no set_network_mode call)."""
+
+    def _make_orch(self, network_mode, mock_executor):
+        from hybrid_orchestrator import HybridReasoningOrchestrator
+        mock_cv = MagicMock()
+        mock_cv.executor = mock_executor
+        return HybridReasoningOrchestrator(
+            vibe_endpoint="http://localhost:0",
+            generalist_endpoint="http://localhost:0",
+            use_clr=False,
+            use_embedding_router=False,
+            use_clr_cache=False,
+            use_trajectory_store=False,
+            code_verifier=mock_cv,
+            network_mode=network_mode,
+        )
+
+    def test_explicit_enforced_gateway_reaches_executor(self):
+        executor = MagicMock()
+        orch = self._make_orch(NetworkMode.ENFORCED_GATEWAY, executor)
+        executor.set_network_mode.assert_called_once_with(
+            NetworkMode.ENFORCED_GATEWAY)
+
+    def test_explicit_disabled_reaches_executor(self):
+        executor = MagicMock()
+        orch = self._make_orch(NetworkMode.DISABLED, executor)
+        executor.set_network_mode.assert_called_once_with(
+            NetworkMode.DISABLED)
+
+    def test_auto_does_not_override_executor(self):
+        """network_mode=None (auto) must NOT call set_network_mode, so the
+        executor keeps its auto-detect behavior (BEST_EFFORT_PROXY when an
+        allow-list is present, DISABLED otherwise)."""
+        executor = MagicMock()
+        orch = self._make_orch(None, executor)
+        executor.set_network_mode.assert_not_called()
+
+
 class TestDockerSandboxNetworkModeWiring:
     """Verify that DockerSandboxExecutor correctly maps NetworkMode to
     Docker --network flags. These tests do NOT require Docker to be

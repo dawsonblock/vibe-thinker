@@ -142,6 +142,29 @@ def _build_network_allowlist(args) -> "object | None":
     return allowlist
 
 
+def _sandbox_network_mode(value: str):
+    """Map a --sandbox-network flag value to a NetworkMode (or None).
+
+    Returns None for "auto" so the executor auto-detects (BEST_EFFORT_PROXY
+    when an allow-list is present, DISABLED otherwise) — preserving the
+    historical default behavior. An explicit value overrides auto-detection
+    so the operator's choice is never silently inferred from the allow-list.
+
+    Safety (Blocker 12): BEST_EFFORT_PROXY is NOT a security boundary. Only
+    ENFORCED_GATEWAY may be treated as egress enforcement, and only after
+    bypass tests pass.
+    """
+    from sandbox.base import NetworkMode
+
+    mapping = {
+        "auto": None,
+        "none": NetworkMode.DISABLED,
+        "best-effort-proxy": NetworkMode.BEST_EFFORT_PROXY,
+        "enforced-gateway": NetworkMode.ENFORCED_GATEWAY,
+    }
+    return mapping.get(value, None)
+
+
 # ----------------------------- command parsing ----------------------------- #
 def _split_flags(tokens):
     """Pull leading -p/-r style flags out of a token list.
@@ -741,6 +764,29 @@ def build_argparser() -> argparse.ArgumentParser:
                         "filtering instead of --network=none. "
                         "EXPERIMENTAL — not production-safe. "
                         "Empty = deny all (default).")
+    # --- Sandbox network mode (Blocker 12 safety cleanup) ---
+    # Explicit opt-in for the sandbox network mode. Default "auto" preserves
+    # the historical behavior (auto-detect from the allow-list). An explicit
+    # choice overrides auto-detection so the operator's intent is never
+    # silently inferred from the allow-list.
+    p.add_argument("--sandbox-network",
+                   default=os.environ.get("VIBE_NETWORK_MODE", "auto"),
+                   choices=["auto", "none", "best-effort-proxy",
+                            "enforced-gateway"],
+                   help="Sandbox network mode (default: auto). "
+                        "'none' = no network access (safest; ignores any "
+                        "allow-list). "
+                        "'best-effort-proxy' = HTTP_PROXY/HTTPS_PROXY env "
+                        "routing — NOT a security boundary (bypassable via "
+                        "raw sockets / direct IP / clients that ignore proxy "
+                        "vars). "
+                        "'enforced-gateway' = Docker --internal network + "
+                        "gateway egress enforcement — the ONLY mode that may "
+                        "be treated as a security boundary, and ONLY after "
+                        "bypass tests pass; experimental, fail-closes to "
+                        "--network none if the gateway cannot be created. "
+                        "'auto' = best-effort-proxy when an allow-list is "
+                        "present, else none.")
     p.add_argument("--network-allowlist-file",
                    default=os.environ.get("RFSN_NETWORK_ALLOWLIST_FILE", ""),
                    help="Path to a file with allowed network destinations "
@@ -892,6 +938,7 @@ async def _amain() -> None:
         dns_resolver=args.dns_resolver or None,
         sandbox_image=args.sandbox_image or None,
         proxy_egress=args.proxy_egress or None,
+        network_mode=_sandbox_network_mode(args.sandbox_network),
         use_structured_output=args.use_structured_output,
         specialist_transport=args.specialist_transport,
         specialist_api_key=args.specialist_api_key or None,
@@ -1076,18 +1123,27 @@ def _run_doctor() -> int:
     # Sandbox
     print("\nSandbox:")
     sandbox_mode = os.environ.get("VIBE_SANDBOX_MODE", "disabled")
-    network_mode = os.environ.get("VIBE_NETWORK_MODE", "disabled")
+    # Default "auto" matches the --sandbox-network flag default: auto-detect
+    # (BEST_EFFORT_PROXY when an allow-list is present, DISABLED otherwise).
+    network_mode = os.environ.get("VIBE_NETWORK_MODE", "auto")
+    _safe_network = network_mode in ("auto", "disabled", "none")
     print(f"  mode: {sandbox_mode} "
           f"{'OK' if sandbox_mode == 'disabled' else 'CHECK'}")
     print(f"  network: {network_mode} "
-          f"{'OK' if network_mode == 'disabled' else 'CHECK'}")
+          f"{'OK' if _safe_network else 'CHECK'}")
     if network_mode == "best_effort_proxy":
         print("  WARNING: best_effort_proxy is NOT a security boundary.")
-        print("           Use 'disabled' for untrusted code.")
+        print("           It is bypassable (raw sockets, direct IP, clients")
+        print("           that ignore proxy vars). Use 'none' for untrusted code.")
+    elif network_mode == "enforced_gateway":
+        print("  NOTE: enforced_gateway is the ONLY mode that may be treated")
+        print("        as egress enforcement, and ONLY after bypass tests pass.")
+        print("        It is experimental and fail-closes to --network none if")
+        print("        the gateway cannot be created.")
 
     # Verdict
     print("\nVerdict:")
-    if py_ok and sandbox_mode == "disabled" and network_mode == "disabled":
+    if py_ok and sandbox_mode == "disabled" and _safe_network:
         print("  core local profile is runnable")
         return 0
     else:
