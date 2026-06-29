@@ -2013,7 +2013,7 @@ class HybridReasoningOrchestrator:
             # parallelism naturally (round-robin dispatch). This replaces the
             # old sequential loop — with 6 candidates and 3 warm containers,
             # verification time drops from ~1.2s to ~0.4s.
-            async def _verify_one(idx: int, code: str):
+            async def _verify_one(idx: int, code: str, tests=tests):
                 result = await self.code_verifier.verify(
                     query, code, {"unit_tests": tests}
                 )
@@ -2909,7 +2909,6 @@ class HybridReasoningOrchestrator:
             if len(patterns) >= _EXPORT_LIMIT:
                 print(f"[SONA] Warning: export hit limit ({_EXPORT_LIMIT}), "
                       f"some patterns may be truncated")
-            return patterns
             return patterns
         except Exception as e:
             print(f"[SONA] Warning: failed to export patterns: {e}")

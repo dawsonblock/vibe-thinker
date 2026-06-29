@@ -254,6 +254,9 @@ class TestCodeSpecialistRouting:
                                       error="mutation correctly failed")
 
         o.code_verifier.verify = verify_side_effect
+        assert hasattr(o, "_run_clr_with_cache"), (
+            "cannot monkeypatch a method the class does not define "
+            "(would mask a missing-method regression)")
         o._run_clr_with_cache = AsyncMock(side_effect=AssertionError("CLR should not run for code"))
 
         result = await o.run("Write a Python function to square a number")
@@ -457,6 +460,9 @@ class TestCodeSpecialistRouting:
             use_trajectory_store=False,
         )
         o._call_code_specialist = AsyncMock(return_value="def sort(l): return sorted(l)")
+        assert hasattr(o, "_run_clr_with_cache"), (
+            "cannot monkeypatch a method the class does not define "
+            "(would mask a missing-method regression)")
         o._run_clr_with_cache = AsyncMock(side_effect=AssertionError("CLR should not run for code"))
 
         result = await o.run("Write a Python function to sort a list efficiently")
@@ -481,6 +487,9 @@ class TestCodeSpecialistRouting:
         o._call_code_specialist = AsyncMock(side_effect=AssertionError("ruvltra should not run for math"))
         o._generate_test_spec = AsyncMock(side_effect=AssertionError("test spec should not run for math"))
         fake_clr = CLRResult(best_answer="42", best_score=0.9, best_raw_trace="")
+        assert hasattr(o, "_run_clr_with_cache"), (
+            "cannot monkeypatch a method the class does not define "
+            "(would mask a missing-method regression)")
         o._run_clr_with_cache = AsyncMock(return_value=(fake_clr, False))
 
         result = await o.run("Solve the equation 2x + 3 = 7")
@@ -502,6 +511,9 @@ class TestCodeSpecialistRouting:
             use_trajectory_store=False,
         )
         fake_clr = CLRResult(best_answer="code here", best_score=0.8, best_raw_trace="")
+        assert hasattr(o, "_run_clr_with_cache"), (
+            "cannot monkeypatch a method the class does not define "
+            "(would mask a missing-method regression)")
         o._run_clr_with_cache = AsyncMock(return_value=(fake_clr, False))
 
         result = await o.run("Write a Python function to sort a list efficiently")

@@ -162,7 +162,7 @@ class TestInProcessContract:
             pytest.skip("ruvllm_py has logprobs — see test_inprocess_logprobs")
         try:
             ppl.eval_inprocess("model.gguf", "hello world")
-            assert False, "should have raised"
+            raise AssertionError("should have raised")
         except NotImplementedError:
             pass
         except Exception:

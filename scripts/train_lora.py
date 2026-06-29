@@ -106,7 +106,7 @@ def compute_diversity_stats(examples: List[Dict[str, Any]]) -> Dict[str, Any]:
       - DPO pair completeness (how many have both chosen + rejected)
     """
     queries = [_extract_query(ex) for ex in examples]
-    unique_queries = len(set(q.strip().lower() for q in queries if q))
+    unique_queries = len({q.strip().lower() for q in queries if q})
     task_types = Counter(_detect_task_type(q) for q in queries)
 
     is_dpo = any("chosen" in ex and "rejected" in ex for ex in examples)

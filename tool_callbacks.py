@@ -170,7 +170,7 @@ async def run_with_callbacks(
 
     prompt = initial_prompt
     last_generation = ""
-    for round_idx in range(max_rounds):
+    for _ in range(max_rounds):
         generation = await generate(prompt)
         last_generation = generation
         calls = parse_tool_calls(generation)

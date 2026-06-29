@@ -172,7 +172,7 @@ def _try_recurrence(problem: str) -> Optional[str]:
 
     # Iterate the recurrence
     current = a0
-    for i in range(1, target_n):
+    for _ in range(1, target_n):
         val = _safe_eval(expr, {"x": current})
         if val is None:
             return None

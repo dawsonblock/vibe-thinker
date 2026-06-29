@@ -161,3 +161,29 @@ include = [
     "sandbox*",
     "web*",
 ]
+
+[tool.ruff]
+# Green lint baseline. Focused on real-bug rules (B = flake8-bugbear,
+# C4 = comprehensions, W = pycodestyle warnings e.g. invalid escape
+# sequences). F/E/SIM/RET/UP are NOT enabled here because the existing
+# codebase has hundreds of stylistic findings under them; enabling them
+# would make `ruff check .` red without catching the dead-code class of
+# bug that mattered (a bare string literal after `return` is NOT flagged
+# by any ruff rule). That class is covered instead by the AST gate in
+# tests/test_static_unreachable_code.py.
+extend-exclude = [
+    "rust",        # vendored third-party (onig_sys, exo probe)
+    "build",       # generated wheel/sdist artifacts
+    ".venv",
+    ".venv-core",
+]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["B", "C4", "W"]
+# B905 (zip() without explicit strict=) is pedantic for existing correct
+# code where mismatched lengths are intentional/irrelevant; enabling it
+# would churn many zip call sites without catching a real bug. The other
+# B rules (B904 raise-from, B023 closure binding, B011 assert False,
+# B007 unused loop var) remain active.
+ignore = ["B905"]

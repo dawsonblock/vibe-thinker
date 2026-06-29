@@ -341,7 +341,8 @@ class JobQueue:
         try:
             await asyncio.wait_for(ev.wait(), timeout=timeout)
         except asyncio.TimeoutError:
-            raise TimeoutError(f"Job {job_id} did not finish within {timeout}s")
+            raise TimeoutError(
+                f"Job {job_id} did not finish within {timeout}s") from None
         job = self._jobs[job_id]
         if job.status == JobStatus.FAILED:
             raise RuntimeError(f"Job {job_id} failed: {job.error}")

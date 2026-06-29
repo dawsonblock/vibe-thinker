@@ -282,7 +282,7 @@ class LogicVerifier:
         try:
             tree = ast.parse(expr_str, mode="eval")
         except SyntaxError as e:
-            raise ValueError(f"invalid constraint syntax: {e}")
+            raise ValueError(f"invalid constraint syntax: {e}") from None
 
         evaluator = _SafeZ3Evaluator(namespace)
         return evaluator.visit(tree.body)

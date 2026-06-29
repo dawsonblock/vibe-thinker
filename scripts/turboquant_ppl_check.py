@@ -293,7 +293,7 @@ def eval_inprocess(
             "`turboquant_ppl_check.py eval --base-url ...`. "
             "Build the extension with `maturin develop --release "
             "--features candle` in the ruvllm_py directory."
-        )
+        ) from None
 
     # Check the logprobs capability BEFORE creating an Engine (avoids a
     # model-not-found error when the binding is present but stubbed).
