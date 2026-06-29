@@ -1093,6 +1093,75 @@ def _run_doctor() -> int:
         return 1
 
 
+async def _smoke_orchestrator_spine() -> tuple:
+    """Exercise the real orchestrator.run() -> CLR path with no model.
+
+    Instantiates ``HybridReasoningOrchestrator`` and runs one query through a
+    fake CLR backend. The fake is injected at the layer BELOW
+    ``_run_clr_with_cache`` (``self.reasoner.run``), never on the method
+    itself, so a missing ``_run_clr_with_cache`` surfaces as an
+    ``AttributeError`` here instead of being masked.
+
+    No real LLM, network, Docker, or embeddings are required.
+
+    Returns ``(True, msg)`` on success or ``(False, msg)`` on failure.
+    """
+    from unittest.mock import AsyncMock
+    from vibe_clr_async import CLRResult
+
+    try:
+        orchestrator = HybridReasoningOrchestrator(
+            vibe_endpoint="http://localhost:0",
+            generalist_endpoint="http://localhost:0",
+            use_clr=True,
+            use_embedding_router=False,
+            use_clr_cache=False,
+            use_trajectory_store=False,
+            code_verifier=None,
+            retrieval_backend=None,
+        )
+    except AttributeError as e:
+        return False, f"orchestrator construction failed: {e}"
+    except Exception as e:  # pragma: no cover - defensive
+        return False, f"orchestrator construction failed: {type(e).__name__}: {e}"
+
+    # The method must exist on the class, not be supplied by this smoke test.
+    if "_run_clr_with_cache" not in vars(HybridReasoningOrchestrator):
+        return False, (
+            "HybridReasoningOrchestrator is missing _run_clr_with_cache "
+            "(defined on the class, not just monkeypatched onto an instance)")
+
+    fake_clr = CLRResult(
+        best_answer="x = 2",
+        best_score=0.9,
+        best_raw_trace="",
+        verified=True,
+        verification_method="math_verifier",
+    )
+    # Fake the layer BELOW _run_clr_with_cache — never the method itself.
+    orchestrator.reasoner.run = AsyncMock(return_value=fake_clr)
+
+    try:
+        result = await orchestrator.run("Solve the equation 2x + 3 = 7")
+    except AttributeError as e:
+        return False, (
+            f"orchestrator.run() AttributeError (spine broken): {e}")
+    except Exception as e:  # pragma: no cover - defensive
+        return False, f"orchestrator.run() failed: {type(e).__name__}: {e}"
+
+    if result is None or getattr(result, "final_answer", None) != "x = 2":
+        got = getattr(result, "final_answer", None) if result else None
+        return False, f"unexpected result (final_answer={got!r})"
+    if getattr(result, "route_taken", None) != "specialist_clr":
+        return False, (
+            f"unexpected route_taken="
+            f"{getattr(result, 'route_taken', None)!r}")
+    # The real _run_clr_with_cache must have called through to the reasoner.
+    if not orchestrator.reasoner.run.await_count:
+        return False, "_run_clr_with_cache did not reach reasoner.run"
+    return True, "orchestrator.run() -> _run_clr_with_cache -> reasoner.run OK"
+
+
 def _run_smoke() -> int:
     """Run a minimal no-network, no-model smoke test.
 
@@ -1102,6 +1171,7 @@ def _run_smoke() -> int:
       - run schema verifier
       - create audit event
       - write/read local cache
+      - exercise the real orchestrator.run() -> CLR spine (no model)
     Exits 0 if all pass, 1 otherwise.
     """
     import asyncio as _asyncio
@@ -1114,9 +1184,9 @@ def _run_smoke() -> int:
     # 1. Import orchestrator
     try:
         import hybrid_orchestrator  # noqa: F401
-        print("[1/5] Import orchestrator: OK")
+        print("[1/6] Import orchestrator: OK")
     except ImportError as e:
-        print(f"[1/5] Import orchestrator: FAIL ({e})")
+        print(f"[1/6] Import orchestrator: FAIL ({e})")
         failures.append("import")
 
     # 2. Math verifier (async)
@@ -1129,9 +1199,9 @@ def _run_smoke() -> int:
         assert result.verified, (
             f"MathVerifier expected verified=True, "
             f"got {result.verified}")
-        print("[2/5] Math verifier (2+2=4): OK")
+        print("[2/6] Math verifier (2+2=4): OK")
     except Exception as e:
-        print(f"[2/5] Math verifier: FAIL ({e})")
+        print(f"[2/6] Math verifier: FAIL ({e})")
         failures.append("math")
 
     # 3. Schema verifier (async)
@@ -1146,9 +1216,9 @@ def _run_smoke() -> int:
         assert result.verified, (
             f"SchemaVerifier expected verified=True, "
             f"got {result.verified}")
-        print("[3/5] Schema verifier: OK")
+        print("[3/6] Schema verifier: OK")
     except Exception as e:
-        print(f"[3/5] Schema verifier: FAIL ({e})")
+        print(f"[3/6] Schema verifier: FAIL ({e})")
         failures.append("schema")
 
     # 4. Audit log (uses record() with a job-like object)
@@ -1172,12 +1242,12 @@ def _run_smoke() -> int:
             log.record(job, event="smoke_test", extra={"test": True})
             entries = log.read_all()
             assert len(entries) >= 1, f"Expected >=1 entry, got {len(entries)}"
-            print("[4/5] Audit log write/read: OK")
+            print("[4/6] Audit log write/read: OK")
         finally:
             if os.path.exists(log_path):
                 os.unlink(log_path)
     except Exception as e:
-        print(f"[4/5] Audit log: FAIL ({e})")
+        print(f"[4/6] Audit log: FAIL ({e})")
         failures.append("audit")
 
     # 5. Local cache (exact key lookup, no embeddings needed)
@@ -1203,13 +1273,27 @@ def _run_smoke() -> int:
                 verified=True,
                 verification_method="python_eval",
             )
-            print("[5/5] Local cache write/read: OK")
+            print("[5/6] Local cache write/read: OK")
         finally:
             if os.path.exists(cache_path):
                 os.unlink(cache_path)
     except Exception as e:
-        print(f"[5/5] Local cache: FAIL ({e})")
+        print(f"[5/6] Local cache: FAIL ({e})")
         failures.append("cache")
+
+    # 6. Orchestrator runtime spine: real run() -> _run_clr_with_cache path.
+    # This is the check that would have caught the missing-method regression.
+    # No real model — the CLR backend is faked below _run_clr_with_cache.
+    try:
+        ok, msg = _asyncio.run(_smoke_orchestrator_spine())
+        if ok:
+            print(f"[6/6] Orchestrator spine: OK ({msg})")
+        else:
+            print(f"[6/6] Orchestrator spine: FAIL ({msg})")
+            failures.append("spine")
+    except Exception as e:
+        print(f"[6/6] Orchestrator spine: FAIL ({type(e).__name__}: {e})")
+        failures.append("spine")
 
     print()
     if failures:

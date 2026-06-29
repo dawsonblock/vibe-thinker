@@ -2622,6 +2622,10 @@ class HybridReasoningOrchestrator:
         print("[CLR] Logic translation retries exhausted — returning "
               "best-effort (will fail at verification)")
         return result
+
+    async def _run_clr_with_cache(
+        self, query: str
+    ) -> Tuple[CLRResult, bool]:
         """Run CLR, but return a cached result if a similar high-score
         problem was solved before. Returns (result, cache_hit).
 
