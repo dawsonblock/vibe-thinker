@@ -288,25 +288,28 @@ services:
   #   The orchestrator points RUVLLM_URL at it (rfsn_cli.py:476 -> --ruvllm-url,
   #   which overrides --vibe at rfsn_cli.py:681).
   #
-  #   IMPORTANT: There is NO published RuvLLM Docker image. The build: context
-  #   below points at ruvllm_py/ (the PyO3/maturin Rust crate). You MUST build
-  #   it yourself first:
+  #   IMPORTANT: There is NO published RuvLLM Docker image and NO
+  #   Dockerfile in ruvllm_py/. You MUST build the Rust crate yourself
+  #   first:
   #     cd ruvllm_py && cargo build --release --features candle   # CPU
   #     # or: cargo build --release --features inference-metal      # Apple Silicon
-  #   then wrap it in an image (see docker/ruvllm.Dockerfile pattern), or set
-  #   RUVLLM_IMAGE to a pre-built image name. Until a real image is supplied,
-  #   this service will fail to start — the orchestrator fail-closes to the
-  #   HTTP path (ruvllm_adapter.py documents the same OpenAI API shape).
+  #   then wrap it in an image and set RUVLLM_IMAGE to its name. Until
+  #   a real image is supplied, this service will fail to start — the
+  #   orchestrator fail-closes to the HTTP path (ruvllm_adapter.py
+  #   documents the same OpenAI API shape).
   # ---------------------------------------------------------------------------
   ruvllm:
     # Env-var-driven image: set RUVLLM_IMAGE to your built image, e.g.
     #   RUVLLM_IMAGE=ruvllm:latest docker compose --profile ruvllm up
-    # If unset, we try to build from ruvllm_py/ (placeholder — see comment
-    # above; a real Dockerfile for the Rust crate must be supplied).
+    # There is NO published RuvLLM Docker image and NO Dockerfile in
+    # ruvllm_py/ — you MUST build the image yourself first:
+    #   cd ruvllm_py && cargo build --release --features candle   # CPU
+    #   # or: cargo build --release --features inference-metal      # Apple Silicon
+    # then wrap it in an image and set RUVLLM_IMAGE to its name.
+    # Until then, this service will fail to start — the orchestrator
+    # fail-closes to the HTTP path (ruvllm_adapter.py documents the
+    # same OpenAI API shape).
     image: ${RUVLLM_IMAGE:-ruvllm:latest}
-    build:
-      context: ./ruvllm_py
-      dockerfile: Dockerfile
     restart: unless-stopped
     profiles: ["ruvllm"]
     environment:

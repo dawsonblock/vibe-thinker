@@ -28,11 +28,12 @@ RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 # Install runtime dependencies from the pinned requirements.txt.
-# requirements.txt groups optional deps with comments; we install the full set
-# so embeddings (numpy/sklearn/sentence-transformers), web (fastapi/uvicorn),
-# federation (redis), and signing (cryptography) are all available. The
-# orchestrator fail-closes gracefully when any optional dep is missing, but
-# shipping them gives the full experience out of the box.
+# requirements.txt currently contains only the core runtime deps (aiohttp,
+# python-dotenv). This is a CORE-ONLY image — optional subsystems (embeddings,
+# web, federation, sandbox, logic, NLI) are NOT installed. The orchestrator
+# fail-closes gracefully when any optional dep is missing. To get the full
+# stack, extend requirements.txt or install extras in a derived image:
+#   pip install -e ".[embeddings,web,federation,sandbox,logic,nli]"
 WORKDIR /install
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \

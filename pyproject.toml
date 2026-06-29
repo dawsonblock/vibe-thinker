@@ -54,6 +54,16 @@ web = [
 ]
 sandbox = [
     "docker>=6.0,<8",
+    "wasmtime>=10.0,<20",
+    "cryptography>=43.0.1,<46",
+]
+models = [
+    "llama-cpp-python>=0.2.70,<1",
+    "onnxruntime>=1.17,<2",
+    "huggingface_hub>=0.20,<1",
+    "tokenizers>=0.15,<1",
+    "duckduckgo_search>=4.0,<5",
+    "wikipedia>=1.4,<2",
 ]
 nli = [
     "transformers>=4.40,<5",
@@ -84,9 +94,17 @@ all = [
     "pydantic>=2.0,<3",
     "httpx>=0.27,<1",
     "docker>=6.0,<8",
+    "wasmtime>=10.0,<20",
+    "cryptography>=43.0.1,<46",
     "transformers>=4.40,<5",
     "torch>=2.2,<3",
     "maturin>=1.4,<2",
+    "llama-cpp-python>=0.2.70,<1",
+    "onnxruntime>=1.17,<2",
+    "huggingface_hub>=0.20,<1",
+    "tokenizers>=0.15,<1",
+    "duckduckgo_search>=4.0,<5",
+    "wikipedia>=1.4,<2",
 ]
 
 [project.scripts]

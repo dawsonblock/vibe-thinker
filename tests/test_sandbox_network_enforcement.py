@@ -47,7 +47,14 @@ class TestNetworkModeDefaults:
         assert NetworkMode.BEST_EFFORT_PROXY.value == "best_effort_proxy"
 
     def test_enforced_gateway_exists(self):
-        """ENFORCED_GATEWAY is the only mode that IS a security boundary."""
+        """ENFORCED_GATEWAY is the intended security boundary mode.
+
+        Note: ENFORCED_GATEWAY is EXPERIMENTAL — command wiring and
+        fail-closed behavior are tested, but real egress enforcement
+        is not proven until Docker bypass tests pass. It is the only
+        mode *designed* to be a security boundary, but that design is
+        not yet validated.
+        """
         assert NetworkMode.ENFORCED_GATEWAY.value == "enforced_gateway"
 
     def test_network_mode_is_str_enum(self):

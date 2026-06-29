@@ -50,6 +50,31 @@ addressing the v30/v31 validation reports.
   manager pattern instead of the deprecated `@app.on_event`
   decorators. Web/federation tests now produce 0 FastAPI/Starlette
   deprecation warnings (down from 21).
+- `scripts/check_ruvllm.sh`: fixed to build with `--features candle`
+  (CPU) or `--features inference-metal` (Apple Silicon) instead of
+  the default stub build. The old script was designed to fail —
+  `SUPPORTS_INFERENCE` is only true with inference features enabled.
+- `ruvllm_py/pyproject.toml`: fixed deprecated `license = { text = "MIT" }`
+  → `license = "MIT"` (matches main pyproject.toml fix).
+- `docker-compose.yml`: removed broken `build:` block in the ruvllm
+  profile that referenced `ruvllm_py/Dockerfile` (which does not
+  exist). The service now requires a pre-built `RUVLLM_IMAGE` —
+  documented in the comment block.
+- `Dockerfile`: fixed comments that overclaimed "full experience" —
+  the image is core-only (aiohttp + python-dotenv). Comments now
+  say "CORE-ONLY image" and explain how to extend it with extras.
+- `pyproject.toml` extras: added `models` extra (llama-cpp-python,
+  onnxruntime, huggingface_hub, tokenizers, duckduckgo_search,
+  wikipedia) matching `requirements-models.txt`. Expanded `sandbox`
+  extra to include `wasmtime` and `cryptography` matching
+  `requirements-sandbox.txt`. Updated `all` extra accordingly.
+- `README.md`: fixed Python version requirement from "3.10+" to
+  "3.11+" to match `requires-python = ">=3.11"` in pyproject.toml.
+- `tests/test_sandbox_network_enforcement.py`: softened the
+  ENFORCED_GATEWAY test docstring from "the only mode that IS a
+  security boundary" to "the only mode *designed* to be a security
+  boundary, but that design is not yet validated" — matches the
+  experimental/unproven status in all other docs.
 
 ### Added (demos — not part of release scope)
 - `examples/demo_complex_pipeline.py`: multi-step combinatorics problem

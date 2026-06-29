@@ -180,7 +180,7 @@ Query -> EmbeddingRouter -> specialist | generalist | hybrid
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.11+
 - A running llama-server for the specialist (default: `http://127.0.0.1:8080`)
 - A running llama-server for the generalist (default: `http://127.0.0.1:8081`)
 - *Optional:* a dedicated code-specialist server (default: `http://127.0.0.1:8082`).
