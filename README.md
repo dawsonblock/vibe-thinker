@@ -173,12 +173,15 @@ sockets, direct IP connections, custom DNS, or clients that ignore
 proxy variables. The mode is never silently promoted to enforcement from
 an allow-list.
 
-`ENFORCED_GATEWAY` is the **only** mode that may be treated as egress
-enforcement, and **only after bypass tests pass**. It is experimental:
-command wiring and fail-closed behavior are tested, but real egress
-enforcement is not considered proven until Docker bypass tests pass for
-raw sockets, DNS bypass, direct IP HTTPS, metadata service access, and
-host-LAN access. It fail-closes to `--network none` if the gateway
+`ENFORCED_GATEWAY` is the **only** mode designed to be egress
+enforcement. Docker network isolation is tested: `--network none` and
+`--internal` networks are verified to block connections to the internet,
+cloud metadata, and host LAN. However, the allowlisted gateway/proxy
+egress path (domain-level filtering through a gateway container) is
+**not yet validated** — the executor can create the `--internal` network
+and fail-closed to `--network none` if it cannot, but the gateway
+container itself is not started or verified by the test suite. It
+remains experimental. It fail-closes to `--network none` if the gateway
 network cannot be created, and requires Docker.
 
 Do not run hostile code with network access enabled.

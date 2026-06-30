@@ -24,10 +24,13 @@ The executor's network behavior is controlled by :class:`NetworkMode`:
   - ``ENFORCED_GATEWAY``: the container runs on a Docker ``--internal``
     network with no direct internet access. All egress goes through a
     gateway container that enforces the allow-list at the network level.
-    EXPERIMENTAL — this mode has not been validated with bypass tests in
-    all environments. Fail-closes to ``--network none`` if the gateway
-    network cannot be created. Requires Docker and a pre-created internal
-    network + gateway container.
+    EXPERIMENTAL — Docker network isolation (``--network none`` and
+    ``--internal`` blocking) is tested, but the allowlisted gateway/proxy
+    egress path is not yet validated (the gateway container is not
+    started or verified by the test suite). Fail-closes to
+    ``--network none`` if the gateway network cannot be created.
+    Requires Docker and a pre-created internal network + gateway
+    container.
 
 When a NetworkAllowList is provided AND network_mode is BEST_EFFORT_PROXY
 or ENFORCED_GATEWAY, the executor uses domain-level egress filtering.

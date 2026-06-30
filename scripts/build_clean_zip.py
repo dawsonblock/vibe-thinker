@@ -33,7 +33,7 @@ Usage:
     python scripts/build_clean_zip.py --self-contained
 
 Output:
-    dist/vibe-thinker-v<version>.zip   (e.g. dist/vibe-thinker-v0.4.6a0.zip)
+    dist/vibe-thinker-v<version>.zip   (e.g. dist/vibe-thinker-v0.4.6a1.zip)
 
 Exit code is nonzero if compileall fails, or if the core pytest gate
 fails. If pytest is absent and tests are not skipped (--no-tests), the
