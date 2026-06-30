@@ -719,7 +719,13 @@ Bad answers are never cached. The strict `should_cache()` policy rejects:
 ## Testing
 
 ```bash
-# Full suite (509 tests, no model servers needed):
+# Fast core gate (~250 curated tests, ~30s) — the iteration gate:
+./scripts/test_core.sh
+
+# Broad local gate (~1000+ core-marker tests, ~70s) — the pre-release gate:
+./scripts/test_local.sh
+
+# Full suite (all markers, needs all optional deps installed):
 python3 -m pytest -q
 
 # Specific subsystems:

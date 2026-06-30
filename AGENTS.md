@@ -7,7 +7,9 @@
 > Treat them as historical context labels, not current release markers.
 
 ## Verify / test
-- Full suite: `python3 -m pytest -q` (~1173 tests, ~110s, no live servers needed)
+- Fast core gate: `./scripts/test_core.sh` (~250 curated tests, ~30s — the iteration gate)
+- Broad local gate: `./scripts/test_local.sh` (~1000+ core-marker tests, ~70s — the pre-release gate)
+- Full suite (all markers, needs all optional deps): `python3 -m pytest -q`
 - **Release gate profiles** (self-contained venvs, fresh-clone safe):
   - Fast core gate: `./scripts/test_core.sh` (env-aware; standalone creates `.venv-core` + installs `-e ".[dev]"`; runs compile + doctor + smoke + a curated fast subset — spine, anti-regression static checks, routing/REPL/cache/scoring/signers/deterministic/math-verifier/format-enforcer/trajectory — ~250 tests, ~30s)
   - Broad local gate: `./scripts/test_local.sh` (env-aware; the full ~1000+ core-marker selection, ~15 min — the pre-release confidence gate)

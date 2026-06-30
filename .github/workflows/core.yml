@@ -16,7 +16,9 @@ jobs:
       - run: python -m pip install --upgrade pip setuptools wheel build
       - run: python -m pip install -e ".[dev,test]"
       - run: python -m compileall -q .
-      - run: pytest -m "not logic and not embeddings and not federation and not web and not sandbox and not nli and not integration"
+      # Use the same fast core gate as release_gate.sh core. test_core.sh
+      # is env-aware and reuses the active venv (no nested venv creation).
+      - run: bash scripts/test_core.sh
       - run: python -m build
       - run: python -m pip install --force-reinstall dist/*.whl
       - run: vibe-thinker --help

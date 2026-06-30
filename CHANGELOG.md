@@ -1,5 +1,80 @@
 # Changelog
 
+## v0.4.6a1
+
+Release-hygiene repair over v0.4.6a0. No new features. Splits the
+test gate into fast vs. broad, fixes nested-venv waste, implements
+real Docker network enforcement tests, and aligns CI with the local
+gate model.
+
+### Fixed
+- `scripts/test_core.sh`: now a **fast curated gate** (~250 tests,
+  ~30s) covering the historically-regressing failure classes —
+  orchestrator runtime spine, anti-regression static AST checks
+  (missing-self / unreachable-code), routing, REPL, cache, scoring,
+  signers, deterministic check, math verifier, format enforcer,
+  trajectory store. Env-aware: reuses an active `VIRTUAL_ENV` instead
+  of creating a nested `.venv-core`, eliminating double venv/install
+  overhead when called from `release_gate.sh core` or
+  `test_zip_release.sh`.
+- `scripts/test_local.sh` (new): the **broad local gate** (~1000+
+  core-marker tests, ~70s) — the former `test_core.sh` behavior, now
+  the pre-release confidence gate.
+- `scripts/release_gate.sh`: `phase_core` now calls
+  `bash scripts/test_core.sh` which detects the active venv and
+  reuses it — no more nested venv creation.
+- `tests/test_static_missing_self_methods.py` and
+  `tests/test_static_unreachable_code.py`: fixed latent `.venv*`
+  exclusion bug. Both static checks only excluded `.venv` and
+  `.venv-core` by exact name, so per-profile venvs (`.venv-local`,
+  `.venv-docker`, etc.) caused 551 false positives from third-party
+  packages. Added a `.venv*` prefix guard (`_is_excluded_part`).
+- `.gitignore`: added `.venv-local/` and `.venv-*/` glob to match
+  the per-profile venv naming convention.
+- `README.md`: version bump `v0.4.6a0` → `v0.4.6a1` (matches
+  `pyproject.toml`). Stale "Full suite (509 tests)" testing section
+  replaced with the current fast-core / broad-local / full-suite
+  gate model.
+- `AGENTS.md`: stale "Full suite: `python3 -m pytest -q` (~1173
+  tests)" replaced with the current three-gate model.
+- `scripts/build_clean_zip.py`: updated stale comments referencing
+  `test_core.sh` marker filter (now `test_local.sh` owns the broad
+  filter; `test_core.sh` is the fast curated subset).
+- `.github/workflows/test.yml`: now calls `bash scripts/test_core.sh`
+  instead of bare `pytest -q` — same gate as local dev and release.
+- `.github/workflows/core.yml`: now calls `bash scripts/test_core.sh`
+  instead of the broad marker-selected pytest directly.
+- `.github/workflows/optional.yml`: added `sandbox` extra install
+  and a dedicated `sandbox` job that builds the sandbox image and
+  runs `bash scripts/test_docker.sh` (real Docker enforcement).
+  The `optional` job no longer includes `sandbox` in its marker
+  filter (those tests need Docker + the sandbox extra).
+
+### Added
+- `tests/test_sandbox_network_enforcement.py`: replaced 6 stub
+  Docker enforcement tests (always skipped with "requires real
+  enforced-gateway Docker fixture") with **real tests** that run
+  hardened containers against the live Docker daemon:
+  - `--network none` (DISABLED mode): verifies containers cannot
+    connect to 1.1.1.1 (internet), 169.254.169.254 (cloud metadata),
+    or 192.168.1.1 (host LAN).
+  - `--internal` network (ENFORCED_GATEWAY mode): verifies
+    containers cannot reach 1.1.1.1, metadata service, or 10.0.0.1.
+  All 6 pass against a real Docker daemon.
+
+### Verified end-to-end (macOS, cargo + Docker daemon)
+- `release_gate.sh all`: PASS (build + install-smoke + fast core)
+- `check_ruvllm.sh`: PASSED (inference-metal build,
+  `SUPPORTS_INFERENCE=True`)
+- `test_docker.sh`: 6 passed (real Docker network enforcement)
+- `test_local.sh`: 1021 passed, 45 skipped in 68s
+- `ruff check .`: clean
+
+### Still experimental
+- Enforced sandbox gateway egress (`NetworkMode.ENFORCED_GATEWAY`).
+- RuvLLM (Rust inference engine — default build is stub).
+- Distributed federation (Redis-backed HA).
+
 ## v0.4.6a0
 
 Stabilization-only release. No new features. Release-engineering
