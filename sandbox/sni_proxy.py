@@ -280,8 +280,17 @@ class SNIEgressProxy:
     """Async SNI-aware egress proxy.
 
     Listens for CONNECT requests (HTTPS) and plain HTTP requests.
-    For CONNECT: reads the SNI from the TLS ClientHello and checks it
-    against the allow-list. For HTTP: reads the Host header.
+    For CONNECT: checks the CONNECT target host AND port against the
+    allow-list, connects upstream, sends 200, then peeks at the TLS
+    ClientHello SNI for defense-in-depth spoofing detection. For HTTP:
+    reads the Host header and checks host AND port against the allow-list.
+
+    Port enforcement: when an allow-list entry specifies a port (e.g.
+    ``pypi.org:443``), only that port is allowed for that host. When
+    no port is specified (e.g. ``pypi.org``), all ports are allowed
+    (backward compat). This is tracked via ``allowed_ports``: a dict
+    mapping hostname → set of allowed ports. An empty set or absent
+    key means "all ports allowed".
 
     Allowed connections are tunneled to the destination. Denied
     connections are closed immediately.
@@ -292,6 +301,7 @@ class SNIEgressProxy:
         allowed_domains: Set[str],
         allowed_wildcards: Set[str],
         allowed_ips: Set[str] = None,
+        allowed_ports: Optional[Dict[str, Set[int]]] = None,
         port: int = 8888,
         host: str = "127.0.0.1",
         dns_resolver: Optional[str] = None,
@@ -302,6 +312,9 @@ class SNIEgressProxy:
         self.allowed_domains = allowed_domains
         self.allowed_wildcards = allowed_wildcards
         self.allowed_ips = allowed_ips or set()
+        # Port restrictions: hostname → set of allowed ports.
+        # Empty set or absent key = all ports allowed (no restriction).
+        self.allowed_ports = allowed_ports or {}
         self.port = port
         self.host = host
         self.dns_resolver = dns_resolver
@@ -314,6 +327,21 @@ class SNIEgressProxy:
             window=dns_rate_window,
             log=dns_audit,
         )
+
+    def _is_port_allowed(self, host: str, port: int) -> bool:
+        """Check if a port is allowed for a host.
+
+        If the host has no port restrictions in allowed_ports (or the
+        key is absent), all ports are allowed (backward compat with
+        allow-list entries that don't specify a port). If the host has
+        a port restriction set, the port must be in that set.
+        """
+        host = host.lower().strip()
+        ports = self.allowed_ports.get(host)
+        if not ports:
+            # No port restriction for this host — all ports allowed.
+            return True
+        return port in ports
 
     async def _resolve_host(self, host: str) -> Optional[str]:
         """Resolve a hostname with audit logging + rate limiting.
@@ -436,6 +464,20 @@ class SNIEgressProxy:
             await client_writer.drain()
             return
 
+        # Check the CONNECT target port against the allow-list. If the
+        # allow-list entry for this host specifies ports (e.g.
+        # pypi.org:443), only those ports are allowed. An allow-list
+        # entry without a port (e.g. pypi.org) allows all ports.
+        try:
+            port_num = int(port)
+        except ValueError:
+            port_num = 443
+        if not self._is_port_allowed(host, port_num):
+            self._denied_count += 1
+            client_writer.write(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+            await client_writer.drain()
+            return
+
         # Read and discard headers until empty line.
         while True:
             header = await asyncio.wait_for(
@@ -514,11 +556,16 @@ class SNIEgressProxy:
     ):
         """Handle a plain HTTP request.
 
-        Extract the Host header and check it against the allow-list.
+        Extract the Host header and check the host AND port against
+        the allow-list. The port is taken from the Host header (or
+        defaults to 80 if not specified). If the allow-list entry for
+        this host specifies ports (e.g. example.com:80), only those
+        ports are allowed for plain HTTP.
         """
         # Read headers to find Host.
         headers = ""
         host = None
+        host_port = None  # port from Host header (if specified)
         while True:
             header = await asyncio.wait_for(
                 client_reader.readline(), timeout=5.0
@@ -528,9 +575,14 @@ class SNIEgressProxy:
             header_str = header.decode("ascii", errors="replace")
             headers += header_str
             if header_str.lower().startswith("host:"):
-                host = header_str.split(":", 1)[1].strip()
-                # Strip port from host.
-                host = host.split(":")[0]
+                host_value = header_str.split(":", 1)[1].strip()
+                # Preserve port from Host header for allow-list check.
+                if ":" in host_value:
+                    host, _, hport = host_value.rpartition(":")
+                    host_port = hport
+                else:
+                    host = host_value
+                    host_port = None
 
         if host and is_domain_allowed(host, self.allowed_domains, self.allowed_wildcards):
             # Forward the request to the destination.
@@ -549,6 +601,20 @@ class SNIEgressProxy:
             if not host_part:
                 host_part = target_host
                 port_part = "80"
+            # Check the port against the allow-list. The effective port
+            # is the URL port (if specified) or the Host header port
+            # (if specified) or the default 80. If the allow-list entry
+            # for this host specifies ports, the port must match.
+            try:
+                effective_port = int(port_part) if port_part else (
+                    int(host_port) if host_port else 80)
+            except ValueError:
+                effective_port = 80
+            if not self._is_port_allowed(host, effective_port):
+                self._denied_count += 1
+                client_writer.write(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+                await client_writer.drain()
+                return
             # Resolve with audit + rate limiting before connecting (Phase 1.2).
             resolved_ip = await self._resolve_host(host_part)
             if resolved_ip is None:
@@ -640,22 +706,38 @@ def main():
         al = NetworkAllowList.from_string(args.allowlist)
 
     # Extract domains and wildcards from the allow-list entries.
+    # Also extract port restrictions: when an entry has a port (e.g.
+    # pypi.org:443), only that port is allowed for that host.
     allowed_domains: Set[str] = set()
     allowed_wildcards: Set[str] = set()
     allowed_ips: Set[str] = set()
+    allowed_ports: Dict[str, Set[int]] = {}
     for entry in al.entries:
         if entry.kind == "domain":
             if entry.host.startswith("*."):
                 allowed_wildcards.add(entry.host)
             else:
                 allowed_domains.add(entry.host)
+                # Track port restrictions per-domain.
+                if entry.port is not None:
+                    host_key = entry.host.lower()
+                    if host_key not in allowed_ports:
+                        allowed_ports[host_key] = set()
+                    allowed_ports[host_key].add(entry.port)
         elif entry.kind in ("ip", "cidr"):
             allowed_ips.add(entry.raw)
+            # Track port restrictions for IP/CIDR entries too.
+            if entry.port is not None:
+                host_key = entry.host.lower()
+                if host_key not in allowed_ports:
+                    allowed_ports[host_key] = set()
+                allowed_ports[host_key].add(entry.port)
 
     proxy = SNIEgressProxy(
         allowed_domains=allowed_domains,
         allowed_wildcards=allowed_wildcards,
         allowed_ips=allowed_ips,
+        allowed_ports=allowed_ports,
         port=args.port,
         host=args.host,
         dns_resolver=args.dns_resolver or None,

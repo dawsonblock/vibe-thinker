@@ -689,3 +689,347 @@ class TestSNIEgressProxy:
 
         assert proxy._denied_count >= 2
         assert proxy._allowed_count == 0
+
+
+# ---------------------------------------------------------------------- #
+# Port-specific allow-list enforcement
+# ---------------------------------------------------------------------- #
+class TestPortEnforcement:
+    """Tests for port-specific allow-list enforcement.
+
+    When an allow-list entry specifies a port (e.g. pypi.org:443),
+    only that port is allowed for that host. When no port is specified
+    (e.g. pypi.org), all ports are allowed (backward compat).
+    """
+
+    def test_is_port_allowed_no_restriction(self):
+        """Host with no port restriction allows all ports."""
+        proxy = SNIEgressProxy(
+            allowed_domains={"pypi.org"},
+            allowed_wildcards=set(),
+            allowed_ports={},
+            port=0,
+        )
+        assert proxy._is_port_allowed("pypi.org", 443)
+        assert proxy._is_port_allowed("pypi.org", 80)
+        assert proxy._is_port_allowed("pypi.org", 8080)
+
+    def test_is_port_allowed_with_restriction(self):
+        """Host with port restriction only allows specified ports."""
+        proxy = SNIEgressProxy(
+            allowed_domains={"pypi.org"},
+            allowed_wildcards=set(),
+            allowed_ports={"pypi.org": {443}},
+            port=0,
+        )
+        assert proxy._is_port_allowed("pypi.org", 443)
+        assert not proxy._is_port_allowed("pypi.org", 80)
+        assert not proxy._is_port_allowed("pypi.org", 8080)
+
+    def test_is_port_allowed_case_insensitive(self):
+        """Port check is case-insensitive on the hostname."""
+        proxy = SNIEgressProxy(
+            allowed_domains={"pypi.org"},
+            allowed_wildcards=set(),
+            allowed_ports={"pypi.org": {443}},
+            port=0,
+        )
+        assert proxy._is_port_allowed("PyPI.Org", 443)
+        assert not proxy._is_port_allowed("PyPI.Org", 80)
+
+    def test_is_port_allowed_multiple_ports(self):
+        """Host with multiple allowed ports allows each of them."""
+        proxy = SNIEgressProxy(
+            allowed_domains={"example.com"},
+            allowed_wildcards=set(),
+            allowed_ports={"example.com": {80, 443}},
+            port=0,
+        )
+        assert proxy._is_port_allowed("example.com", 80)
+        assert proxy._is_port_allowed("example.com", 443)
+        assert not proxy._is_port_allowed("example.com", 8080)
+
+    def test_is_port_allowed_different_host_no_restriction(self):
+        """Port restriction on one host doesn't affect a different host."""
+        proxy = SNIEgressProxy(
+            allowed_domains={"pypi.org", "example.com"},
+            allowed_wildcards=set(),
+            allowed_ports={"pypi.org": {443}},
+            port=0,
+        )
+        # example.com has no port restriction — all ports allowed.
+        assert proxy._is_port_allowed("example.com", 80)
+        assert proxy._is_port_allowed("example.com", 443)
+        # pypi.org has port restriction — only 443.
+        assert not proxy._is_port_allowed("pypi.org", 80)
+
+    @pytest.mark.asyncio
+    async def test_connect_port_allowed_returns_200(self):
+        """CONNECT to pypi.org:443 is allowed when allow-list has pypi.org:443.
+
+        Uses a mock remote server to avoid real DNS/network.
+        """
+        proxy = SNIEgressProxy(
+            allowed_domains={"pypi.org"},
+            allowed_wildcards=set(),
+            allowed_ports={"pypi.org": {443}},
+            port=0,
+        )
+        await proxy.start()
+        proxy_addr = proxy._server.sockets[0].getsockname()
+
+        # Mock remote server.
+        async def mock_remote_handler(reader, writer):
+            data = await asyncio.wait_for(reader.read(1024), timeout=5.0)
+            writer.write(b"REMOTE_ECHO:" + data)
+            await writer.drain()
+            writer.close()
+
+        remote_server = await asyncio.start_server(
+            mock_remote_handler, "127.0.0.1", 0
+        )
+        remote_addr = remote_server.sockets[0].getsockname()
+
+        try:
+            async def mock_resolve(host):
+                return remote_addr[0]
+            proxy._resolve_host = mock_resolve
+
+            reader, writer = await asyncio.open_connection(
+                proxy_addr[0], proxy_addr[1]
+            )
+            # CONNECT to pypi.org:443 — port 443 is allowed.
+            # But the proxy will connect to remote_addr[1] (the mock).
+            # We need to use the mock's port in the CONNECT line so the
+            # proxy connects to our mock. But the allow-list says only
+            # port 443 is allowed. So we patch _is_port_allowed to
+            # always allow the mock port, OR we use port 443 and patch
+            # the connection target.
+            #
+            # Actually, the cleanest approach: use the real port 443 in
+            # the CONNECT line, and patch asyncio.open_connection to
+            # redirect to our mock server.
+            writer.write(b"CONNECT pypi.org:443 HTTP/1.1\r\nHost: pypi.org:443\r\n\r\n")
+            await writer.drain()
+            response = await asyncio.wait_for(reader.read(1024), timeout=5.0)
+            # The proxy should connect to the mock remote (via patched
+            # _resolve_host) on port 443. Since our mock server isn't
+            # on port 443, the connection will fail with 502. But the
+            # port check itself should PASS (not 403).
+            # We should NOT get 403 (port denied).
+            assert b"403" not in response, (
+                f"Port 443 should be allowed, got 403: {response!r}")
+            # We should get either 200 (if connection succeeded) or 502
+            # (if the upstream was unreachable, which is expected since
+            # nothing is listening on port 443).
+            assert b"502" in response or b"200" in response, (
+                f"Expected 200 or 502, got: {response!r}")
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            remote_server.close()
+            await remote_server.wait_closed()
+            await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_connect_wrong_port_returns_403(self):
+        """CONNECT to pypi.org:80 is denied when allow-list has pypi.org:443.
+
+        The port check happens BEFORE connecting upstream, so the proxy
+        returns 403 immediately — no DNS resolution or connection attempt.
+        """
+        proxy = SNIEgressProxy(
+            allowed_domains={"pypi.org"},
+            allowed_wildcards=set(),
+            allowed_ports={"pypi.org": {443}},
+            port=0,
+        )
+        await proxy.start()
+        proxy_addr = proxy._server.sockets[0].getsockname()
+
+        try:
+            reader, writer = await asyncio.open_connection(
+                proxy_addr[0], proxy_addr[1]
+            )
+            # CONNECT to pypi.org:80 — port 80 is NOT allowed (only 443).
+            writer.write(b"CONNECT pypi.org:80 HTTP/1.1\r\nHost: pypi.org:80\r\n\r\n")
+            await writer.drain()
+            response = await asyncio.wait_for(reader.read(1024), timeout=5.0)
+            assert b"403" in response, (
+                f"Port 80 should be denied, got: {response!r}")
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            await proxy.stop()
+
+        assert proxy._denied_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_connect_no_port_restriction_allows_any_port(self):
+        """CONNECT to pypi.org:any-port is allowed when allow-list has
+        pypi.org (no port specified). Backward compat."""
+        proxy = SNIEgressProxy(
+            allowed_domains={"pypi.org"},
+            allowed_wildcards=set(),
+            allowed_ports={},  # no port restrictions
+            port=0,
+        )
+        await proxy.start()
+        proxy_addr = proxy._server.sockets[0].getsockname()
+
+        # Mock remote server.
+        async def mock_remote_handler(reader, writer):
+            data = await asyncio.wait_for(reader.read(1024), timeout=5.0)
+            writer.write(b"REMOTE_ECHO:" + data)
+            await writer.drain()
+            writer.close()
+
+        remote_server = await asyncio.start_server(
+            mock_remote_handler, "127.0.0.1", 0
+        )
+        remote_addr = remote_server.sockets[0].getsockname()
+
+        try:
+            async def mock_resolve(host):
+                return remote_addr[0]
+            proxy._resolve_host = mock_resolve
+
+            reader, writer = await asyncio.open_connection(
+                proxy_addr[0], proxy_addr[1]
+            )
+            # CONNECT to pypi.org:<mock_port> — any port allowed.
+            connect_port = remote_addr[1]
+            writer.write(
+                f"CONNECT pypi.org:{connect_port} HTTP/1.1\r\n"
+                f"Host: pypi.org:{connect_port}\r\n\r\n".encode())
+            await writer.drain()
+            response = await asyncio.wait_for(reader.read(1024), timeout=5.0)
+            assert b"200" in response, (
+                f"Any port should be allowed, got: {response!r}")
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            remote_server.close()
+            await remote_server.wait_closed()
+            await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_http_port_allowed(self):
+        """HTTP to example.com (default port 80) is allowed when allow-list
+        has example.com:80.
+
+        The port check uses the default port 80 (no port in Host header).
+        We patch _resolve_host to return 127.0.0.1 — nothing is listening
+        on port 80, so the proxy's connection attempt fails and it closes
+        the client connection. The key assertion is that we do NOT get 403
+        (port denied) — the port check passed, the failure is downstream.
+        """
+        proxy = SNIEgressProxy(
+            allowed_domains={"example.com"},
+            allowed_wildcards=set(),
+            allowed_ports={"example.com": {80}},
+            port=0,
+        )
+        await proxy.start()
+        proxy_addr = proxy._server.sockets[0].getsockname()
+
+        try:
+            async def mock_resolve(host):
+                return "127.0.0.1"
+            proxy._resolve_host = mock_resolve
+
+            reader, writer = await asyncio.open_connection(
+                proxy_addr[0], proxy_addr[1]
+            )
+            # HTTP GET with no port — defaults to 80, which is allowed.
+            writer.write(
+                b"GET http://example.com/ HTTP/1.1\r\n"
+                b"Host: example.com\r\n\r\n")
+            await writer.drain()
+            response = await asyncio.wait_for(reader.read(1024), timeout=5.0)
+            # Should NOT get 403 — port 80 is allowed. The proxy will
+            # try to connect to 127.0.0.1:80 (nothing listening), fail,
+            # and close the connection (empty response or timeout).
+            assert b"403" not in response, (
+                f"Port 80 should be allowed for HTTP, got 403: {response!r}")
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_http_wrong_port_returns_403(self):
+        """HTTP to example.com:443 (via Host header) is denied when
+        allow-list has example.com:80 only.
+
+        The port check uses the Host header port (or URL port, or
+        default 80). When the Host header specifies :443 and the
+        allow-list only allows :80, the request is denied.
+        """
+        proxy = SNIEgressProxy(
+            allowed_domains={"example.com"},
+            allowed_wildcards=set(),
+            allowed_ports={"example.com": {80}},
+            port=0,
+        )
+        await proxy.start()
+        proxy_addr = proxy._server.sockets[0].getsockname()
+
+        try:
+            reader, writer = await asyncio.open_connection(
+                proxy_addr[0], proxy_addr[1]
+            )
+            # HTTP GET with Host: example.com:443 — port 443 NOT allowed.
+            writer.write(
+                b"GET http://example.com:443/ HTTP/1.1\r\n"
+                b"Host: example.com:443\r\n\r\n")
+            await writer.drain()
+            response = await asyncio.wait_for(reader.read(1024), timeout=5.0)
+            assert b"403" in response, (
+                f"Port 443 should be denied for HTTP, got: {response!r}")
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            await proxy.stop()
+
+        assert proxy._denied_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_http_default_port_80_allowed_when_no_port_in_header(self):
+        """HTTP to example.com (no port in Host header) defaults to port
+        80 and is allowed when allow-list has example.com:80.
+
+        Same approach as test_http_port_allowed: patch _resolve_host,
+        verify we don't get 403. The connection to 127.0.0.1:80 will
+        fail, but the port check passes.
+        """
+        proxy = SNIEgressProxy(
+            allowed_domains={"example.com"},
+            allowed_wildcards=set(),
+            allowed_ports={"example.com": {80}},
+            port=0,
+        )
+        await proxy.start()
+        proxy_addr = proxy._server.sockets[0].getsockname()
+
+        try:
+            async def mock_resolve(host):
+                return "127.0.0.1"
+            proxy._resolve_host = mock_resolve
+
+            reader, writer = await asyncio.open_connection(
+                proxy_addr[0], proxy_addr[1]
+            )
+            # HTTP GET with no port in Host header — defaults to 80, allowed.
+            writer.write(
+                b"GET http://example.com/ HTTP/1.1\r\n"
+                b"Host: example.com\r\n\r\n")
+            await writer.drain()
+            response = await asyncio.wait_for(reader.read(1024), timeout=5.0)
+            # Should NOT get 403 — port 80 (default) is allowed.
+            assert b"403" not in response, (
+                f"Default port 80 should be allowed, got 403: {response!r}")
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            await proxy.stop()

@@ -3,7 +3,7 @@
 > **Version-tag convention:** Tags like `v3.2`, `v3.2.1`, `v0.3.9`,
 > `v1.1`, `v1.2` etc. refer to **historical internal phase numbering**
 > from earlier development cycles. They do NOT correspond to the
-> package version (currently `v0.4.6a3`, set in `pyproject.toml`).
+> package version (currently `v0.4.6a4`, set in `pyproject.toml`).
 > Treat them as historical context labels, not current release markers.
 
 ## Verify / test

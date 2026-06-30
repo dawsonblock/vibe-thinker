@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.4.6a4
+
+Port-specific egress enforcement in the SNI proxy. Addresses the
+build-31 audit verdict's remaining real issue: the SNI proxy ignored
+port restrictions in allow-list entries (e.g. `pypi.org:443` allowed
+CONNECT to `pypi.org:<any port>`).
+
+### Fixed
+- `sandbox/sni_proxy.py`: the proxy now enforces port restrictions from
+  allow-list entries. `SNIEgressProxy` accepts an `allowed_ports` dict
+  mapping hostname → set of allowed ports. When an allow-list entry
+  specifies a port (e.g. `pypi.org:443`), only that port is allowed for
+  that host. When no port is specified (e.g. `pypi.org`), all ports are
+  allowed (backward compat). The port check is applied in both
+  `_handle_connect` (CONNECT target port) and `_handle_http` (Host
+  header port or URL port, defaulting to 80). `main()` extracts port
+  info from `AllowListEntry.port` and passes it to the proxy.
+- `CHANGELOG.md`: fixed wording drift in the v0.4.6a3 section — said
+  AGENTS.md was fixed to `v0.4.6a2` but the package was already
+  `v0.4.6a3` at the time of that build.
+
+### Added
+- `tests/test_sni_proxy.py` `TestPortEnforcement`: 11 new tests for
+  port-specific enforcement:
+  - Unit tests for `_is_port_allowed`: no restriction (all ports),
+    with restriction (only specified port), case-insensitive host,
+    multiple ports, different host isolation.
+  - Integration tests: CONNECT to allowed port (not 403), CONNECT to
+    wrong port (403), CONNECT with no port restriction (200), HTTP
+    to allowed port 80 (not 403), HTTP to wrong port 443 (403),
+    HTTP default port 80 with no port in Host header (not 403).
+
 ## v0.4.6a3
 
 CONNECT proxy fix + gateway hardening + real HTTPS/DockerSandboxExecutor
@@ -27,7 +59,7 @@ integration tests. Addresses the build-28/build-29 audit verdict.
   gateway is a network-facing security boundary component and must be
   hardened accordingly.
 - `AGENTS.md`: fixed stale "currently `v0.4.6a1`" reference →
-  `v0.4.6a2` (the package version in `pyproject.toml`).
+  `v0.4.6a3` (the package version in `pyproject.toml`).
 
 ### Added
 - `tests/test_sni_proxy.py`: 4 new tests for the corrected CONNECT

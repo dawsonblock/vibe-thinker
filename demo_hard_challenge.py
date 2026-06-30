@@ -590,7 +590,7 @@ async def run_demo(verbose: bool, only_stage: Optional[int] = None) -> int:
     print(_c(Colors.BOLD, "  ═══════════════════════════════════════════════════════════"))
     print(_c(Colors.BOLD, "  Summary"))
     print(_c(Colors.BOLD, "  ═══════════════════════════════════════════════════════════"))
-    for num, title, passed, summary in results:
+    for num, title, passed, _summary in results:
         status = _c(Colors.GREEN, "PASS") if passed else _c(Colors.RED, "FAIL")
         print(f"    Stage {num} ({title}): [{status}]")
     print()
