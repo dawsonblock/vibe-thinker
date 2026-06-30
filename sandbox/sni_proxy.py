@@ -10,10 +10,13 @@ Architecture:
   1. The proxy runs on the host (or as a sidecar container).
   2. The sandbox container routes all traffic through the proxy via
      HTTP_PROXY / HTTPS_PROXY env vars or iptables REDIRECT.
-  3. For HTTPS: the proxy reads the SNI from the TLS ClientHello and
-     checks it against the allow-list. If allowed, it tunnels the
-     connection to the resolved IP (CONNECT proxy). If denied, it
-     closes the connection.
+  3. For HTTPS (CONNECT): the proxy checks the CONNECT target host
+     against the allow-list (the authoritative destination). If
+     allowed, it connects to the resolved IP, sends '200 Connection
+     Established', and tunnels bidirectionally. After tunneling begins,
+     it peeks at the TLS ClientHello to extract the SNI and verifies it
+     matches the CONNECT target (defense-in-depth against SNI spoofing).
+     If denied, it returns 403.
   4. For HTTP: the proxy reads the Host header and checks it against
      the allow-list.
 
@@ -66,6 +69,15 @@ from dataclasses import dataclass, field
 # ---------------------------------------------------------------------------
 # SNI extraction
 # ---------------------------------------------------------------------------
+
+def _is_ip_literal(host: str) -> bool:
+    """Return True if `host` is an IP literal (v4 or v6), not a hostname."""
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
 
 def extract_sni(client_hello: bytes) -> Optional[str]:
     """Extract the Server Name Indication (SNI) from a TLS ClientHello.
@@ -385,7 +397,22 @@ class SNIEgressProxy:
 
         CONNECT host:port HTTP/1.1
         <headers>
-        <TLS ClientHello with SNI>
+
+        The allow decision is based on the CONNECT target host (the
+        authoritative destination the client requests). This is standard
+        CONNECT proxy behavior: the client tells the proxy where it wants
+        to go, the proxy checks the allow-list, connects to the remote,
+        sends '200 Connection Established', and tunnels bidirectionally.
+
+        Standard HTTPS clients wait for the 200 response BEFORE sending
+        the TLS ClientHello — so we must NOT try to read the ClientHello
+        before sending 200 (the previous implementation did this, which
+        broke standard clients and incorrectly wrote the ClientHello
+        back to the client). After sending 200, we peek at the first
+        client bytes (the ClientHello) to extract the SNI and verify it
+        matches the CONNECT target host (defense-in-depth against SNI
+        spoofing). If the SNI is present and does NOT match, the
+        connection is closed.
         """
         # Parse the target from the CONNECT line.
         # CONNECT pypi.org:443 HTTP/1.1
@@ -400,6 +427,15 @@ class SNIEgressProxy:
             host = target
             port = "443"
 
+        # Check the CONNECT target host against the allow-list. This is
+        # the primary allow decision — the CONNECT target is the
+        # authoritative destination, available before the ClientHello.
+        if not is_domain_allowed(host, self.allowed_domains, self.allowed_wildcards):
+            self._denied_count += 1
+            client_writer.write(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+            await client_writer.drain()
+            return
+
         # Read and discard headers until empty line.
         while True:
             header = await asyncio.wait_for(
@@ -408,51 +444,67 @@ class SNIEgressProxy:
             if header in (b"\r\n", b"\n", b""):
                 break
 
-        # Read the TLS ClientHello to extract SNI.
-        try:
-            client_hello = await asyncio.wait_for(
-                client_reader.read(4096), timeout=5.0
-            )
-        except asyncio.TimeoutError:
-            client_writer.close()
-            self._denied_count += 1
-            return
-
-        sni = extract_sni(client_hello)
-        if sni and is_domain_allowed(sni, self.allowed_domains, self.allowed_wildcards):
-            # Allowed by the allow-list — now resolve with audit + rate
-            # limiting before tunneling (Phase 1.2).
-            resolved_ip = await self._resolve_host(host)
-            if resolved_ip is None:
-                # Resolution denied/failed — fail-closed.
-                self._denied_count += 1
-                client_writer.write(b"HTTP/1.1 403 Forbidden\r\n\r\n")
-                await client_writer.drain()
-                return
-            self._allowed_count += 1
-            try:
-                # Send 200 Connection Established to the client.
-                client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                await client_writer.drain()
-                # Forward the ClientHello we already read.
-                client_writer.write(client_hello)
-                await client_writer.drain()
-                # Connect to the real destination (resolved IP).
-                remote_reader, remote_writer = await asyncio.open_connection(
-                    resolved_ip, int(port)
-                )
-                remote_writer.write(client_hello)
-                await remote_writer.drain()
-                # Tunnel bidirectionally.
-                await self._tunnel(client_reader, client_writer,
-                                   remote_reader, remote_writer)
-            except (ConnectionError, OSError, asyncio.TimeoutError):
-                pass
-        else:
-            # Denied — SNI not in allow-list or no SNI.
+        # Resolve with audit + rate limiting before connecting (Phase 1.2).
+        resolved_ip = await self._resolve_host(host)
+        if resolved_ip is None:
+            # Resolution denied/failed — fail-closed.
             self._denied_count += 1
             client_writer.write(b"HTTP/1.1 403 Forbidden\r\n\r\n")
             await client_writer.drain()
+            return
+
+        self._allowed_count += 1
+        try:
+            # Connect to the real destination (resolved IP) FIRST, before
+            # telling the client the tunnel is established. This way, if
+            # the upstream is unreachable, we return 502 instead of 200.
+            remote_reader, remote_writer = await asyncio.open_connection(
+                resolved_ip, int(port)
+            )
+        except (ConnectionError, OSError, asyncio.TimeoutError):
+            client_writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+            await client_writer.drain()
+            return
+
+        # Send 200 Connection Established to the client. Standard HTTPS
+        # clients wait for this BEFORE sending the TLS ClientHello.
+        client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        await client_writer.drain()
+
+        # Defense-in-depth: peek at the first bytes from the client (the
+        # TLS ClientHello) to extract the SNI and verify it matches the
+        # CONNECT target host. If the SNI is present and does NOT match,
+        # close the connection (SNI spoofing attempt). If SNI is absent
+        # or extraction fails, the tunnel proceeds — the CONNECT target
+        # check above is the primary decision. Skip the SNI check when
+        # the CONNECT target is an IP literal (no hostname to compare).
+        skip_sni_check = _is_ip_literal(host)
+        if not skip_sni_check:
+            try:
+                first_bytes = await asyncio.wait_for(
+                    client_reader.read(4096), timeout=5.0
+                )
+            except (asyncio.TimeoutError, ConnectionError, OSError):
+                remote_writer.close()
+                client_writer.close()
+                return
+            if not first_bytes:
+                # Client closed the connection immediately.
+                remote_writer.close()
+                return
+            sni = extract_sni(first_bytes)
+            if sni and sni.lower() != host.lower():
+                # SNI mismatch — likely SNI spoofing. Close both sides.
+                remote_writer.close()
+                client_writer.close()
+                return
+            # Forward the peeked bytes to the remote server.
+            remote_writer.write(first_bytes)
+            await remote_writer.drain()
+
+        # Tunnel bidirectionally.
+        await self._tunnel(client_reader, client_writer,
+                           remote_reader, remote_writer)
 
     async def _handle_http(
         self,

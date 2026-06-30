@@ -257,6 +257,92 @@ class TestDockerSandboxNetworkModeWiring:
             == NetworkMode.BEST_EFFORT_PROXY
         )
 
+    def test_gateway_container_uses_hardening_flags(self):
+        """The gateway container must be started with the same hardening
+        flags as the sandbox container: --read-only, --cap-drop ALL,
+        --security-opt no-new-privileges, --user, --pids-limit,
+        --memory, --tmpfs. The gateway is a network-facing security
+        boundary component and must be hardened accordingly.
+        """
+        from sandbox.docker_executor import DockerSandboxExecutor
+        from sandbox.network_allowlist import NetworkAllowList
+        allowlist = NetworkAllowList.from_string("pypi.org:443")
+        executor = DockerSandboxExecutor(
+            network_mode=NetworkMode.ENFORCED_GATEWAY,
+            allowlist=allowlist,
+        )
+        captured_cmds = []
+
+        async def _run():
+            # Mock all subprocess calls. The calls in order are:
+            # 1. network inspect (wait) → success (network exists)
+            # 2. gateway docker run (communicate) → success
+            # 3. network connect (communicate) → success
+            # 4. inspect gateway IP (communicate) → fake IP
+            # 5. docker logs (communicate) → "Listening on" message
+            # 6. sandbox docker run (communicate) → output
+            call_count = [0]
+
+            async def mock_communicate():
+                call_count[0] += 1
+                # communicate() is called by gateway run, connect, inspect, logs, sandbox
+                # Map by communicate call index.
+                if call_count[0] == 1:
+                    # gateway docker run → success
+                    return (b"container_id\n", b"")
+                if call_count[0] == 2:
+                    # network connect → success
+                    return (b"", b"")
+                if call_count[0] == 3:
+                    # inspect gateway IP → return a fake IP
+                    return (b"10.0.0.2\n", b"")
+                if call_count[0] == 4:
+                    # docker logs → "Listening on" message
+                    return (b"[SNIProxy] Listening on 0.0.0.0:8888\n", b"")
+                # sandbox run
+                return (b"hi\n", b"")
+
+            async def mock_wait():
+                return 0
+
+            mock_proc = MagicMock()
+            mock_proc.returncode = 0
+            mock_proc.communicate = mock_communicate
+            mock_proc.wait = mock_wait
+
+            with patch("asyncio.create_subprocess_exec",
+                       return_value=mock_proc) as mock_exec:
+                await executor.execute("print('hi')", timeout=5.0)
+                for call in mock_exec.call_args_list:
+                    captured_cmds.append(list(call[0]))
+
+        import asyncio
+        asyncio.run(_run())
+        # Find the gateway docker run command (contains "run", "-d",
+        # and "sni_proxy").
+        gw_cmd = None
+        for cmd in captured_cmds:
+            if "run" in cmd and "-d" in cmd and "sni_proxy" in " ".join(cmd):
+                gw_cmd = cmd
+                break
+        assert gw_cmd is not None, (
+            f"Gateway docker run command not found in: {captured_cmds}"
+        )
+        # Verify hardening flags are present.
+        assert "--read-only" in gw_cmd, "Gateway must use --read-only"
+        assert "--cap-drop" in gw_cmd, "Gateway must use --cap-drop"
+        cap_idx = gw_cmd.index("--cap-drop")
+        assert gw_cmd[cap_idx + 1] == "ALL", "Gateway must cap-drop ALL"
+        assert "--security-opt" in gw_cmd, "Gateway must use --security-opt"
+        sec_idx = gw_cmd.index("--security-opt")
+        assert gw_cmd[sec_idx + 1] == "no-new-privileges"
+        assert "--user" in gw_cmd, "Gateway must use --user"
+        user_idx = gw_cmd.index("--user")
+        assert gw_cmd[user_idx + 1] == "1000:1000"
+        assert "--pids-limit" in gw_cmd, "Gateway must use --pids-limit"
+        assert "--memory" in gw_cmd, "Gateway must use --memory"
+        assert "--tmpfs" in gw_cmd, "Gateway must use --tmpfs"
+
 
 class TestBlockedIpRanges:
     """Document the IP ranges that must be blocked from sandbox candidates.
@@ -639,6 +725,13 @@ class TestGatewayEgressEnforcement:
             "--name", gw_name,
             "--network", "bridge",
             "--restart", "no",
+            "--read-only",
+            "--cap-drop", "ALL",
+            "--security-opt", "no-new-privileges",
+            "--user", "1000:1000",
+            "--pids-limit", "64",
+            "--memory", "128m",
+            "--tmpfs", "/tmp:rw,size=10m",
             "-v", f"{sandbox_dir}/sandbox:/app/sandbox:ro",
             "-w", "/app",
             "python:3.12-slim",
@@ -829,3 +922,235 @@ class TestGatewayEgressEnforcement:
         finally:
             self._stop_gateway()
             self._cleanup_network(net)
+
+    @pytest.mark.skipif(
+        not _has_docker(),
+        reason="requires Docker",
+    )
+    def test_gateway_allows_https_allowlisted_domain(self):
+        """An allowlisted HTTPS domain can be reached THROUGH the gateway proxy.
+
+        This is the real HTTPS test: the sandbox container does
+        ``urllib.request.urlopen('https://example.com')`` through the
+        gateway. The CONNECT proxy must correctly handle the HTTPS
+        tunnel: check the CONNECT target (example.com) against the
+        allow-list, connect to the upstream, send 200, and tunnel the
+        TLS handshake + data bidirectionally.
+        """
+        if not self._docker_available():
+            pytest.skip("Docker daemon not running")
+        net = "vibe-test-gw-net"
+        if not self._create_internal_network(net):
+            pytest.skip("could not create --internal network")
+        gw_ip = self._start_gateway(net, "example.com:80,example.com:443")
+        if gw_ip is None:
+            self._cleanup_network(net)
+            pytest.skip("could not start gateway container")
+        try:
+            script = (
+                "import urllib.request, ssl\n"
+                "try:\n"
+                "    ctx = ssl.create_default_context()\n"
+                "    req = urllib.request.urlopen('https://example.com', timeout=15, context=ctx)\n"
+                "    print(f'STATUS:{req.status}')\n"
+                "except Exception as e:\n"
+                "    print(f'FAILED:{type(e).__name__}:{e}')\n"
+            )
+            env = {
+                "HTTP_PROXY": f"http://{gw_ip}:8888",
+                "HTTPS_PROXY": f"http://{gw_ip}:8888",
+                "http_proxy": f"http://{gw_ip}:8888",
+                "https_proxy": f"http://{gw_ip}:8888",
+                "NO_PROXY": "localhost,127.0.0.1",
+            }
+            rc, out, err = self._run_container_with_env(net, script, env, timeout=45)
+            assert "STATUS:200" in out, (
+                f"Allowlisted HTTPS domain should be reachable through gateway, "
+                f"but got: {out!r} (stderr: {err!r})"
+            )
+        finally:
+            self._stop_gateway()
+            self._cleanup_network(net)
+
+
+@pytest.mark.sandbox
+@pytest.mark.integration
+@pytest.mark.requires_docker_gateway
+class TestDockerSandboxExecutorGatewayIntegration:
+    """End-to-end tests using DockerSandboxExecutor.execute() with
+    NetworkMode.ENFORCED_GATEWAY.
+
+    Unlike TestGatewayEgressEnforcement (which manually starts a gateway
+    helper), these tests use the real DockerSandboxExecutor.execute()
+    method — the exact production path:
+
+        DockerSandboxExecutor.execute()
+        → _ensure_gateway_network()
+        → _start_gateway()
+        → connect gateway to internal network
+        → inject HTTP_PROXY/HTTPS_PROXY
+        → run sandbox container
+        → cleanup gateway
+
+    SKIPPED when Docker is not available.
+    """
+
+    @staticmethod
+    def _docker_available() -> bool:
+        if not _has_docker():
+            return False
+        import subprocess
+        try:
+            r = subprocess.run(
+                ["docker", "info"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    @staticmethod
+    def _cleanup_gateway_network() -> None:
+        """Remove any leftover gateway network from prior runs."""
+        import subprocess
+        for name in ("vibe-thinker-gateway-net",):
+            subprocess.run(["docker", "network", "rm", name],
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=10)
+
+    @pytest.mark.skipif(
+        not _has_docker(),
+        reason="requires Docker",
+    )
+    @pytest.mark.asyncio
+    async def test_executor_enforced_gateway_allows_allowlisted_http(self):
+        """DockerSandboxExecutor.execute() with ENFORCED_GATEWAY allows
+        an HTTP request to an allowlisted domain through the gateway.
+
+        This exercises the full production path: the executor creates the
+        internal network, starts the gateway container, connects it,
+        injects proxy env vars, runs the sandbox, and cleans up.
+        """
+        if not self._docker_available():
+            pytest.skip("Docker daemon not running")
+        from sandbox.docker_executor import DockerSandboxExecutor
+        from sandbox.network_allowlist import NetworkAllowList
+
+        self._cleanup_gateway_network()
+        allowlist = NetworkAllowList.from_string("example.com:80,example.com:443")
+        executor = DockerSandboxExecutor(
+            network_mode=NetworkMode.ENFORCED_GATEWAY,
+            allowlist=allowlist,
+            timeout=60.0,
+        )
+        try:
+            script = (
+                "import urllib.request\n"
+                "try:\n"
+                "    req = urllib.request.urlopen('http://example.com', timeout=15)\n"
+                "    print(f'STATUS:{req.status}')\n"
+                "except Exception as e:\n"
+                "    print(f'FAILED:{type(e).__name__}:{e}')\n"
+            )
+            result = await executor.execute(script, timeout=60.0)
+            assert "STATUS:200" in result.stdout, (
+                f"Allowlisted HTTP domain should be reachable through "
+                f"gateway via DockerSandboxExecutor.execute(), but got: "
+                f"stdout={result.stdout!r}, stderr={result.stderr!r}, "
+                f"evidence={result.evidence}"
+            )
+            # Verify the executor recorded the gateway evidence.
+            assert result.evidence.get("enforced") is True
+            assert result.evidence.get("network_mode") == "enforced_gateway"
+        finally:
+            await executor.cleanup()
+            self._cleanup_gateway_network()
+
+    @pytest.mark.skipif(
+        not _has_docker(),
+        reason="requires Docker",
+    )
+    @pytest.mark.asyncio
+    async def test_executor_enforced_gateway_allows_allowlisted_https(self):
+        """DockerSandboxExecutor.execute() with ENFORCED_GATEWAY allows
+        an HTTPS request to an allowlisted domain through the gateway.
+
+        This is the real HTTPS integration test through the production
+        executor path — the CONNECT proxy must correctly tunnel the TLS
+        handshake.
+        """
+        if not self._docker_available():
+            pytest.skip("Docker daemon not running")
+        from sandbox.docker_executor import DockerSandboxExecutor
+        from sandbox.network_allowlist import NetworkAllowList
+
+        self._cleanup_gateway_network()
+        allowlist = NetworkAllowList.from_string("example.com:80,example.com:443")
+        executor = DockerSandboxExecutor(
+            network_mode=NetworkMode.ENFORCED_GATEWAY,
+            allowlist=allowlist,
+            timeout=60.0,
+        )
+        try:
+            script = (
+                "import urllib.request, ssl\n"
+                "try:\n"
+                "    ctx = ssl.create_default_context()\n"
+                "    req = urllib.request.urlopen('https://example.com', timeout=15, context=ctx)\n"
+                "    print(f'STATUS:{req.status}')\n"
+                "except Exception as e:\n"
+                "    print(f'FAILED:{type(e).__name__}:{e}')\n"
+            )
+            result = await executor.execute(script, timeout=60.0)
+            assert "STATUS:200" in result.stdout, (
+                f"Allowlisted HTTPS domain should be reachable through "
+                f"gateway via DockerSandboxExecutor.execute(), but got: "
+                f"stdout={result.stdout!r}, stderr={result.stderr!r}, "
+                f"evidence={result.evidence}"
+            )
+            assert result.evidence.get("enforced") is True
+        finally:
+            await executor.cleanup()
+            self._cleanup_gateway_network()
+
+    @pytest.mark.skipif(
+        not _has_docker(),
+        reason="requires Docker",
+    )
+    @pytest.mark.asyncio
+    async def test_executor_enforced_gateway_blocks_non_allowlisted(self):
+        """DockerSandboxExecutor.execute() with ENFORCED_GATEWAY blocks
+        a request to a non-allowlisted domain (proxy returns 403).
+        """
+        if not self._docker_available():
+            pytest.skip("Docker daemon not running")
+        from sandbox.docker_executor import DockerSandboxExecutor
+        from sandbox.network_allowlist import NetworkAllowList
+
+        self._cleanup_gateway_network()
+        # Only allow example.com — httpbin.org is NOT allowlisted.
+        allowlist = NetworkAllowList.from_string("example.com:80,example.com:443")
+        executor = DockerSandboxExecutor(
+            network_mode=NetworkMode.ENFORCED_GATEWAY,
+            allowlist=allowlist,
+            timeout=60.0,
+        )
+        try:
+            script = (
+                "import urllib.request\n"
+                "try:\n"
+                "    req = urllib.request.urlopen('http://httpbin.org/get', timeout=15)\n"
+                "    print(f'STATUS:{req.status}')\n"
+                "except Exception as e:\n"
+                "    print(f'BLOCKED:{type(e).__name__}')\n"
+            )
+            result = await executor.execute(script, timeout=60.0)
+            assert "BLOCKED" in result.stdout, (
+                f"Non-allowlisted domain should be blocked by gateway, "
+                f"but got: stdout={result.stdout!r}, stderr={result.stderr!r}"
+            )
+        finally:
+            await executor.cleanup()
+            self._cleanup_gateway_network()

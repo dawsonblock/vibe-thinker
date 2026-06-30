@@ -283,11 +283,24 @@ class DockerSandboxExecutor:
 
         try:
             # 1. Start the gateway on the default bridge (internet access).
+            #    Hardened with the same flags as the sandbox container:
+            #    read-only root, no capabilities, no new privileges,
+            #    non-root user, pids/memory limits, tmpfs for /tmp.
+            #    The gateway only needs to read the mounted sandbox/
+            #    package and bind to port 8888 (>1024, so non-root is
+            #    fine). No writes are needed beyond /tmp.
             cmd = [
                 "docker", "run", "-d",
                 "--name", self._gateway_container_name,
                 "--network", "bridge",
                 "--restart", "no",
+                "--read-only",
+                "--cap-drop", "ALL",
+                "--security-opt", "no-new-privileges",
+                "--user", "1000:1000",
+                "--pids-limit", "64",
+                "--memory", "128m",
+                "--tmpfs", "/tmp:rw,size=10m",
                 "-v", f"{sandbox_dir}:/app/sandbox:ro",
                 "-w", "/app",
                 GATEWAY_IMAGE,

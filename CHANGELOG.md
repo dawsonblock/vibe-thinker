@@ -1,5 +1,63 @@
 # Changelog
 
+## v0.4.6a3
+
+CONNECT proxy fix + gateway hardening + real HTTPS/DockerSandboxExecutor
+integration tests. Addresses the build-28/build-29 audit verdict.
+
+### Fixed
+- `sandbox/sni_proxy.py` `_handle_connect()`: rewrote CONNECT handling to
+  fix two bugs: (1) the proxy read the TLS ClientHello BEFORE sending
+  `200 Connection Established` — standard HTTPS clients wait for the 200
+  first, so the proxy would hang; (2) the proxy wrote the ClientHello
+  back to the client (incorrect). The new flow uses the CONNECT target
+  host (the authoritative destination) for the allow-list decision,
+  connects to the remote upstream FIRST, then sends `200 Connection
+  Established`, then tunnels bidirectionally. After tunneling begins, it
+  peeks at the first client bytes (the ClientHello) to extract the SNI
+  and verifies it matches the CONNECT target (defense-in-depth against
+  SNI spoofing — closes the connection on mismatch). Returns `502 Bad
+  Gateway` when the upstream is unreachable (instead of `200`). Added
+  `_is_ip_literal()` helper to skip the SNI check for IP-literal CONNECT
+  targets.
+- `sandbox/docker_executor.py` `_start_gateway()`: hardened the gateway
+  container with the same flags as the sandbox container: `--read-only`,
+  `--cap-drop ALL`, `--security-opt no-new-privileges`, `--user 1000:1000`,
+  `--pids-limit 64`, `--memory 128m`, `--tmpfs /tmp:rw,size=10m`. The
+  gateway is a network-facing security boundary component and must be
+  hardened accordingly.
+- `AGENTS.md`: fixed stale "currently `v0.4.6a1`" reference →
+  `v0.4.6a2` (the package version in `pyproject.toml`).
+
+### Added
+- `tests/test_sni_proxy.py`: 4 new tests for the corrected CONNECT
+  behavior:
+  - `test_connect_allowed_domain_no_sni_gets_200`: CONNECT to an
+    allowlisted domain with no SNI is allowed (SNI is defense-in-depth,
+    not required).
+  - `test_connect_sni_mismatch_closes_connection`: CONNECT to an
+    allowlisted domain with a mismatched SNI is closed (spoofing
+    detection).
+  - `test_connect_matching_sni_tunnels_to_remote`: CONNECT with matching
+    SNI tunnels data to the remote.
+  - `test_connect_unreachable_remote_returns_502`: CONNECT to an
+    unreachable upstream returns 502 Bad Gateway.
+  - `TestIsIpLiteral`: tests for the `_is_ip_literal()` helper.
+- `tests/test_sandbox_network_enforcement.py`: 4 new integration tests:
+  - `test_gateway_allows_https_allowlisted_domain`: real HTTPS request
+    to `https://example.com` through the gateway proxy (validates the
+    CONNECT fix with a real TLS client).
+  - `test_gateway_container_uses_hardening_flags`: wiring test that
+    verifies the gateway container is started with `--read-only`,
+    `--cap-drop ALL`, `--security-opt no-new-privileges`, `--user`,
+    `--pids-limit`, `--memory`, `--tmpfs`.
+  - `TestDockerSandboxExecutorGatewayIntegration`: 3 tests that use the
+    real `DockerSandboxExecutor.execute()` with
+    `NetworkMode.ENFORCED_GATEWAY` — the exact production path
+    (executor → _ensure_gateway_network → _start_gateway → connect
+    gateway → inject proxy env vars → run sandbox → cleanup). Tests
+    HTTP allowlisted, HTTPS allowlisted, and non-allowlisted blocked.
+
 ## v0.4.6a2
 
 Post-audit cleanup + allowlisted gateway container. The ENFORCED_GATEWAY
