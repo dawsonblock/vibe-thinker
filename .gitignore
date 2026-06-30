@@ -27,6 +27,8 @@ verified_trajectories.json
 .venv-docker/
 .venv-embeddings/
 .venv-federation/
+.venv-local/
+.venv-*/
 venv/
 env/
 .env

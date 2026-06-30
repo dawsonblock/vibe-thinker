@@ -83,17 +83,19 @@ phase_install_smoke() {
     echo "[release-gate] phase install-smoke: OK"
 }
 
-# ---- phase 3: dev/test core gate ----
+# ---- phase 3: fast dev/test core gate ----
 phase_core() {
-    echo "[release-gate] Isolated dev/test core gate"
+    echo "[release-gate] Isolated fast core gate"
     local venv
     venv="$(_make_venv)"
     # shellcheck disable=SC1091
     source "$venv/bin/activate"
     python -m pip install --upgrade pip setuptools wheel build $PIP_FLAGS
     python -m pip install -e ".[dev,test]" $PIP_FLAGS
-    # Use 'bash' prefix so this works even if the ZIP extraction lost the
-    # executable bit (some extraction tools / GitHub ZIP downloads do this).
+    # test_core.sh is env-aware: it detects the active $VIRTUAL_ENV and
+    # reuses it instead of creating a nested .venv-core, so no double
+    # venv / double install happens here. Use 'bash' prefix so this
+    # works even if the ZIP extraction lost the executable bit.
     bash scripts/test_core.sh
     deactivate
     rm -rf "$(dirname "$venv")"

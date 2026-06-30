@@ -5,7 +5,7 @@ queries between a high-precision reasoning specialist and a generalist
 model, with deterministic verifiers, bi-temporal audit logging, and an
 interactive CLI.
 
-## Current status: ALPHA (v0.4.6a0)
+## Current status: ALPHA (v0.4.6a1)
 
 **Not production-safe.** This is alpha software. See `docs/roadmap.md`
 for the stabilization plan and frozen feature scope.
@@ -100,7 +100,9 @@ vibe-thinker
 ```bash
 # Core tests — fully self-contained. Creates its own .venv-core, installs
 # -e ".[dev]" (pins pytest<9, pytest-timeout, hypothesis, ruff, mypy), then
-# runs compile + strict-markers pytest + CLI --help. No global deps assumed.
+# runs compile + doctor + smoke + a fast curated pytest subset + CLI --help.
+# No global deps assumed. ~30s. For the full ~1000+ test selection, use
+# ./scripts/test_local.sh instead (same setup, broad marker selection).
 ./scripts/test_core.sh
 
 # Optional tests — require an activated venv with the relevant extras.
@@ -133,12 +135,13 @@ Each profile is a self-contained gate that creates its own isolated venv
 (and installs its own extra) so a fresh clone passes without global deps.
 
 ```bash
-./scripts/test_core.sh        # core (no optional deps) — compile, doctor, smoke, pytest
+./scripts/test_core.sh        # fast core (no optional deps) — compile, doctor, smoke, ~250 curated tests (~30s)
+./scripts/test_local.sh       # broad local gate — full ~1000+ core-marker selection (~15 min, pre-release)
 ./scripts/test_docker.sh      # sandbox: tests marked sandbox / requires_docker_gateway
 ./scripts/test_embeddings.sh  # embeddings: numpy + sklearn + sentence-transformers + faiss
 ./scripts/test_federation.sh  # federation + web: Redis/fakeredis + FastAPI/WebSocket
 ./scripts/check_ruvllm.sh     # RuvLLM: cargo check + maturin build + import (needs Rust)
-./scripts/release_gate.sh     # full release: build wheel, clean-install smoke, core gate
+./scripts/release_gate.sh     # full release: build wheel, clean-install smoke, fast core gate
 ```
 
 The core Python gate never requires Rust. RuvLLM is opt-in: a stub build

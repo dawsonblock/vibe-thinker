@@ -51,11 +51,13 @@ import zipfile
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIST_DIR = os.path.join(PROJECT_ROOT, "dist")
 
-# Marker filter identical to scripts/test_core.sh — only core deps needed.
-# Full pytest is intentionally NOT run here: optional-subsystem tests
-# (web/federation/embeddings/sandbox/nli/logic/integration) require extra
-# dependencies and would error, not skip, when run directly from the
-# staging dir without those extras installed.
+# Marker filter identical to scripts/test_local.sh (the broad local gate)
+# — only core deps needed. scripts/test_core.sh is now the FAST gate
+# (curated subset); this build-time gate keeps the broad marker filter
+# for full pre-release coverage. Full pytest is intentionally NOT run
+# here: optional-subsystem tests (web/federation/embeddings/sandbox/nli
+# /logic/integration) require extra dependencies and would error, not
+# skip, when run directly from the staging dir without those extras.
 CORE_MARKERS = (
     "not logic and not embeddings and not federation and not web "
     "and not sandbox and not nli and not integration"
@@ -307,8 +309,8 @@ def main() -> int:
                 if d == "__pycache__":
                     shutil.rmtree(os.path.join(root, d), ignore_errors=True)
 
-        # --- Validation: core pytest gate ---
-        # Run ONLY the core marker filter (same as scripts/test_core.sh).
+        # --- Validation: broad core-marker pytest gate ---
+        # Run the broad core marker filter (same as scripts/test_local.sh).
         # No --timeout flags are used so this works with plain pytest
         # (pytest-timeout is not required). A subprocess timeout provides
         # the outer guard.

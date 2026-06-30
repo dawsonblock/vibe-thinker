@@ -43,6 +43,17 @@ _EXCLUDE_PARTS = frozenset({
     ".ruff_cache",
 })
 
+
+def _is_excluded_part(part: str) -> bool:
+    """True if a path component is not production source we want to gate.
+
+    Covers the explicit set above plus ANY ``.venv*`` directory (e.g.
+    ``.venv-local``, ``.venv-docker``, ``.venv-embeddings``,
+    ``.venv-federation``) so per-profile gate venvs created in the project
+    root are never scanned as production source.
+    """
+    return part in _EXCLUDE_PARTS or part.startswith(".venv")
+
 # Methods that are genuinely dynamic (set via setattr / injection at runtime
 # and never visible to a static scan). Add here ONLY if a flagged call is
 # legitimately supplied outside the class body. Empty by design — the current
@@ -52,7 +63,7 @@ _ALLOWLIST: frozenset[str] = frozenset()
 
 def _iter_production_files():
     for p in ROOT.rglob("*.py"):
-        if any(part in _EXCLUDE_PARTS for part in p.parts):
+        if any(_is_excluded_part(part) for part in p.parts):
             continue
         yield p
 
