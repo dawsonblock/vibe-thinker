@@ -136,7 +136,7 @@ Each profile is a self-contained gate that creates its own isolated venv
 
 ```bash
 ./scripts/test_core.sh        # fast core (no optional deps) — compile, doctor, smoke, ~250 curated tests (~30s)
-./scripts/test_local.sh       # broad local gate — full ~1000+ core-marker selection (~15 min, pre-release)
+./scripts/test_local.sh       # broad local gate — full ~1000+ core-marker selection (~70s, pre-release)
 ./scripts/test_docker.sh      # sandbox: tests marked sandbox / requires_docker_gateway
 ./scripts/test_embeddings.sh  # embeddings: numpy + sklearn + sentence-transformers + faiss
 ./scripts/test_federation.sh  # federation + web: Redis/fakeredis + FastAPI/WebSocket
