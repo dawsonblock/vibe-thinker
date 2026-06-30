@@ -36,11 +36,9 @@ from types import SimpleNamespace
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
-# Default model — Llama-3.2-3B works with the RuvLLM binding (llama arch)
-DEFAULT_MODEL = os.environ.get(
-    "VIBE_LLM_MODEL",
-    "/Users/dawsonblock/Downloads/Llama-3.2-3B-Instruct-Q5_K_M.gguf",
-)
+# Default model — Llama-3.2-3B works with the RuvLLM binding (llama arch).
+# No personal-machine path is shipped: set VIBE_LLM_MODEL or pass --model.
+DEFAULT_MODEL = os.environ.get("VIBE_LLM_MODEL", "")
 
 
 def header(title: str) -> None:
@@ -204,6 +202,11 @@ async def main():
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Path to GGUF model")
     parser.add_argument("--k", type=int, default=3, help="CLR trajectories per problem")
     args = parser.parse_args()
+
+    if not args.model:
+        parser.error(
+            "no model specified: set VIBE_LLM_MODEL or pass --model <path/to/model.gguf>"
+        )
 
     print("\n" + "=" * 70)
     print("  vibe-thinker v0.4.6a5 — Complex LLM-Powered Demo")
