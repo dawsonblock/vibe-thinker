@@ -15,7 +15,9 @@ from sandbox.sni_proxy import (
     SNIEgressProxy,
     DnsAuditor,
     _is_ip_literal,
+    extract_allowlist_sets,
 )
+from sandbox.network_allowlist import NetworkAllowList
 
 
 # ---------------------------------------------------------------------- #
@@ -1033,3 +1035,166 @@ class TestPortEnforcement:
             await writer.wait_closed()
         finally:
             await proxy.stop()
+
+
+# ---------------------------------------------------------------------- #
+# Wildcard allow-list extraction + port enforcement
+# ---------------------------------------------------------------------- #
+class TestWildcardAllowlistExtraction:
+    """Tests for wildcard allow-list extraction (extract_allowlist_sets).
+
+    Regression guard for the build-32/33 bug where ``main()`` checked
+    ``entry.host.startswith("*.")`` even though the parser already
+    strips the ``*.`` prefix and sets ``entry.wildcard=True`` with
+    ``entry.host="example.com"``. That check was never true for
+    wildcard entries, so they silently became exact-domain rules
+    (inverted semantics).
+    """
+
+    def test_wildcard_entry_goes_to_wildcards_not_domains(self):
+        """*.example.com:443 -> allowed_wildcards, NOT allowed_domains."""
+        al = NetworkAllowList.from_string("*.example.com:443")
+        domains, wildcards, ips, ports = extract_allowlist_sets(al)
+        assert wildcards == {"*.example.com"}
+        assert domains == set(), (
+            f"wildcard entry leaked into exact domains: {domains!r}")
+        assert ips == set()
+
+    def test_wildcard_port_stored_under_pattern_key(self):
+        """*.example.com:443 stores its port restriction under the
+        '*.example.com' pattern key, not under 'example.com'."""
+        al = NetworkAllowList.from_string("*.example.com:443")
+        _, _, _, ports = extract_allowlist_sets(al)
+        assert ports.get("*.example.com") == {443}
+        assert "example.com" not in ports, (
+            f"port restriction keyed under root domain: {ports!r}")
+
+    def test_exact_domain_entry_goes_to_domains(self):
+        """example.com:443 -> allowed_domains, NOT allowed_wildcards."""
+        al = NetworkAllowList.from_string("example.com:443")
+        domains, wildcards, _, ports = extract_allowlist_sets(al)
+        assert domains == {"example.com"}
+        assert wildcards == set()
+        assert ports.get("example.com") == {443}
+
+    def test_wildcard_and_exact_coexist(self):
+        """A wildcard and an exact entry don't clobber each other."""
+        al = NetworkAllowList.from_string(
+            "*.example.com:443,example.com:80")
+        domains, wildcards, _, ports = extract_allowlist_sets(al)
+        assert domains == {"example.com"}
+        assert wildcards == {"*.example.com"}
+        assert ports.get("example.com") == {80}
+        assert ports.get("*.example.com") == {443}
+
+    def test_wildcard_without_port_has_no_port_restriction(self):
+        """*.example.com (no port) -> wildcard pattern, no port entry."""
+        al = NetworkAllowList.from_string("*.example.com")
+        domains, wildcards, _, ports = extract_allowlist_sets(al)
+        assert wildcards == {"*.example.com"}
+        assert domains == set()
+        assert ports == {}
+
+
+class TestWildcardPortEnforcement:
+    """Tests for wildcard-aware port enforcement in _is_port_allowed.
+
+    These construct SNIEgressProxy with the sets that
+    extract_allowlist_sets would produce for ``*.example.com:443`` and
+    verify the four verdict scenarios:
+      - *.example.com:443 allows   foo.example.com:443
+      - *.example.com:443 rejects  foo.example.com:80
+      - *.example.com:443 rejects  example.com:443   (domain-level)
+      - example.com:443  allows   only example.com:443
+    """
+
+    def _wildcard_proxy(self):
+        return SNIEgressProxy(
+            allowed_domains=set(),
+            allowed_wildcards={"*.example.com"},
+            allowed_ports={"*.example.com": {443}},
+            port=0,
+        )
+
+    def test_wildcard_allows_subdomain_on_allowed_port(self):
+        proxy = self._wildcard_proxy()
+        assert proxy._is_port_allowed("foo.example.com", 443)
+
+    def test_wildcard_rejects_subdomain_on_wrong_port(self):
+        proxy = self._wildcard_proxy()
+        assert not proxy._is_port_allowed("foo.example.com", 80)
+
+    def test_wildcard_port_does_not_leak_to_unrelated_subdomain(self):
+        """A deeper subdomain (foo.bar.example.com) is not matched by
+        *.example.com (single-level wildcard), so no port restriction
+        applies — but the domain check would reject it anyway."""
+        proxy = self._wildcard_proxy()
+        # domain_matches("foo.bar.example.com", "*.example.com") is False,
+        # so _is_port_allowed finds no matching wildcard restriction and
+        # returns True (all ports). Domain-level rejection is handled
+        # separately by is_domain_allowed.
+        assert proxy._is_port_allowed("foo.bar.example.com", 80)
+
+    def test_wildcard_rejects_root_domain_at_domain_level(self):
+        """*.example.com:443 must NOT allow example.com:443 — the root
+        domain is not a subdomain and is not in allowed_domains."""
+        proxy = self._wildcard_proxy()
+        assert not is_domain_allowed(
+            "example.com", proxy.allowed_domains, proxy.allowed_wildcards)
+
+    def test_wildcard_allows_subdomain_at_domain_level(self):
+        """foo.example.com is matched by *.example.com at the domain level."""
+        proxy = self._wildcard_proxy()
+        assert is_domain_allowed(
+            "foo.example.com", proxy.allowed_domains, proxy.allowed_wildcards)
+
+    def test_exact_domain_only_allows_exact_domain(self):
+        """example.com:443 allows only example.com:443, not subdomains."""
+        proxy = SNIEgressProxy(
+            allowed_domains={"example.com"},
+            allowed_wildcards=set(),
+            allowed_ports={"example.com": {443}},
+            port=0,
+        )
+        assert is_domain_allowed(
+            "example.com", proxy.allowed_domains, proxy.allowed_wildcards)
+        assert proxy._is_port_allowed("example.com", 443)
+        assert not proxy._is_port_allowed("example.com", 80)
+        # Subdomain is NOT allowed at the domain level (no wildcard).
+        assert not is_domain_allowed(
+            "foo.example.com", proxy.allowed_domains, proxy.allowed_wildcards)
+
+    def test_full_extraction_pipeline_wildcard_scenarios(self):
+        """End-to-end: parse '*.example.com:443' through
+        extract_allowlist_sets into a proxy and verify all four
+        verdict scenarios in one place."""
+        al = NetworkAllowList.from_string("*.example.com:443")
+        domains, wildcards, _, ports = extract_allowlist_sets(al)
+        proxy = SNIEgressProxy(
+            allowed_domains=domains,
+            allowed_wildcards=wildcards,
+            allowed_ports=ports,
+            port=0,
+        )
+        # 1. *.example.com:443 allows foo.example.com:443
+        assert is_domain_allowed(
+            "foo.example.com", proxy.allowed_domains, proxy.allowed_wildcards)
+        assert proxy._is_port_allowed("foo.example.com", 443)
+        # 2. *.example.com:443 rejects foo.example.com:80
+        assert not proxy._is_port_allowed("foo.example.com", 80)
+        # 3. *.example.com:443 rejects example.com:443 (root not matched)
+        assert not is_domain_allowed(
+            "example.com", proxy.allowed_domains, proxy.allowed_wildcards)
+        # 4. example.com:443 still allows only example.com:443
+        al2 = NetworkAllowList.from_string("example.com:443")
+        d2, w2, _, p2 = extract_allowlist_sets(al2)
+        proxy2 = SNIEgressProxy(
+            allowed_domains=d2, allowed_wildcards=w2,
+            allowed_ports=p2, port=0,
+        )
+        assert is_domain_allowed(
+            "example.com", proxy2.allowed_domains, proxy2.allowed_wildcards)
+        assert proxy2._is_port_allowed("example.com", 443)
+        assert not proxy2._is_port_allowed("example.com", 80)
+        assert not is_domain_allowed(
+            "foo.example.com", proxy2.allowed_domains, proxy2.allowed_wildcards)

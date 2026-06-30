@@ -335,13 +335,31 @@ class SNIEgressProxy:
         key is absent), all ports are allowed (backward compat with
         allow-list entries that don't specify a port). If the host has
         a port restriction set, the port must be in that set.
+
+        Wildcard-aware: when there is no exact-host port restriction,
+        we also check any wildcard pattern (e.g. ``*.example.com``)
+        that matches the host. A wildcard entry like
+        ``*.example.com:443`` stores its port restriction under the
+        pattern key ``*.example.com``; without this lookup a request to
+        ``foo.example.com:80`` would find no exact key and be allowed,
+        defeating the port restriction.
         """
         host = host.lower().strip()
         ports = self.allowed_ports.get(host)
-        if not ports:
-            # No port restriction for this host — all ports allowed.
-            return True
-        return port in ports
+        if ports:
+            # Exact-host port restriction present — must match.
+            return port in ports
+        # No exact-host restriction — check matching wildcard patterns.
+        # A wildcard pattern may carry a port restriction that applies
+        # to all of its matching subdomains.
+        for pattern in self.allowed_wildcards:
+            if domain_matches(host, pattern):
+                ports = self.allowed_ports.get(pattern.lower())
+                if ports:
+                    return port in ports
+        # No exact key and no matching wildcard key with a restriction —
+        # all ports allowed (backward compat).
+        return True
 
     async def _resolve_host(self, host: str) -> Optional[str]:
         """Resolve a hostname with audit logging + rate limiting.
@@ -677,6 +695,58 @@ class SNIEgressProxy:
 
 
 # ---------------------------------------------------------------------------
+# Allow-list -> proxy set extraction
+# ---------------------------------------------------------------------------
+
+def extract_allowlist_sets(al) -> Tuple[Set[str], Set[str], Set[str], Dict[str, Set[int]]]:
+    """Extract SNIEgressProxy sets from a NetworkAllowList.
+
+    Returns ``(allowed_domains, allowed_wildcards, allowed_ips,
+    allowed_ports)``.
+
+    Wildcard handling: ``NetworkAllowList._parse_entry`` strips the
+    ``*.`` prefix and stores ``entry.host="example.com"`` with
+    ``entry.wildcard=True``. We reconstruct the ``*.example.com``
+    pattern for ``allowed_wildcards`` and key any port restriction
+    under that same pattern so ``_is_port_allowed`` can resolve it via
+    ``domain_matches()``. Checking ``entry.host.startswith("*.")``
+    (the old code) would NEVER be true for wildcard entries — they'd
+    silently fall into the exact-domain branch, inverting the
+    semantics (a wildcard-subdomain rule becomes a root-domain exact
+    rule). Use ``entry.wildcard`` instead.
+    """
+    allowed_domains: Set[str] = set()
+    allowed_wildcards: Set[str] = set()
+    allowed_ips: Set[str] = set()
+    allowed_ports: Dict[str, Set[int]] = {}
+    for entry in al.entries:
+        if entry.kind == "domain":
+            if entry.wildcard:
+                pattern = f"*.{entry.host}"
+                allowed_wildcards.add(pattern)
+                if entry.port is not None:
+                    pattern_key = pattern.lower()
+                    if pattern_key not in allowed_ports:
+                        allowed_ports[pattern_key] = set()
+                    allowed_ports[pattern_key].add(entry.port)
+            else:
+                allowed_domains.add(entry.host)
+                if entry.port is not None:
+                    host_key = entry.host.lower()
+                    if host_key not in allowed_ports:
+                        allowed_ports[host_key] = set()
+                    allowed_ports[host_key].add(entry.port)
+        elif entry.kind in ("ip", "cidr"):
+            allowed_ips.add(entry.raw)
+            if entry.port is not None:
+                host_key = entry.host.lower()
+                if host_key not in allowed_ports:
+                    allowed_ports[host_key] = set()
+                allowed_ports[host_key].add(entry.port)
+    return allowed_domains, allowed_wildcards, allowed_ips, allowed_ports
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
@@ -708,30 +778,9 @@ def main():
     # Extract domains and wildcards from the allow-list entries.
     # Also extract port restrictions: when an entry has a port (e.g.
     # pypi.org:443), only that port is allowed for that host.
-    allowed_domains: Set[str] = set()
-    allowed_wildcards: Set[str] = set()
-    allowed_ips: Set[str] = set()
-    allowed_ports: Dict[str, Set[int]] = {}
-    for entry in al.entries:
-        if entry.kind == "domain":
-            if entry.host.startswith("*."):
-                allowed_wildcards.add(entry.host)
-            else:
-                allowed_domains.add(entry.host)
-                # Track port restrictions per-domain.
-                if entry.port is not None:
-                    host_key = entry.host.lower()
-                    if host_key not in allowed_ports:
-                        allowed_ports[host_key] = set()
-                    allowed_ports[host_key].add(entry.port)
-        elif entry.kind in ("ip", "cidr"):
-            allowed_ips.add(entry.raw)
-            # Track port restrictions for IP/CIDR entries too.
-            if entry.port is not None:
-                host_key = entry.host.lower()
-                if host_key not in allowed_ports:
-                    allowed_ports[host_key] = set()
-                allowed_ports[host_key].add(entry.port)
+    allowed_domains, allowed_wildcards, allowed_ips, allowed_ports = (
+        extract_allowlist_sets(al)
+    )
 
     proxy = SNIEgressProxy(
         allowed_domains=allowed_domains,

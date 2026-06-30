@@ -18,6 +18,7 @@ def _has_module(name: str) -> bool:
 
 
 _FASTAPI_AVAILABLE = _has_module("fastapi")
+_CRYPTOGRAPHY_AVAILABLE = _has_module("cryptography")
 
 pytestmark = [
     pytest.mark.web,
@@ -179,8 +180,78 @@ class TestSonaOrchestratorSync:
         assert result["status"] == "disabled"
 
 
+class TestEncryptionFailClosed:
+    """v0.4.6a5: federation_secret + no cryptography => startup failure.
+
+    The server must NOT silently downgrade to plaintext when a secret
+    was configured. This is a security-critical fail-closed contract:
+    if an operator sets federation_secret, they expect encryption. A
+    silent plaintext fallback would leak query data over the federation
+    without any error. The fix: create_federation_app raises RuntimeError
+    at app creation time when federation_secret is set but Fernet is
+    unavailable.
+
+    This test runs in ALL environments (with or without cryptography)
+    because it mocks the ImportError path via sys.modules manipulation.
+    """
+
+    def test_secret_without_cryptography_raises_runtimeerror(self, monkeypatch):
+        """create_federation_app(federation_secret=...) must raise
+        RuntimeError when cryptography/Fernet is unavailable."""
+        import sys
+        # Simulate cryptography being absent by blocking the import.
+        # Store and restore the original module so we don't break other
+        # tests that need real cryptography.
+        original_crypto = sys.modules.get("cryptography", None)
+        original_fernet = sys.modules.get("cryptography.fernet", None)
+        monkeypatch.setitem(sys.modules, "cryptography", None)
+        monkeypatch.setitem(sys.modules, "cryptography.fernet", None)
+        try:
+            with pytest.raises(RuntimeError, match="federation_secret"):
+                create_federation_app(federation_secret="test_secret")
+        finally:
+            # Restore real cryptography if it was available.
+            if original_crypto is not None:
+                monkeypatch.setitem(sys.modules, "cryptography", original_crypto)
+            else:
+                monkeypatch.delitem(sys.modules, "cryptography", raising=False)
+            if original_fernet is not None:
+                monkeypatch.setitem(sys.modules, "cryptography.fernet", original_fernet)
+            else:
+                monkeypatch.delitem(sys.modules, "cryptography.fernet", raising=False)
+
+    def test_no_secret_without_cryptography_does_not_raise(self, monkeypatch):
+        """Without federation_secret, missing cryptography is fine —
+        plaintext is intentional when no secret was configured."""
+        import sys
+        original_crypto = sys.modules.get("cryptography", None)
+        original_fernet = sys.modules.get("cryptography.fernet", None)
+        monkeypatch.setitem(sys.modules, "cryptography", None)
+        monkeypatch.setitem(sys.modules, "cryptography.fernet", None)
+        try:
+            # Should NOT raise — no secret means plaintext is intentional.
+            app = create_federation_app()
+            assert app is not None
+        finally:
+            if original_crypto is not None:
+                monkeypatch.setitem(sys.modules, "cryptography", original_crypto)
+            else:
+                monkeypatch.delitem(sys.modules, "cryptography", raising=False)
+            if original_fernet is not None:
+                monkeypatch.setitem(sys.modules, "cryptography.fernet", original_fernet)
+            else:
+                monkeypatch.delitem(sys.modules, "cryptography.fernet", raising=False)
+
+
 class TestEncryptedClaimResponse:
     """v3.0 fix: /claim endpoint encrypts the response when secret is set."""
+
+    pytestmark = [
+        pytest.mark.skipif(
+            not _CRYPTOGRAPHY_AVAILABLE,
+            reason="requires cryptography (pip install -e '.[federation]')",
+        ),
+    ]
 
     def test_claim_response_encrypted_with_secret(self):
         """When federation_secret is set, /claim response is encrypted."""
@@ -238,6 +309,13 @@ class TestEncryptedClaimResponse:
 
 class TestEncryptedJobsEndpoints:
     """v3.0 fix: /jobs endpoints encrypt responses when secret is set."""
+
+    pytestmark = [
+        pytest.mark.skipif(
+            not _CRYPTOGRAPHY_AVAILABLE,
+            reason="requires cryptography (pip install -e '.[federation]')",
+        ),
+    ]
 
     def test_jobs_list_encrypted_with_secret(self):
         """GET /jobs encrypts the response when federation_secret is set."""

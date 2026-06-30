@@ -1,5 +1,87 @@
 # Changelog
 
+## v0.4.6a5
+
+Fail-closed federation encryption, wildcard allow-list fix, gate
+finalization, and test-suite cleanup. The first build with a credible
+full-gate pass across all non-local gates (Docker, embeddings,
+federation/web, RuvLLM Rust) on the actual Mac environment.
+
+### Security
+- `federation_server.py`: **fail-closed encryption**. When
+  `federation_secret` is configured but the `cryptography` package
+  (Fernet) is unavailable, `create_federation_app()` now raises
+  `RuntimeError` at app creation time. Previously the `except
+  ImportError: pass` silently set `_fernet = None`, causing `_encrypt()`
+  to return plaintext responses under a configured secret — a security
+  downgrade that would leak query data over the federation without any
+  error. The new contract: no secret → plaintext is intentional; secret
+  + cryptography → encrypted; secret + no cryptography → startup
+  failure (never silent plaintext).
+- `sandbox/sni_proxy.py`: **wildcard allow-list fix**. The `main()`
+  extraction checked `entry.host.startswith("*.")` to detect wildcard
+  entries, but `NetworkAllowList._parse_entry` already strips the `*.`
+  prefix and stores `entry.host="example.com"` with
+  `entry.wildcard=True`. The check was never true for wildcard entries,
+  so they silently became exact-domain rules — inverting the semantics
+  (`*.example.com:443` allowed `example.com:443` but denied
+  `foo.example.com:443`). Fixed by checking `entry.wildcard` and
+  reconstructing the `*.host` pattern. Also made `_is_port_allowed()`
+  wildcard-aware so port restrictions on wildcard entries (e.g.
+  `*.example.com:443` rejecting `foo.example.com:80`) are enforced.
+
+### Fixed
+- `scripts/check_ruvllm.sh`: made env-aware (reuses active venv or
+  creates `.venv-ruvllm`) and pins a single `PYTHON` interpreter for
+  all commands (`pip install`, `maturin develop`, `import check`).
+  Previously `maturin develop` could install into one Python while the
+  import check ran in another, causing a false "stub build" failure.
+  Now prints the Python path at the top for auditability.
+- `scripts/test_local.sh`: dynamic dep-aware marker filter. Optional-
+  dep markers (logic, embeddings, federation, web, nli) are only
+  excluded when their deps are NOT installed, so a full-deps venv runs
+  ~1333 tests instead of ~1096. The sandbox/integration/
+  requires_docker_gateway markers remain always excluded (need a
+  running Docker daemon).
+- `web/app.py`: added `federated` flag to `/api/query` endpoint. When
+  `federated=true`, the job stays "pending" for an external worker to
+  claim via `/api/jobs/claim` — no background task races the claim.
+  This is both a production feature (federation mode) and a test fix
+  (eliminates the race-condition `pytest.skip()` in
+  `test_federation_zombie.py`).
+- `pyproject.toml`: added `cryptography` to the `federation` extra
+  (was only in `sandbox` and `all`). The federation encryption tests
+  require it.
+- `pyproject.toml`: added `filterwarnings` to suppress the upstream
+  Starlette/httpx deprecation warning (not our code; pending fastapi
+  httpx2 migration).
+- `tests/test_routing.py`: wrapped the `_static_analysis_fallback`
+  deprecation warning in `pytest.warns(DeprecationWarning)` so it's
+  asserted instead of bubbling up unasserted.
+
+### Added
+- `tests/test_sni_proxy.py`: 12 new tests for wildcard allow-list
+  extraction and wildcard port enforcement (4 verdict scenarios).
+- `tests/test_sona_gossip.py`: `TestEncryptionFailClosed` — 2 tests
+  verifying that `create_federation_app(federation_secret=...)` raises
+  `RuntimeError` when cryptography is unavailable (mocked via
+  sys.modules), and that no-secret + no-cryptography does NOT raise.
+- `tests/test_schema_verifier.py`: mock-based companion test for the
+  z3-unavailable fail-closed path (runs when z3 IS installed).
+- `tests/test_turboquant_ppl.py`: mock-based companion tests for the
+  ruvllm_py-unavailable fail-closed path (runs when ruvllm_py IS built).
+- `tests/test_sona_gossip.py`: `skipif` guards on encryption test
+  classes for environments where cryptography is genuinely absent.
+
+### Gate results (Mac, Apple Silicon, all optional deps installed)
+- Core gate (`test_core.sh`): 248 passed, 32 skipped
+- Local gate (`test_local.sh`): 1333 passed, 4 skipped, 13 deselected
+- Docker gate (`test_docker.sh`): 13 passed
+- Embeddings gate (`test_embeddings.sh`): 90 passed, 5 skipped
+- Federation gate (`test_federation.sh`): 121 passed (incl. 2 fail-closed)
+- RuvLLM gate (`check_ruvllm.sh`): PASSED (inference-metal, SUPPORTS_INFERENCE=True)
+- Full suite (no marker filter): 1348 passed, 4 skipped, 0 warnings
+
 ## v0.4.6a4
 
 Port-specific egress enforcement in the SNI proxy. Addresses the

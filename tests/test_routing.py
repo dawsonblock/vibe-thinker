@@ -413,7 +413,11 @@ class TestCodeSpecialistRouting:
         async def _mock_sandbox(code, code_verifier=None):
             return (None, [])
         with patch("hybrid_orchestrator._wasmtime_sandbox_fallback", _mock_sandbox):
-            result = await o.run("Write a Python function to square a number")
+            # _static_analysis_fallback emits a DeprecationWarning by design
+            # (it's on the deprecation path). Assert it here so it doesn't
+            # bubble up as an unasserted warning in the test summary.
+            with pytest.warns(DeprecationWarning, match="_static_analysis_fallback"):
+                result = await o.run("Write a Python function to square a number")
         assert result.route_taken == "code_specialist_unverified_static_only"
         assert result.clr_score == 0.2
         assert result.raw_traces["verified"] is False

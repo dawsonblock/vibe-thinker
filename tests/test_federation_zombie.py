@@ -255,15 +255,14 @@ class TestWebHeartbeatEndpoint:
         mock_orch.route = slow_route
         app = create_app(mock_orch)
         client = TestClient(app)
-        # Submit via the query API (same as existing web federation tests).
-        resp = client.post("/api/query", json={"query": "test query"})
+        # Submit as federated so the job stays "pending" for an external
+        # worker to claim — no background task races us to "running".
+        resp = client.post("/api/query", json={
+            "query": "test query", "federated": True,
+        })
         job_id = resp.json()["job_id"]
         # Claim it.
         resp = client.post("/api/jobs/claim", json={"worker_id": "w1"})
-        # The claim may return null if the background task already picked
-        # up the job. In that case, skip (the job is already running).
-        if resp.json().get("job_id") is None:
-            pytest.skip("Background task picked up job before claim")
         assert resp.json()["job_id"] == job_id
         # Heartbeat.
         resp = client.post("/api/jobs/heartbeat", json={
@@ -284,11 +283,13 @@ class TestWebHeartbeatEndpoint:
         mock_orch.route = slow_route
         app = create_app(mock_orch)
         client = TestClient(app)
-        resp = client.post("/api/query", json={"query": "test query"})
+        # Submit as federated so the job stays "pending" for claim.
+        resp = client.post("/api/query", json={
+            "query": "test query", "federated": True,
+        })
         job_id = resp.json()["job_id"]
         resp = client.post("/api/jobs/claim", json={"worker_id": "w1"})
-        if resp.json().get("job_id") is None:
-            pytest.skip("Background task picked up job before claim")
+        assert resp.json()["job_id"] == job_id
         resp = client.post("/api/jobs/heartbeat", json={
             "job_id": job_id, "worker_id": "w2",
         })

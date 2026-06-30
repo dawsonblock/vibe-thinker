@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vibe-thinker"
-version = "0.4.6a4"
+version = "0.4.6a5"
 description = "Verifier-driven local reasoning engine with adaptive CLR, deterministic verifiers, and bi-temporal audit logging"
 readme = "README.md"
 license = "MIT"
@@ -44,6 +44,7 @@ embeddings = [
 federation = [
     "redis>=5.0,<6",
     "fakeredis>=2.0,<3",
+    "cryptography>=43.0.1,<46",
 ]
 web = [
     "fastapi>=0.109.1,<1",
@@ -126,6 +127,14 @@ markers = [
     "integration: slower integration tests",
     "requires_docker_gateway: tests requiring a real enforced-gateway Docker fixture",
     "timeout: per-test timeout marker (enforced when pytest-timeout is installed)",
+]
+filterwarnings = [
+    # Upstream Starlette deprecation: fastapi's testclient re-exports
+    # starlette.testclient which warns about httpx. Not our code; suppress
+    # until fastapi/starlette ships the httpx2 migration. The warning class
+    # is StarletteDeprecationWarning (not stdlib DeprecationWarning), so we
+    # match on message text only (no category filter = matches any class).
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated",
 ]
 
 [tool.setuptools]

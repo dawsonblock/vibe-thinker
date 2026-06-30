@@ -911,6 +911,11 @@ def create_federation_app(
     )
 
     # v3.0: Set up decryption if a secret is provided.
+    # Fail-closed: if federation_secret is configured but the cryptography
+    # package (Fernet) is unavailable, raise immediately at app creation
+    # time. Silently falling back to plaintext when a secret was supplied
+    # would be a security downgrade — the operator configured encryption
+    # and must not get plaintext responses without an explicit error.
     _fernet = None
     if federation_secret:
         try:
@@ -922,7 +927,13 @@ def create_federation_app(
             )
             _fernet = Fernet(key)
         except ImportError:
-            pass
+            raise RuntimeError(
+                "federation_secret was configured but the cryptography "
+                "package is not installed — cannot enable zero-trust "
+                "encryption. Install it with: pip install -e '.[federation]' "
+                "or pip install cryptography. Refusing to start with "
+                "plaintext fallback under a configured secret."
+            ) from None
 
     def _decrypt(body: dict) -> dict:
         """Decrypt an incoming payload if it's encrypted."""
@@ -939,10 +950,16 @@ def create_federation_app(
     def _encrypt(data: dict) -> dict:
         """Encrypt a response payload for zero-trust federation (v3.0).
 
-        If encryption is enabled, the payload is JSON-serialized and
-        encrypted. If not enabled, returns the payload unchanged.
+        If encryption is enabled (federation_secret was configured and
+        cryptography is available), the payload is JSON-serialized and
+        encrypted. If no secret was configured, returns the payload
+        unchanged (plaintext is intentional). Fail-closed guarantees
+        that _fernet is never None when a secret was configured —
+        create_federation_app raises at startup if cryptography is
+        missing under a configured secret.
         """
         if _fernet is None:
+            # No secret configured — plaintext is intentional.
             return data
         import json as _json
         plaintext = _json.dumps(data, default=str).encode("utf-8")

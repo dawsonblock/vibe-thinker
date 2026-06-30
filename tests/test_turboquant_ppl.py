@@ -169,6 +169,33 @@ class TestInProcessContract:
             # Any exception is acceptable as long as no PplResult is returned.
             pass
 
+    def test_inprocess_raises_not_implemented_via_mock(self):
+        # When ruvllm_py IS built with logprobs, simulate its absence by
+        # patching the binding's SUPPORTS_LOGPROBS to False, then verify
+        # the same fail-closed NotImplementedError path.
+        if not self._ruvllm_has_logprobs():
+            pytest.skip("ruvllm_py NOT built — real fail-closed path covered above")
+        from unittest.mock import patch
+        import ruvllm_py  # type: ignore
+        with patch.object(ruvllm_py, "SUPPORTS_LOGPROBS", False):
+            with pytest.raises(NotImplementedError):
+                ppl.eval_inprocess("model.gguf", "hello world")
+
+    def test_inprocess_does_not_return_fake_ppl_via_mock(self):
+        # Same mock approach for the no-fake-PPL contract.
+        if not self._ruvllm_has_logprobs():
+            pytest.skip("ruvllm_py NOT built — real fail-closed path covered above")
+        from unittest.mock import patch
+        import ruvllm_py  # type: ignore
+        with patch.object(ruvllm_py, "SUPPORTS_LOGPROBS", False):
+            try:
+                ppl.eval_inprocess("model.gguf", "hello world")
+                raise AssertionError("should have raised")
+            except NotImplementedError:
+                pass
+            except Exception:
+                pass
+
     @pytest.mark.timeout(300)
     def test_inprocess_logprobs_returns_ppl_result(self):
         # When ruvllm_py IS built with candle (SUPPORTS_LOGPROBS == True)

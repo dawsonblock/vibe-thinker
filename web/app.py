@@ -442,11 +442,15 @@ def create_app(
                 status_code=400,
             )
         force_route = body.get("force_route") or None
+        federated = bool(body.get("federated", False))
         job_id = uuid.uuid4().hex[:12]
         state.add_job(job_id, query, force_route)
 
-        # Launch the job in the background.
-        asyncio.create_task(_run_job(state, job_id, query, force_route))
+        # Launch the job in the background — UNLESS this is a federated
+        # submission, in which case the job stays "pending" until an
+        # external worker claims it via /api/jobs/claim.
+        if not federated:
+            asyncio.create_task(_run_job(state, job_id, query, force_route))
         return {"job_id": job_id, "status": "pending"}
 
     async def _run_job(state: AppState, job_id: str, query: str, force_route: Optional[str]):

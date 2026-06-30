@@ -391,6 +391,23 @@ class TestLogicVerifierUnavailable:
         assert result.method == "smt_unavailable"
         assert "z3-solver not installed" in result.error
 
+    @pytest.mark.skipif(not _Z3_AVAILABLE, reason="z3-solver NOT installed — real fail-closed path covered above")
+    @pytest.mark.asyncio
+    async def test_z3_unavailable_fail_closed_via_mock(self):
+        """When z3 IS installed, simulate its absence by patching
+        _Z3_AVAILABLE to False and verify the same fail-closed path."""
+        from unittest.mock import patch
+        v = LogicVerifier()
+        with patch("verifiers.logic_verifier._Z3_AVAILABLE", False):
+            result = await v.verify("q", "x=5", {
+                "constraints": ["x > 0"],
+                "variables": {"x": "Int"},
+                "values": {"x": 5},
+            })
+        assert result.verified is False
+        assert result.method == "smt_unavailable"
+        assert "z3-solver not installed" in result.error
+
 
 # ---------------------------------------------------------------------- #
 # Logic constraint translation (v0.4.1)
