@@ -1,5 +1,66 @@
 # Changelog
 
+## v0.4.6a2
+
+Post-audit cleanup + allowlisted gateway container. The ENFORCED_GATEWAY
+mode now automatically starts and validates a real gateway container
+running the SNI egress proxy — the "not yet validated" gap from v0.4.6a1
+is closed.
+
+### Added
+- `sandbox/docker_executor.py`: the executor now automatically starts a
+  gateway container running the SNI egress proxy (`sandbox.sni_proxy`)
+  on `python:3.12-slim` with the `sandbox/` directory mounted as a
+  read-only volume. The gateway is connected to both the default Docker
+  bridge (for internet access) and the `--internal` network (for sandbox
+  access). The sandbox container routes traffic through the gateway via
+  `HTTP_PROXY`/`HTTPS_PROXY` env vars pointing at the gateway's IP on
+  the internal network. Raw socket egress is blocked by the `--internal`
+  network — the proxy is the only path out. The gateway is stopped and
+  removed in `cleanup()`.
+- `tests/test_sandbox_network_enforcement.py`: 3 new integration tests
+  in `TestGatewayEgressEnforcement` that run real Docker containers:
+  - `test_gateway_allows_allowlisted_domain`: verifies an allowlisted
+    domain (example.com) returns HTTP 200 through the proxy.
+  - `test_gateway_blocks_non_allowlisted_domain`: verifies a
+    non-allowlisted domain (httpbin.org) is blocked by the proxy.
+  - `test_gateway_blocks_raw_socket_bypass`: verifies raw socket egress
+    (bypassing the proxy) is blocked by the `--internal` network.
+
+### Fixed
+- `sandbox/sni_proxy.py` `_handle_http()`: headers were not terminated
+  with `\r\n`, causing the remote server to wait for more headers and
+  never respond. Also removed a duplicate request line in the forwarded
+  headers (the original first_line was included in the headers variable,
+  resulting in two request lines being sent to the upstream).
+- `sandbox/docker_executor.py`: fixed Go template hyphen issue — Docker
+  network names with hyphens (e.g. `vibe-thinker-gateway-net`) need
+  `index()` syntax in `docker inspect --format` instead of dot-notation
+  (which interprets hyphens as subtraction).
+- `scripts/test_optional.sh`: removed `sandbox` from the marker filter
+  (sandbox tests now belong to `test_docker.sh`, which needs Docker +
+  the sandbox extra). The marker filter is now `logic or embeddings or
+  federation or web or nli` — consistent with `optional.yml`.
+- `scripts/build_clean_zip.py`: stale example version `v0.4.6a0` →
+  `v0.4.6a2`.
+- Sandbox wording in `README.md`, `sandbox/README.md`,
+  `sandbox/docker_executor.py`, and `sandbox/base.py`: updated to
+  reflect that the gateway IS now started and the egress path IS
+  validated by integration tests. No longer says "not yet validated".
+
+### Verified end-to-end (macOS, cargo + Docker daemon)
+- `test_core.sh`: 248 passed, 32 skipped (27s)
+- `test_local.sh`: 1021 passed, 45 skipped (56s)
+- `test_docker.sh`: 9 passed (12s) — 6 network isolation + 3 gateway
+  egress enforcement
+- `check_ruvllm.sh`: PASSED (inference-metal, SUPPORTS_INFERENCE=True)
+- `release_gate.sh all`: PASS
+- `ruff check .`: clean
+
+### Still experimental
+- RuvLLM (Rust inference engine — default build is stub).
+- Distributed federation (Redis-backed HA).
+
 ## v0.4.6a1
 
 Release-hygiene repair over v0.4.6a0. No new features. Splits the
@@ -71,7 +132,6 @@ gate model.
 - `ruff check .`: clean
 
 ### Still experimental
-- Enforced sandbox gateway egress (`NetworkMode.ENFORCED_GATEWAY`).
 - RuvLLM (Rust inference engine — default build is stub).
 - Distributed federation (Redis-backed HA).
 
