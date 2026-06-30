@@ -465,7 +465,7 @@ class SNIEgressProxy:
         Extract the Host header and check it against the allow-list.
         """
         # Read headers to find Host.
-        headers = first_line + "\r\n"
+        headers = ""
         host = None
         while True:
             header = await asyncio.wait_for(
@@ -510,9 +510,13 @@ class SNIEgressProxy:
                 remote_reader, remote_writer = await asyncio.open_connection(
                     resolved_ip, int(port_part)
                 )
-                # Forward the request.
+                # Forward the request with rewritten request line.
+                # headers contains the header lines (each ending \r\n)
+                # but NOT the terminating empty line — add it so the
+                # remote server sees a complete HTTP request.
                 remote_writer.write(f"{parts[0]} {path} HTTP/1.1\r\n".encode())
                 remote_writer.write(headers.encode())
+                remote_writer.write(b"\r\n")
                 await remote_writer.drain()
                 # Tunnel bidirectionally.
                 await self._tunnel(client_reader, client_writer,

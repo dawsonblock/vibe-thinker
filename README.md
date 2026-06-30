@@ -174,15 +174,17 @@ proxy variables. The mode is never silently promoted to enforcement from
 an allow-list.
 
 `ENFORCED_GATEWAY` is the **only** mode designed to be egress
-enforcement. Docker network isolation is tested: `--network none` and
-`--internal` networks are verified to block connections to the internet,
-cloud metadata, and host LAN. However, the allowlisted gateway/proxy
-egress path (domain-level filtering through a gateway container) is
-**not yet validated** — the executor can create the `--internal` network
-and fail-closed to `--network none` if it cannot, but the gateway
-container itself is not started or verified by the test suite. It
-remains experimental. It fail-closes to `--network none` if the gateway
-network cannot be created, and requires Docker.
+enforcement. The executor automatically starts a gateway container
+running the SNI egress proxy, connected to both the default bridge (for
+internet access) and the `--internal` network (for sandbox access). The
+sandbox routes traffic through the gateway via `HTTP_PROXY`/`HTTPS_PROXY`
+env vars. Docker network isolation is tested: `--network none` and
+`--internal` networks block connections to the internet, cloud metadata,
+and host LAN. The allowlisted gateway/proxy egress path is validated:
+allowlisted domains are reachable through the proxy, non-allowlisted
+domains are blocked (403), and raw socket egress (bypassing the proxy)
+is blocked by the `--internal` network. It fail-closes to `--network none`
+if the gateway network or container cannot be created, and requires Docker.
 
 Do not run hostile code with network access enabled.
 

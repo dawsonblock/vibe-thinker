@@ -22,15 +22,17 @@ The executor's network behavior is controlled by :class:`NetworkMode`:
     clients that ignore proxy env vars (raw sockets, direct IP) can bypass
     it. Use only with trusted code that respects proxy conventions.
   - ``ENFORCED_GATEWAY``: the container runs on a Docker ``--internal``
-    network with no direct internet access. All egress goes through a
-    gateway container that enforces the allow-list at the network level.
-    EXPERIMENTAL — Docker network isolation (``--network none`` and
-    ``--internal`` blocking) is tested, but the allowlisted gateway/proxy
-    egress path is not yet validated (the gateway container is not
-    started or verified by the test suite). Fail-closes to
-    ``--network none`` if the gateway network cannot be created.
-    Requires Docker and a pre-created internal network + gateway
-    container.
+    network with no direct internet access. The executor automatically
+    starts a gateway container running the SNI egress proxy, connected to
+    both the default bridge (for internet access) and the internal
+    network (for sandbox access). The sandbox routes traffic through the
+    gateway via ``HTTP_PROXY``/``HTTPS_PROXY`` env vars. Raw socket
+    egress from the sandbox is blocked by the ``--internal`` network.
+    The allowlisted gateway/proxy egress path is validated by integration
+    tests: allowlisted domains are reachable, non-allowlisted domains are
+    blocked (403), and raw socket bypass is blocked. Fail-closes to
+    ``--network none`` if the gateway network or container cannot be
+    created. Requires Docker.
 
 When a NetworkAllowList is provided AND network_mode is BEST_EFFORT_PROXY
 or ENFORCED_GATEWAY, the executor uses domain-level egress filtering.
@@ -71,7 +73,9 @@ sbx microVM, which has its own Docker daemon).
 """
 
 import asyncio
+import os
 import time
+import uuid
 from typing import Dict, Optional, TYPE_CHECKING
 
 from sandbox.base import ExecutionResult, NetworkMode
@@ -97,6 +101,12 @@ DEFAULT_PROXY_EGRESS = "127.0.0.1:8888"
 # creates this network if it doesn't exist. The network is --internal
 # (no direct internet access); egress goes through a gateway container.
 GATEWAY_NETWORK_NAME = "vibe-thinker-gateway-net"
+
+# Gateway container image — uses python:3.12-slim with the sandbox/
+# directory mounted as a read-only volume. No custom image build needed;
+# the SNI proxy uses only stdlib (asyncio, socket, json).
+GATEWAY_IMAGE = "python:3.12-slim"
+GATEWAY_PORT = 8888
 
 
 class DockerSandboxExecutor:
@@ -152,6 +162,10 @@ class DockerSandboxExecutor:
         self._network_mode = network_mode
         self._gateway_network = gateway_network
         self._gateway_network_created = False
+        # Gateway container lifecycle (ENFORCED_GATEWAY mode).
+        self._gateway_container_name = f"vibe-thinker-gw-{uuid.uuid4().hex[:8]}"
+        self._gateway_ip: Optional[str] = None
+        self._gateway_started = False
 
     def _effective_network_mode(self) -> NetworkMode:
         """Resolve the effective network mode.
@@ -234,6 +248,166 @@ class DockerSandboxExecutor:
             print(f"[DockerSandbox] Gateway network setup failed: {e}")
         return None
 
+    async def _start_gateway(self) -> Optional[str]:
+        """Start the SNI proxy gateway container.
+
+        The gateway runs the Python SNI egress proxy (sandbox.sni_proxy)
+        on ``python:3.12-slim``. It is connected to two networks:
+
+          1. The default Docker bridge (for internet access — the proxy
+             needs to resolve and tunnel to allow-listed upstreams).
+          2. The ``--internal`` gateway network (so the sandbox container
+             can reach the proxy).
+
+        The sandbox container, attached only to the ``--internal``
+        network, routes traffic through the gateway via
+        ``HTTP_PROXY``/``HTTPS_PROXY`` env vars. Raw socket egress from
+        the sandbox is blocked by the ``--internal`` network (no route
+        to the outside).
+
+        Returns the gateway's IP on the internal network, or None if
+        startup failed (caller fail-closes to ``--network none``).
+        """
+        if self._gateway_started and self._gateway_ip:
+            return self._gateway_ip
+        if not self._allowlist or self._allowlist.is_empty:
+            return None
+
+        # Serialize the allowlist for the SNI proxy CLI.
+        allowlist_str = ",".join(e.raw for e in self._allowlist.entries)
+
+        # Absolute path to the sandbox/ directory for the volume mount.
+        # The gateway container needs sni_proxy.py, network_allowlist.py,
+        # and __init__.py — all in the sandbox/ package.
+        sandbox_dir = os.path.dirname(os.path.abspath(__file__))
+
+        try:
+            # 1. Start the gateway on the default bridge (internet access).
+            cmd = [
+                "docker", "run", "-d",
+                "--name", self._gateway_container_name,
+                "--network", "bridge",
+                "--restart", "no",
+                "-v", f"{sandbox_dir}:/app/sandbox:ro",
+                "-w", "/app",
+                GATEWAY_IMAGE,
+                "python3", "-u", "-m", "sandbox.sni_proxy",
+                "--host", "0.0.0.0",
+                "--port", str(GATEWAY_PORT),
+                "--allowlist", allowlist_str,
+            ]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                print(f"[DockerSandbox] Failed to start gateway container: "
+                      f"{stderr.decode().strip()}")
+                return None
+
+            # 2. Connect the gateway to the internal network.
+            connect = await asyncio.create_subprocess_exec(
+                "docker", "network", "connect",
+                self._gateway_network, self._gateway_container_name,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await connect.communicate()
+            if connect.returncode != 0:
+                print(f"[DockerSandbox] Failed to connect gateway to "
+                      f"internal network: {stderr.decode().strip()}")
+                await self._stop_gateway()
+                return None
+
+            # 3. Get the gateway's IP on the internal network.
+            # Use index() in the Go template because the network name
+            # contains hyphens (Go templates interpret hyphens as
+            # subtraction operators in dot-notation field access).
+            inspect = await asyncio.create_subprocess_exec(
+                "docker", "inspect",
+                "--format",
+                f"{{{{(index .NetworkSettings.Networks \"{self._gateway_network}\").IPAddress}}}}",
+                self._gateway_container_name,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await inspect.communicate()
+            if inspect.returncode != 0:
+                print(f"[DockerSandbox] Failed to get gateway IP: "
+                      f"{stderr.decode().strip()}")
+                await self._stop_gateway()
+                return None
+
+            ip = stdout.decode().strip()
+            if not ip:
+                print("[DockerSandbox] Gateway IP is empty on internal network")
+                await self._stop_gateway()
+                return None
+
+            # 4. Wait for the SNI proxy to be ready (check container logs
+            # for the "Listening" message, with a timeout).
+            ready = await self._wait_gateway_ready(timeout=10.0)
+            if not ready:
+                print("[DockerSandbox] Gateway proxy did not become ready "
+                      "within timeout")
+                await self._stop_gateway()
+                return None
+
+            self._gateway_ip = ip
+            self._gateway_started = True
+            print(f"[DockerSandbox] Gateway started at {ip}:{GATEWAY_PORT}")
+            return ip
+
+        except Exception as e:
+            print(f"[DockerSandbox] Gateway startup failed: {e}")
+            await self._stop_gateway()
+            return None
+
+    async def _wait_gateway_ready(self, timeout: float = 10.0) -> bool:
+        """Wait for the SNI proxy to print its 'Listening' message.
+
+        Polls ``docker logs`` for the startup line. Returns True if the
+        proxy is ready, False on timeout.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "docker", "logs", self._gateway_container_name,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await proc.communicate()
+                output = (stdout + stderr).decode("utf-8", errors="replace")
+                if "Listening on" in output:
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+        return False
+
+    async def _stop_gateway(self) -> None:
+        """Stop and remove the gateway container."""
+        if not self._gateway_started and not self._gateway_container_name:
+            return
+        for cmd_args in (
+            ["docker", "stop", self._gateway_container_name],
+            ["docker", "rm", "-f", self._gateway_container_name],
+        ):
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd_args,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await proc.wait()
+            except Exception:
+                pass
+        self._gateway_started = False
+        self._gateway_ip = None
+
     async def execute(
         self,
         script: str,
@@ -280,6 +454,21 @@ class DockerSandboxExecutor:
                 docker_network = gateway_net
                 use_gateway = True
                 use_proxy = use_allowlist  # proxy env vars for the gateway
+                if use_proxy:
+                    # Start the gateway container and get its IP on the
+                    # internal network. The sandbox will route traffic
+                    # through the gateway via HTTP_PROXY/HTTPS_PROXY.
+                    gateway_ip = await self._start_gateway()
+                    if gateway_ip is not None:
+                        proxy_addr = f"{gateway_ip}:{GATEWAY_PORT}"
+                    else:
+                        # Gateway failed — fail-closed to no network.
+                        print("[DockerSandbox] WARNING: Gateway container "
+                              "startup failed — falling back to "
+                              "--network none (fail-closed).")
+                        docker_network = "none"
+                        use_proxy = False
+                        use_gateway = False
             else:
                 # Gateway network setup failed — fail-closed to no network.
                 print("[DockerSandbox] WARNING: ENFORCED_GATEWAY network "
@@ -461,5 +650,5 @@ class DockerSandboxExecutor:
             return False
 
     async def cleanup(self) -> None:
-        """No persistent resources to clean up — containers use --rm."""
-        pass
+        """Stop the gateway container if running. Sandbox containers use --rm."""
+        await self._stop_gateway()

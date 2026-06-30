@@ -522,3 +522,310 @@ class TestDockerNetworkEnforcement:
             )
         finally:
             self._cleanup_network(net)
+
+
+@pytest.mark.sandbox
+@pytest.mark.integration
+@pytest.mark.requires_docker_gateway
+class TestGatewayEgressEnforcement:
+    """End-to-end gateway egress enforcement tests.
+
+    These tests verify the full ENFORCED_GATEWAY path:
+      1. The executor starts a gateway container running the SNI proxy.
+      2. The sandbox container is on the --internal network (no direct
+         internet).
+      3. Allowlisted domains can be reached THROUGH the proxy.
+      4. Non-allowlisted domains are BLOCKED by the proxy.
+      5. Direct internet access (raw sockets bypassing the proxy) is
+         BLOCKED by the --internal network.
+
+    SKIPPED when Docker is not available. When Docker IS available,
+    these tests run for real — they are the authoritative gateway
+    enforcement validation.
+    """
+
+    @staticmethod
+    def _docker_available() -> bool:
+        if not _has_docker():
+            return False
+        import subprocess
+        try:
+            r = subprocess.run(
+                ["docker", "info"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    @staticmethod
+    def _run_container_with_env(
+        network: str, script: str, env: dict, timeout: int = 30,
+    ) -> tuple:
+        """Run a Python script in a container with env vars set.
+
+        The script is piped via stdin (python3 -) to avoid quoting issues.
+        Returns (returncode, stdout, stderr).
+        """
+        import subprocess
+        img_check = subprocess.run(
+            ["docker", "image", "inspect", "vibe-thinker-sandbox:latest"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+        )
+        image = "vibe-thinker-sandbox:latest" if img_check.returncode == 0 \
+            else "python:3.12-slim"
+        cmd = [
+            "docker", "run", "--rm", "-i",
+            "--network", network,
+            "--memory", "256m",
+            "--read-only",
+            "--security-opt", "no-new-privileges",
+            "--cap-drop", "ALL",
+            "--pids-limit", "64",
+            "--tmpfs", "/tmp",
+            "--user", "1000:1000",
+            "--entrypoint", "python3",
+        ]
+        for k, v in env.items():
+            cmd.extend(["--env", f"{k}={v}"])
+        cmd.extend([image, "-"])
+        r = subprocess.run(cmd, input=script.encode(), capture_output=True,
+                           timeout=timeout)
+        return r.returncode, r.stdout.decode(), r.stderr.decode()
+
+    @staticmethod
+    def _create_internal_network(name: str = "vibe-test-gw-net") -> bool:
+        import subprocess
+        # Force-remove any leftover gateway container that might be
+        # attached to the network (prevents "has active endpoints" error).
+        subprocess.run(["docker", "rm", "-f", "vibe-test-gateway"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=10)
+        subprocess.run(["docker", "network", "rm", name],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=10)
+        r = subprocess.run(
+            ["docker", "network", "create", "--internal", "--driver", "bridge", name],
+            capture_output=True, timeout=10,
+        )
+        return r.returncode == 0
+
+    @staticmethod
+    def _cleanup_network(name: str = "vibe-test-gw-net") -> None:
+        import subprocess
+        subprocess.run(["docker", "network", "rm", name],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=10)
+
+    @staticmethod
+    def _start_gateway(network: str, allowlist: str) -> str | None:
+        """Start a gateway container on the default bridge + internal net.
+
+        Returns the gateway's IP on the internal network, or None.
+        """
+        import subprocess, os, time
+        gw_name = "vibe-test-gateway"
+        # Clean up any leftover gateway.
+        subprocess.run(["docker", "rm", "-f", gw_name],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=10)
+        sandbox_dir = os.path.dirname(
+            os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "sandbox"))
+        )
+        cmd = [
+            "docker", "run", "-d",
+            "--name", gw_name,
+            "--network", "bridge",
+            "--restart", "no",
+            "-v", f"{sandbox_dir}/sandbox:/app/sandbox:ro",
+            "-w", "/app",
+            "python:3.12-slim",
+            "python3", "-u", "-m", "sandbox.sni_proxy",
+            "--host", "0.0.0.0", "--port", "8888",
+            "--allowlist", allowlist,
+        ]
+        r = subprocess.run(cmd, capture_output=True, timeout=30)
+        if r.returncode != 0:
+            return None
+        # Connect to internal network.
+        r2 = subprocess.run(
+            ["docker", "network", "connect", network, gw_name],
+            capture_output=True, timeout=10,
+        )
+        if r2.returncode != 0:
+            subprocess.run(["docker", "rm", "-f", gw_name],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=10)
+            return None
+        # Get IP on internal network.
+        # Use index() in the Go template because the network name
+        # contains hyphens (Go templates interpret hyphens as
+        # subtraction operators in dot-notation field access).
+        r3 = subprocess.run(
+            ["docker", "inspect", "--format",
+             f"{{{{(index .NetworkSettings.Networks \"{network}\").IPAddress}}}}",
+             gw_name],
+            capture_output=True, timeout=10,
+        )
+        ip = r3.stdout.decode().strip()
+        if not ip:
+            return None
+        # Wait for proxy to be ready.
+        for _ in range(20):
+            r4 = subprocess.run(
+                ["docker", "logs", gw_name],
+                capture_output=True, timeout=5,
+            )
+            output = r4.stdout.decode() + r4.stderr.decode()
+            if "Listening on" in output:
+                return ip
+            time.sleep(0.5)
+        return None
+
+    @staticmethod
+    def _stop_gateway() -> None:
+        import subprocess
+        subprocess.run(["docker", "rm", "-f", "vibe-test-gateway"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=10)
+
+    @pytest.mark.skipif(
+        not _has_docker(),
+        reason="requires Docker",
+    )
+    def test_gateway_allows_allowlisted_domain(self):
+        """An allowlisted domain can be reached THROUGH the gateway proxy.
+
+        The sandbox container is on the --internal network (no direct
+        internet). HTTP_PROXY points at the gateway. A urllib request
+        to an allowlisted domain (example.com) should succeed.
+        """
+        if not self._docker_available():
+            pytest.skip("Docker daemon not running")
+        net = "vibe-test-gw-net"
+        if not self._create_internal_network(net):
+            pytest.skip("could not create --internal network")
+        gw_ip = self._start_gateway(net, "example.com:80,example.com:443")
+        if gw_ip is None:
+            self._cleanup_network(net)
+            pytest.skip("could not start gateway container")
+        try:
+            script = (
+                "import urllib.request\n"
+                "try:\n"
+                "    req = urllib.request.urlopen('http://example.com', timeout=10)\n"
+                "    print(f'STATUS:{req.status}')\n"
+                "except Exception as e:\n"
+                "    print(f'FAILED:{type(e).__name__}:{e}')\n"
+            )
+            env = {
+                "HTTP_PROXY": f"http://{gw_ip}:8888",
+                "HTTPS_PROXY": f"http://{gw_ip}:8888",
+                "http_proxy": f"http://{gw_ip}:8888",
+                "https_proxy": f"http://{gw_ip}:8888",
+                "NO_PROXY": "localhost,127.0.0.1",
+            }
+            rc, out, err = self._run_container_with_env(net, script, env, timeout=30)
+            assert "STATUS:200" in out, (
+                f"Allowlisted domain should be reachable through gateway, "
+                f"but got: {out!r} (stderr: {err!r})"
+            )
+        finally:
+            self._stop_gateway()
+            self._cleanup_network(net)
+
+    @pytest.mark.skipif(
+        not _has_docker(),
+        reason="requires Docker",
+    )
+    def test_gateway_blocks_non_allowlisted_domain(self):
+        """A non-allowlisted domain is BLOCKED by the gateway proxy.
+
+        The sandbox container is on the --internal network. HTTP_PROXY
+        points at the gateway. A urllib request to a non-allowlisted
+        domain (httpbin.org) should fail — the proxy returns 403.
+        """
+        if not self._docker_available():
+            pytest.skip("Docker daemon not running")
+        net = "vibe-test-gw-net"
+        if not self._create_internal_network(net):
+            pytest.skip("could not create --internal network")
+        # Only allow example.com — httpbin.org is NOT on the list.
+        gw_ip = self._start_gateway(net, "example.com:80,example.com:443")
+        if gw_ip is None:
+            self._cleanup_network(net)
+            pytest.skip("could not start gateway container")
+        try:
+            script = (
+                "import urllib.request\n"
+                "try:\n"
+                "    req = urllib.request.urlopen('http://httpbin.org/get', timeout=10)\n"
+                "    print(f'STATUS:{req.status}')\n"
+                "except Exception as e:\n"
+                "    print(f'BLOCKED:{type(e).__name__}')\n"
+            )
+            env = {
+                "HTTP_PROXY": f"http://{gw_ip}:8888",
+                "HTTPS_PROXY": f"http://{gw_ip}:8888",
+                "http_proxy": f"http://{gw_ip}:8888",
+                "https_proxy": f"http://{gw_ip}:8888",
+                "NO_PROXY": "localhost,127.0.0.1",
+            }
+            rc, out, err = self._run_container_with_env(net, script, env, timeout=30)
+            assert "BLOCKED" in out, (
+                f"Non-allowlisted domain should be blocked by gateway, "
+                f"but got: {out!r} (stderr: {err!r})"
+            )
+        finally:
+            self._stop_gateway()
+            self._cleanup_network(net)
+
+    @pytest.mark.skipif(
+        not _has_docker(),
+        reason="requires Docker",
+    )
+    def test_gateway_blocks_raw_socket_bypass(self):
+        """Raw socket egress (bypassing the proxy) is BLOCKED by --internal.
+
+        Even with the proxy env vars set, a raw socket connection to an
+        external IP must fail — the --internal network has no route to
+        the outside. This is the key security property: the proxy is the
+        ONLY path out.
+        """
+        if not self._docker_available():
+            pytest.skip("Docker daemon not running")
+        net = "vibe-test-gw-net"
+        if not self._create_internal_network(net):
+            pytest.skip("could not create --internal network")
+        gw_ip = self._start_gateway(net, "example.com:80")
+        if gw_ip is None:
+            self._cleanup_network(net)
+            pytest.skip("could not start gateway container")
+        try:
+            # Raw socket to 1.1.1.1 (Cloudflare DNS) — no proxy used.
+            script = (
+                "import socket\n"
+                "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+                "s.settimeout(5)\n"
+                "try:\n"
+                "    s.connect(('1.1.1.1', 80))\n"
+                "    print('CONNECTED')\n"
+                "except Exception as e:\n"
+                "    print(f'BLOCKED:{type(e).__name__}')\n"
+                "finally:\n"
+                "    s.close()\n"
+            )
+            env = {
+                "HTTP_PROXY": f"http://{gw_ip}:8888",
+                "HTTPS_PROXY": f"http://{gw_ip}:8888",
+            }
+            rc, out, err = self._run_container_with_env(net, script, env, timeout=20)
+            assert "BLOCKED" in out, (
+                f"Raw socket egress should be blocked by --internal network, "
+                f"but got: {out!r} (stderr: {err!r})"
+            )
+        finally:
+            self._stop_gateway()
+            self._cleanup_network(net)

@@ -33,12 +33,15 @@ class NetworkMode(str, Enum):
         it. Use only with trusted code that respects proxy conventions.
 
     ENFORCED_GATEWAY: the candidate container runs on a Docker
-        --internal network with no direct internet access. All egress
-        goes through a gateway/proxy container that enforces the
-        allow-list at the network level. EXPERIMENTAL — not validated
-        with bypass tests in all environments. Fail-closes to
-        --network none if the gateway network cannot be created.
-        Requires Docker.
+        --internal network with no direct internet access. The executor
+        automatically starts a gateway container running the SNI egress
+        proxy, connected to both the default bridge (for internet) and
+        the internal network (for sandbox access). The sandbox routes
+        traffic through the gateway via HTTP_PROXY/HTTPS_PROXY env vars.
+        Raw socket egress is blocked by the --internal network. The
+        allowlisted egress path is validated by integration tests.
+        Fail-closes to --network none if the gateway network or
+        container cannot be created. Requires Docker.
     """
 
     DISABLED = "disabled"

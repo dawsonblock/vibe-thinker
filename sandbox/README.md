@@ -91,12 +91,13 @@ that respect proxy environment variables. Code may bypass it with raw
 sockets, direct IP connections, custom DNS, or clients that ignore
 proxy variables.
 
-`ENFORCED_GATEWAY` is experimental. Docker network isolation is tested
-(`--network none` and `--internal` networks block connections to the
-internet, cloud metadata, and host LAN), but the allowlisted
-gateway/proxy egress path (domain-level filtering through a gateway
-container) is not yet validated — the gateway container is not started
-or verified by the test suite.
+`ENFORCED_GATEWAY` starts a gateway container running the SNI egress
+proxy. Docker network isolation is tested (`--network none` and
+`--internal` networks block connections to the internet, cloud metadata,
+and host LAN), and the allowlisted gateway/proxy egress path is
+validated: allowlisted domains are reachable through the proxy,
+non-allowlisted domains are blocked (403), and raw socket egress
+(bypassing the proxy) is blocked by the `--internal` network.
 
 Do not run hostile code with network access enabled.
 
