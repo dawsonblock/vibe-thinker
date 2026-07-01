@@ -2,9 +2,13 @@
 
 This repo ships a unified Docker Compose stack that bundles the sidecars the
 orchestrator normally needs you to run by hand: **Redis** (federation
-heartbeat/reaping + web UI Pub/Sub), **Envoy** (SNI-aware egress proxy), and
-**AgentDB** (vector store). You pick an LLM topology with a single
-`--profile` flag.
+heartbeat/reaping + web UI Pub/Sub), **Python SNI proxy** (`sni-proxy`,
+HTTP/HTTPS CONNECT egress proxy), and **AgentDB** (vector store). You pick
+an LLM topology with a single `--profile` flag.
+
+The Envoy sidecar (`--envoy-sidecar` / `sandbox/envoy_sidecar.py`) is for
+standalone transparent-routing experiments on the host and is **not** used as
+the HTTP proxy in the compose stack.
 
 ## Files
 
@@ -123,8 +127,8 @@ docker compose --profile cpu up -e VIBE_THINKER_URL=http://10.0.0.5:8080
 | `8080` | llama-server / ruvllm | Specialist LLM `/completion` endpoint |
 | `8081` | llama-server | Generalist LLM `/completion` endpoint |
 | `8088` | agentdb | AgentDB `POST /v1/vector/search` |
-| `8888` | envoy | SNI-aware egress proxy listener |
-| `9901` | envoy | Envoy admin interface |
+| `8888` | sni-proxy | Python SNI-aware egress proxy listener (internal only) |
+| `9901` | envoy (host mode only) | Envoy admin interface (`--envoy-sidecar`, not used in compose) |
 
 ## Healthchecks
 
@@ -133,7 +137,7 @@ Every service has a healthcheck with `start_period` and `retries`:
 | Service | Healthcheck | start_period | retries |
 | --- | --- | --- | --- |
 | `redis` | `redis-cli ping` | 10s | 5 |
-| `envoy` | `GET /server_info` (admin :9901) | 15s | 5 |
+| `sni-proxy` | TCP connect to `127.0.0.1:8888` | 15s | 5 |
 | `agentdb` | `GET /health` (:8088) | 20s | 5 |
 | `llama-server` | `GET /health` (:8080) | 60s | 6 |
 | `ruvllm` | `GET /health` (:8080) | 60s | 6 |
@@ -157,7 +161,7 @@ You can run sidecars alone (no orchestrator) by omitting the profile — useful
 if you run the orchestrator on the host but want the sidecars containerized:
 
 ```bash
-docker compose up redis envoy agentdb
+docker compose up redis sni-proxy agentdb
 ```
 
 ## AgentDB — important caveat
@@ -186,7 +190,23 @@ verification, remove that volume mount. The sandbox image defaults to
 docker build -f sandbox/Dockerfile -t vibe-thinker-sandbox:latest .
 ```
 
-Egress from the sandbox is filtered by the Envoy sidecar. Edit
-`docker/envoy/envoy.yaml` (the `exact_match_map`) to allow the domains your
-code needs to reach. The default allows `pypi.org` and
-`files.pythonhosted.org` only.
+Egress from the sandbox is filtered by the Python SNI proxy (`sni-proxy`).
+Edit the `RFSN_NETWORK_ALLOWLIST` environment variable (or the
+`--network-allowlist` CLI flag) to allow the domains your code needs to reach.
+The default allow-list is `pypi.org:443,files.pythonhosted.org:443`. The
+proxy is hardened with a read-only filesystem, dropped capabilities, no new
+privileges, non-root user, PID and memory limits, and a tmpfs `/tmp`.
+
+The Envoy sidecar (`--envoy-sidecar`) is an alternative for standalone
+transparent-routing experiments on the host and is not used in the compose
+stack.
+
+## Validation
+
+Run the compose smoke test to verify the sidecars start and the hardened
+`sni-proxy` correctly allows allowlisted HTTP/HTTPS traffic and blocks
+non-allowlisted domains:
+
+```bash
+./scripts/test_compose.sh
+```

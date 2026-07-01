@@ -129,6 +129,16 @@ services:
   sni-proxy:
     image: python:3.12-slim
     restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    user: "1000:1000"
+    pids_limit: 64
+    mem_limit: 128m
+    tmpfs:
+      - /tmp:rw,size=10m
     command:
       - "python3"
       - "-u"
@@ -143,8 +153,8 @@ services:
     working_dir: /app
     volumes:
       - ./sandbox:/app/sandbox:ro
-    ports:
-      - "8888:8888"
+    expose:
+      - "8888"
     healthcheck:
       test:
         - "CMD"

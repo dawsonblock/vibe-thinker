@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.4.6a6
+
+Compose proxy hardening and validation.
+
+### Fixed
+- Hardened docker-compose `sni-proxy` service with read-only root, dropped
+capabilities, no-new-privileges, non-root user, PID/memory limits, and tmpfs.
+- Clarified that Envoy sidecar is transparent-routing only, not HTTP_PROXY.
+- Added compose smoke test for HTTP allow, HTTPS allow, and blocked-domain
+behavior.
+
+### Added
+- `scripts/test_compose.sh`
+- `tests/test_compose_config.py`
+
 ## v0.4.6a5
 
 Fail-closed federation encryption, wildcard allow-list fix, gate

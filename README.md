@@ -5,7 +5,7 @@ queries between a high-precision reasoning specialist and a generalist
 model, with deterministic verifiers, bi-temporal audit logging, and an
 interactive CLI.
 
-## Current status: ALPHA (v0.4.6a5)
+## Current status: ALPHA (v0.4.6a6)
 
 **Not production-safe.** This is alpha software. See `docs/roadmap.md`
 for the stabilization plan and frozen feature scope.
@@ -137,6 +137,7 @@ Each profile is a self-contained gate that creates its own isolated venv
 ```bash
 ./scripts/test_core.sh        # fast core (no optional deps) — compile, doctor, smoke, ~250 curated tests (~30s)
 ./scripts/test_local.sh       # broad local gate — full ~1000+ core-marker selection (~70s, pre-release)
+./scripts/test_compose.sh     # compose: CPU sidecars start, sni-proxy HTTP/HTTPS allow/block smoke
 ./scripts/test_docker.sh      # sandbox: tests marked sandbox / requires_docker_gateway
 ./scripts/test_embeddings.sh  # embeddings: numpy + sklearn + sentence-transformers + faiss
 ./scripts/test_federation.sh  # federation + web: Redis/fakeredis + FastAPI/WebSocket
@@ -149,6 +150,27 @@ The core Python gate never requires Rust. RuvLLM is opt-in: a stub build
 core gate's turboquant tests; the real build (candle / inference-metal) is
 validated only by `check_ruvllm.sh`. An optional Rust failure does not
 block the core Python gate.
+
+## Docker Compose sidecars
+
+The `docker-compose.yml` stack bundles the sidecars (Redis, AgentDB, and
+SNI egress proxy) so you can run the orchestrator with a single
+`docker compose --profile cpu up` command. The egress proxy is the
+**Python SNI proxy** (`sandbox/sni_proxy.py`), not the Envoy sidecar.
+
+- **Python `sni-proxy` service** — HTTP/HTTPS CONNECT proxy used for
+  `HTTP_PROXY`/`HTTPS_PROXY` routing in compose. It is hardened with a
+  read-only filesystem, dropped capabilities (`ALL`),
+  `no-new-privileges`, a non-root user (`1000:1000`), a 64-process PID
+  limit, 128 MB memory limit, and a 10 MB tmpfs `/tmp`. It is not
+  published on a host port by default; only the internal compose
+  network can reach port `8888`.
+- **Envoy sidecar** — reserved for the standalone `--envoy-sidecar` CLI
+  flag, which launches Envoy as a child process on the host for
+  transparent-routing experiments. Envoy is **not** used as the HTTP
+  proxy in the compose stack.
+
+Validate the compose stack with `./scripts/test_compose.sh`.
 
 ## Sandbox network status
 

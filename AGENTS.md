@@ -3,7 +3,7 @@
 > **Version-tag convention:** Tags like `v3.2`, `v3.2.1`, `v0.3.9`,
 > `v1.1`, `v1.2` etc. refer to **historical internal phase numbering**
 > from earlier development cycles. They do NOT correspond to the
-> package version (currently `v0.4.6a5`, set in `pyproject.toml`).
+> package version (currently `v0.4.6a6`, set in `pyproject.toml`).
 > Treat them as historical context labels, not current release markers.
 
 ## Verify / test
@@ -13,6 +13,7 @@
 - **Release gate profiles** (self-contained venvs, fresh-clone safe):
   - Fast core gate: `./scripts/test_core.sh` (env-aware; standalone creates `.venv-core` + installs `-e ".[dev,test]"`; runs compile + doctor + smoke + a curated fast subset — spine, anti-regression static checks, routing/REPL/cache/scoring/signers/deterministic/math-verifier/format-enforcer/trajectory — ~280 tests, ~45s, zero skips)
   - Broad local gate: `./scripts/test_local.sh` (env-aware; the full ~1000+ core-marker selection, ~70s — the pre-release confidence gate)
+  - Compose sidecar gate: `./scripts/test_compose.sh` (starts `redis` + hardened `sni-proxy`, validates HTTP allow, HTTPS allow, blocked domain)
   - Docker sandbox gate: `./scripts/test_docker.sh` (`.venv-docker`, `sandbox`/`requires_docker_gateway` markers)
   - Embeddings gate: `./scripts/test_embeddings.sh` (`.venv-embeddings`, `embeddings` marker)
   - Federation/web gate: `./scripts/test_federation.sh` (`.venv-federation`, `federation`/`web` markers)
@@ -70,6 +71,14 @@
 - Full-stack integration (needs live model servers): `python test_full_stack.py`
 - A benign `ResourceTracker.__del__` AttributeError prints after pytest exits on
   macOS Python 3.12 — it is multiprocessing teardown noise, NOT a test failure.
+- **Compose `sni-proxy` hardening**: the Docker Compose stack uses the Python
+  SNI proxy (`sandbox/sni_proxy.py`) as the HTTP/HTTPS CONNECT proxy for the
+  sandbox. The `sni-proxy` service is hardened with read-only root filesystem,
+  `cap_drop: ALL`, `no-new-privileges`, non-root user `1000:1000`, a 64-process
+  PID limit, 128 MB memory limit, and a 10 MB tmpfs `/tmp`. The Envoy sidecar
+  (`--envoy-sidecar` / `sandbox/envoy_sidecar.py`) is for standalone
+  transparent-routing experiments on the host and is **not** used as the
+  HTTP proxy in compose. Validate with `./scripts/test_compose.sh`.
 
 ## RuFlo integration abstractions (v0.3.9)
 Four pluggable abstractions from the Vibe-Thinker + RuFlo Integration Plan.
