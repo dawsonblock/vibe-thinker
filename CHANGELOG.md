@@ -9,6 +9,9 @@ forwarding flagged in the v0.4.6a7 audit.
 - `CLRResultCache.lookup()` and `VerifiedTrajectoryStore.retrieve()` now search
   the AgentDB vector store *before* the `if not self.entries` local-JSON early
   return, so `agentdb_only=True` works even after local JSON files are archived.
+- Restored the missing `sims = cosine_similarity(...)` assignment in
+  `CLRResultCache.lookup()` so the local embeddings semantic cache path no longer
+  raises `NameError: name 'sims' is not defined`.
 - `sni_proxy.py` now applies CIDR port restrictions to concrete IPs inside the
   CIDR (e.g. `10.0.0.0/24:443` blocks `10.0.0.5:80`).
 - HTTP proxy path in `sni_proxy.py` now uses the absolute-URL target host for
@@ -24,8 +27,14 @@ forwarding flagged in the v0.4.6a7 audit.
 ### Added
 - `tests/test_agentdb_only.py` with empty-local-JSON + AgentDB-result tests for
   both `CLRResultCache` and `VerifiedTrajectoryStore`.
+- Regression test for the local embeddings semantic path in `CLRResultCache`.
 - Tests for CIDR port restrictions and HTTP absolute-URL / Host-header mismatch
   in `tests/test_sni_proxy.py`.
+
+### Changed
+- `agentdb_only=True` now prints a warning when no embedding model is available
+  (instead of silently returning nothing) so the dependency requirement is
+  explicit for the AgentDB vector-store path.
 
 ### Verified
 - Full release gate matrix passes on this environment: core (280 tests), broad

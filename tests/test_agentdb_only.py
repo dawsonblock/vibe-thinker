@@ -160,6 +160,48 @@ def _populate_agentdb(vector_store, kind="clr"):
         )
 
 
+class TestCLRResultCacheLocalSemanticPath:
+    """Local embeddings matrix path in CLRResultCache (regression guard)."""
+
+    def test_local_semantic_lookup(self, tmp_path, monkeypatch):
+        """A populated local cache returns a semantic match via cosine_similarity.
+
+        Regression test for the missing `sims = cosine_similarity(...)` line
+        in CLRResultCache.lookup(), which caused NameError on the local
+        embeddings path.
+        """
+        # Avoid loading the real SentenceTransformer model in this unit test.
+        monkeypatch.setattr(
+            "persistent_cache.get_shared_embedding_model",
+            lambda _name: FakeEmbedder(),
+        )
+        vs = FakeVectorStore()
+        path = str(tmp_path / "clr.json")
+        cache = CLRResultCache(
+            path=path,
+            vector_store=vs,
+            similarity_mode=None,
+            agentdb_only=False,
+        )
+        cache.insert(
+            problem="problem beta",
+            best_answer="answer beta",
+            best_score=0.95,
+            verified=True,
+            verification_method="math_verifier",
+            k=4,
+            trajectory_count=6,
+            claim_count=10,
+        )
+        assert cache.entries
+        result = cache.lookup("problem beta")
+        assert result is not None
+        assert result["best_answer"] == "answer beta"
+        assert result["best_score"] == 0.95
+        assert result["matched_problem"] == "problem beta"
+        assert result["cached"] is True
+
+
 class TestAgentDBOnlyCLRResultCache:
     """CLRResultCache returns AgentDB results even when local JSON is empty."""
 

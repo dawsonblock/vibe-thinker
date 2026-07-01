@@ -676,6 +676,12 @@ class CLRResultCache:
         # not hide AgentDB results.
         if self.agentdb_only and self._vector_store is not None:
             if self.model is None:
+                print(
+                    "[CLRResultCache] WARNING: agentdb_only=True but no "
+                    "embedding model available — cannot query AgentDB vector "
+                    "store. Install sentence-transformers or provide a local "
+                    "specialist model."
+                )
                 return None
             q_emb = self.model.encode([problem])[0].reshape(1, -1)
             results = self._vector_store.search(
@@ -750,6 +756,7 @@ class CLRResultCache:
 
         # Semantic similarity path (EMBEDDINGS mode).
         q_emb = self.model.encode([problem])[0].reshape(1, -1)
+        sims = cosine_similarity(q_emb, self._embeddings_matrix)[0]
         # Search entries in order of similarity, return the first
         # trustworthy one above the threshold.
         ranked_indices = np.argsort(sims)[::-1]
@@ -1103,6 +1110,12 @@ class VerifiedTrajectoryStore:
         # not hide AgentDB results.
         if self.agentdb_only and self._vector_store is not None:
             if self.model is None:
+                print(
+                    "[VerifiedTrajectoryStore] WARNING: agentdb_only=True "
+                    "but no embedding model available — cannot query AgentDB "
+                    "vector store. Install sentence-transformers or provide a "
+                    "local specialist model."
+                )
                 return []
             q_emb = self.model.encode([query])[0].reshape(1, -1)
             results = self._vector_store.search(
