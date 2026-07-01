@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fast core test gate — no optional dependencies required.
+# Fast core test gate — lightweight test deps required.
 #
 # This is the crisp, fast confidence gate (target: well under 5 minutes).
 # It runs compile + doctor + smoke + a curated fast subset of the test
@@ -8,6 +8,10 @@
 #   - the anti-regression static AST checks (missing-self / unreachable)
 #   - routing, REPL, cache, scoring, signers, deterministic check,
 #     math verifier, format enforcer, trajectory store
+#
+# The [dev,test] extras install the lightweight runtime deps needed for
+# these tests (numpy, scikit-learn, cryptography, z3-solver). Heavy extras
+# (sentence-transformers, faiss-cpu, transformers/torch) are NOT included.
 #
 # For the BROAD local suite (all ~1000+ core-marker tests, ~15 min) use
 # scripts/test_local.sh instead. The fast gate here is what
@@ -37,7 +41,7 @@ else
   python -m pip install -U pip >/dev/null
   # Editable install + dev/test deps. Pins pytest<9 and installs
   # pytest-timeout (registers the `timeout` marker), hypothesis, ruff.
-  python -m pip install -e "$ROOT[dev]" >/dev/null
+  python -m pip install -e "$ROOT[dev,test]" >/dev/null
 fi
 
 cd "$ROOT"
@@ -46,7 +50,7 @@ python rfsn_cli.py doctor
 python rfsn_cli.py smoke
 
 # Fast core subset — the anti-regression + spine + core unit tests.
-# 248 passed / 32 skipped in ~27s on macOS. See header comment.
+# Target: 280 passed / 0 skipped. See header comment.
 FAST_CORE_TESTS="
 tests/test_orchestrator_runtime_spine.py
 tests/test_static_missing_self_methods.py

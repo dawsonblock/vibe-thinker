@@ -7,11 +7,11 @@
 > Treat them as historical context labels, not current release markers.
 
 ## Verify / test
-- Fast core gate: `./scripts/test_core.sh` (~250 curated tests, ~30s — the iteration gate)
+- Fast core gate: `./scripts/test_core.sh` (~280 curated tests, ~45s — the iteration gate, zero skips)
 - Broad local gate: `./scripts/test_local.sh` (~1000+ core-marker tests, ~70s — the pre-release gate)
 - Full suite (all markers, needs all optional deps): `python3 -m pytest -q`
 - **Release gate profiles** (self-contained venvs, fresh-clone safe):
-  - Fast core gate: `./scripts/test_core.sh` (env-aware; standalone creates `.venv-core` + installs `-e ".[dev]"`; runs compile + doctor + smoke + a curated fast subset — spine, anti-regression static checks, routing/REPL/cache/scoring/signers/deterministic/math-verifier/format-enforcer/trajectory — ~250 tests, ~30s)
+  - Fast core gate: `./scripts/test_core.sh` (env-aware; standalone creates `.venv-core` + installs `-e ".[dev,test]"`; runs compile + doctor + smoke + a curated fast subset — spine, anti-regression static checks, routing/REPL/cache/scoring/signers/deterministic/math-verifier/format-enforcer/trajectory — ~280 tests, ~45s, zero skips)
   - Broad local gate: `./scripts/test_local.sh` (env-aware; the full ~1000+ core-marker selection, ~70s — the pre-release confidence gate)
   - Docker sandbox gate: `./scripts/test_docker.sh` (`.venv-docker`, `sandbox`/`requires_docker_gateway` markers)
   - Embeddings gate: `./scripts/test_embeddings.sh` (`.venv-embeddings`, `embeddings` marker)

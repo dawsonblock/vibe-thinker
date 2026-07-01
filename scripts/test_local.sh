@@ -6,13 +6,12 @@
 # Env-aware: if a virtualenv is already active (VIRTUAL_ENV set), it is
 # reused as-is. Standalone invocation creates and reuses .venv-local.
 #
-# Marker selection is dep-aware: optional-dep markers (logic, embeddings,
-# federation, web, nli) are only excluded when their deps are NOT
-# installed. This means a venv with all optional deps runs the full
-# suite (~1300+ tests), while a core-only venv runs the core subset
-# (~1000 tests). The sandbox/integration/requires_docker_gateway markers
-# are always excluded (they need a running Docker daemon + gateway
-# container, not just Python packages).
+# Standalone installs the [dev,test] extras so the lightweight core-test
+# deps (numpy, scikit-learn, cryptography, z3-solver) are always present.
+# Additional optional-dep markers (federation, web, nli) are only included
+# when their heavier deps are installed. The sandbox/integration/
+# requires_docker_gateway markers are always excluded (they need a running
+# Docker daemon + gateway container, not just Python packages).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -28,7 +27,7 @@ else
   # shellcheck disable=SC1091
   source "$VENV/bin/activate"
   python -m pip install -U pip >/dev/null
-  python -m pip install -e "$ROOT[dev]" >/dev/null
+  python -m pip install -e "$ROOT[dev,test]" >/dev/null
 fi
 
 cd "$ROOT"

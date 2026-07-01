@@ -31,6 +31,12 @@ test = [
     "pytest-asyncio>=0.21,<1",
     "pytest-timeout>=2.0,<3",
     "hypothesis>=6.0,<7",
+    # Lightweight runtime deps required by the fast core gate tests.
+    "numpy>=1.24,<2",
+    "scikit-learn>=1.3,<2",
+    "cryptography>=43.0.1,<46",
+    "z3-solver>=4.12,<5",
+    "pyyaml>=6.0,<7",
 ]
 logic = [
     "z3-solver>=4.12,<5",
