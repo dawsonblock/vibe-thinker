@@ -27,6 +27,11 @@ forwarding flagged in the v0.4.6a7 audit.
 - Tests for CIDR port restrictions and HTTP absolute-URL / Host-header mismatch
   in `tests/test_sni_proxy.py`.
 
+### Verified
+- Full release gate matrix passes on this environment: core (280 tests), broad
+  local (1121 tests), Docker sandbox, compose, federation/web, embeddings,
+  RuvLLM Rust build, wheel install, ZIP release self-test, and release gate.
+
 ## v0.4.6a7
 
 Packaging, enforcement, and AgentDB consistency fixes from the build-40
