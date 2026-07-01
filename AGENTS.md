@@ -1544,9 +1544,9 @@ provided AND no `agentdb_url` is set. `LocalVectorStore` is KEPT as the
 zero-build default (NOT deprecated) because it supports `delete` and
 `cluster`, which the HNSW binding does NOT expose — deprecating it would
 regress those features and force a hard Rust build to run the orchestrator.
-`ShadowVectorStore` is DEPRECATED (emits a `DeprecationWarning`); new
-deployments should cut over to `--agentdb-only` mode after verifying
-recall rather than running shadow mode indefinitely.
+`ShadowVectorStore` has been REMOVED. New deployments should use AgentDB
+directly via `--agentdb-url` and cut over reads with `--agentdb-only` after
+verifying recall.
 
 ### Z3-grammar constraint on logic translation (Step 2.3 revised)
 New `SchemaKind.LOGIC_CONSTRAINTS` + `LOGIC_CONSTRAINTS_GRAMMAR` (GBNF)

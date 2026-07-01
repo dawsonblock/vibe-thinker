@@ -609,13 +609,13 @@ def make_vector_store(
         build to run the orchestrator at all.
       - ShadowVectorStore has been REMOVED (v3.2.1). It was a migration
         scaffold (dual-write local + AgentDB, local-read-with-fallback)
-        for the local->AgentDB cut-over. The deprecation path is complete:
-        when ``agentdb_url`` is set, AgentDB is used DIRECTLY (no local
-        shadow/fallback). Fail-closed: if AgentDB is down, searches return
-        empty. Operators who were running shadow mode must cut over to
-        AgentDB-only (run ``finalize-migration`` first to archive local
-        JSON, then restart with ``--agentdb-url``). The ``shadow_primary``
-        parameter is no longer accepted.
+        for the local->AgentDB cut-over. When ``agentdb_url`` is set,
+        AgentDB is used DIRECTLY (no local fallback). Fail-closed: if
+        AgentDB is down, searches return empty. Operators who were using the
+        dual-write scaffold must cut over to AgentDB-only (run
+        ``finalize-migration`` first to archive local JSON, then restart
+        with ``--agentdb-url``). The ``shadow_primary`` parameter is no
+        longer accepted.
       - ``dim`` is required for RuvLLMVectorStore (HNSW needs the vector
         dimension at construction). If dim is None and RuvLLM would be
         selected, we fall through to LocalVectorStore (which is dim-agnostic).
