@@ -96,7 +96,7 @@ USER vibe
 ENV VIBE_THINKER_URL=http://127.0.0.1:8080 \
     GENERALIST_URL=http://127.0.0.1:8081 \
     AGENTDB_URL=http://agentdb:8088 \
-    RFSN_PROXY_EGRESS=envoy:8888 \
+    RFSN_PROXY_EGRESS=sni-proxy:8888 \
     RFSN_AUDIT_LOG=/data/rfsn_jobs_bitemporal.jsonl \
     TRAJECTORY_STORE_PATH=/data/verified_trajectories.json \
     RFSN_MAX_CONCURRENT=2

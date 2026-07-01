@@ -1,6 +1,11 @@
-"""Envoy sidecar config generator + launcher for SNI-aware egress.
+"""Envoy sidecar config generator + launcher for TRANSPARENT SNI-aware egress.
 
-This is the enterprise-grade replacement for the Python `sni_proxy.py`.
+WARNING: The generated config is for TRANSPARENT SNI routing (e.g. via
+iptables TPROXY), NOT for HTTP_PROXY/HTTPS_PROXY. It will NOT work when
+a sandbox client is configured with HTTP_PROXY=envoy:8888. For HTTP_PROXY
+use the Python SNI proxy (sandbox/sni_proxy.py), which is the proxy
+used by the docker-compose stack.
+
 Envoy provides features the Python proxy lacks (note: enforced egress
 is EXPERIMENTAL — not production-safe until real bypass tests pass):
 
@@ -14,15 +19,15 @@ is EXPERIMENTAL — not production-safe until real bypass tests pass):
 
 This module GENERATES an Envoy config (YAML/JSON) from a
 NetworkAllowList, and provides a launcher that starts Envoy as a
-sidecar process. The sandbox container's HTTP_PROXY/HTTPS_PROXY env
-vars point at the Envoy listener (default 127.0.0.1:8888), same as the
-Python SNI proxy — so docker_executor.py needs no changes.
+sidecar process. In transparent-routing mode the client connection is
+redirected to Envoy without changing the destination IP; the original
+destination is preserved and used by the ORIGINAL_DST cluster.
 
-Architecture:
+Architecture (transparent mode):
   Host/sidecar:  Envoy (listener :8888)
                    |
                    v
-  Sandbox:       HTTP_PROXY=http://host.docker.internal:8888
+  Sandbox:       connection redirected to Envoy (TPROXY / transparent proxy)
                    |
                    v
                  Envoy inspects SNI/Host -> allow/deny -> tunnel to upstream
@@ -39,10 +44,9 @@ The launcher checks for the `envoy` binary on PATH and refuses to start
 if not found (fail-closed). It does NOT install Envoy — that is an
 infrastructure concern (Helm chart, Docker compose, etc.).
 
-NOTE: This module does NOT perform TLS interception. Like the Python
-SNI proxy, it inspects only the cleartext SNI (in the TLS ClientHello)
-and the HTTP Host header. The TLS traffic passes through untouched via
-CONNECT tunneling (tcp_proxy).
+NOTE: This module does NOT perform TLS interception. It inspects only the
+cleartext SNI (in the TLS ClientHello) and the HTTP Host header. The TLS
+traffic passes through untouched via tcp_proxy tunneling.
 """
 
 from __future__ import annotations
@@ -69,9 +73,15 @@ def generate_envoy_config(
 ) -> Dict[str, Any]:
     """Generate an Envoy config dict from a NetworkAllowList.
 
-    The config implements a CONNECT-proxy listener that:
-      1. Inspects the TLS SNI via tls_inspector (for HTTPS CONNECT).
-      2. Inspects the HTTP Host header (for plain HTTP CONNECT).
+    WARNING: The generated config is for TRANSPARENT SNI routing, NOT
+    HTTP_PROXY/HTTPS_PROXY. The client connection must be redirected to
+    Envoy while preserving the original destination IP (e.g. TPROXY). It
+    does NOT speak HTTP CONNECT, so it will NOT work with
+    HTTP_PROXY=host:8888.
+
+    The config implements a transparent SNI-proxy listener that:
+      1. Inspects the TLS SNI via tls_inspector (for HTTPS).
+      2. Inspects the HTTP Host header (for plain HTTP, if transparent).
       3. Matches the SNI/Host against the allow-list domains.
       4. Tunnels allowed connections to the resolved upstream.
       5. Denies (closes) disallowed connections.
@@ -142,6 +152,14 @@ def generate_envoy_config(
                             "port_value": listen_port,
                         }
                     },
+                    "listener_filters": [
+                        {
+                            "name": "envoy.filters.listener.tls_inspector",
+                            "typed_config": {
+                                "@type": "type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector",
+                            },
+                        }
+                    ],
                     "filter_chains": [
                         {
                             "filters": [

@@ -1,10 +1,19 @@
 # =============================================================================
-# Envoy sidecar config — SNI-aware egress proxy for the code sandbox
+# Envoy sidecar config — TRANSPARENT SNI-aware egress proxy (experimental)
 # =============================================================================
+# WARNING: This config is for TRANSPARENT SNI routing, NOT an HTTP_PROXY.
+# It expects the client connection to be redirected to Envoy preserving the
+# original destination IP (e.g. via iptables TPROXY). It does NOT implement
+# HTTP CONNECT, so it will NOT work when the sandbox is configured with
+# HTTP_PROXY=envoy:8888 / HTTPS_PROXY=envoy:8888.
+#
+# For the docker-compose stack, use the Python SNI proxy (sni-proxy service,
+# sandbox/sni_proxy.py) which correctly implements HTTP/HTTPS CONNECT proxying.
+# This Envoy config is kept for the standalone --envoy-sidecar / transparent-
+# routing path only.
+#
 # Generated to match the structure produced by sandbox/envoy_sidecar.py
-# `generate_envoy_config()` (listen_port=8888, admin_port=9901), so the
-# orchestrator's --envoy-sidecar path and the sandbox's HTTP_PROXY=envoy:8888
-# egress routing work unchanged.
+# `generate_envoy_config()` (listen_port=8888, admin_port=9901).
 #
 #   Listener: 0.0.0.0:8888  (envoy_sidecar.py:63 listen_port default 8888)
 #   Admin:    127.0.0.1:9901 (envoy_sidecar.py:65 admin_port default 9901)
@@ -12,7 +21,6 @@
 # This is a MINIMAL config with an example allow-list (pypi.org). The
 # orchestrator's --envoy-sidecar flag normally GENERATES this config at runtime
 # from --network-allowlist (sandbox/envoy_sidecar.py:61 generate_envoy_config).
-# For the compose stack we ship a static file so Envoy can start independently.
 #
 # To tighten egress, edit the `exact_match_map` below to list the domains your
 # sandbox must reach. Domains not in the map hit `on_no_match` -> deny_sinkhole
@@ -33,6 +41,10 @@ static_resources:
         socket_address:
           address: 0.0.0.0
           port_value: 8888
+      listener_filters:
+        - name: envoy.filters.listener.tls_inspector
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
       filter_chains:
         - filter_chain_match:
             server_names: ["pypi.org"]

@@ -95,8 +95,8 @@ The most important ones:
 | `RUVLLM_URL` | `--ruvllm-url` | (empty) | RuvLLM endpoint (overrides `--vibe`) |
 | `AGENTDB_URL` | `--agentdb-url` | `http://agentdb:8088` | AgentDB vector store endpoint |
 | `VIBE_THINKER_AGENTDB_ONLY` | `--agentdb-only` | `false` | AgentDB-only mode (no local fallback) |
-| `RFSN_ENVOY_SIDECAR` | `--envoy-sidecar` | `1` | Enable Envoy egress proxy |
-| `RFSN_PROXY_EGRESS` | `--proxy-egress` | `envoy:8888` | Sandbox egress proxy address |
+| `RFSN_ENVOY_SIDECAR` | `--envoy-sidecar` | (empty) | Launch Envoy as a child process (host mode, not used in compose) |
+| `RFSN_PROXY_EGRESS` | `--proxy-egress` | `sni-proxy:8888` | Sandbox egress proxy address (Python SNI proxy in compose) |
 | `RFSN_NETWORK_ALLOWLIST` | `--network-allowlist` | `pypi.org:443,files.pythonhosted.org:443` | Allowed sandbox egress domains |
 | `FEDERATION_URL` | `--federation-url` | (empty) | Federation coordinator URL (multi-node) |
 | `RFSN_MAX_CONCURRENT` | `--max-concurrent` | `2` | Max concurrent jobs |
