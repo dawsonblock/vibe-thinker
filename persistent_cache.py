@@ -671,6 +671,43 @@ class CLRResultCache:
             allow_weak_cache: if True, allow self_claims_only entries
                 through lookup. Default is False.
         """
+        # AgentDB-only mode: the vector store is the authoritative index.
+        # Run this FIRST so that an empty or archived local JSON file does
+        # not hide AgentDB results.
+        if self.agentdb_only and self._vector_store is not None:
+            if self.model is None:
+                return None
+            q_emb = self.model.encode([problem])[0].reshape(1, -1)
+            results = self._vector_store.search(
+                q_emb.tolist(), top_k=1
+            )
+            if results:
+                _vid, best_sim, metadata = results[0]
+                if best_sim >= self.similarity_threshold:
+                    if float(metadata.get("best_score", 0)) >= self.min_score:
+                        entry = dict(metadata)
+                        if is_cache_entry_trustworthy(
+                            entry, allow_weak_cache=allow_weak_cache
+                        ):
+                            return {
+                                "best_answer": metadata.get("best_answer", ""),
+                                "best_score": float(metadata.get("best_score", 0)),
+                                "k": metadata.get("k"),
+                                "timestamp": metadata.get("timestamp"),
+                                "trajectory_count": metadata.get("trajectory_count"),
+                                "verification_method": metadata.get(
+                                    "verification_method", "self_claims_only"
+                                ),
+                                "verified": bool(metadata.get("verified", False)),
+                                "schema_version": metadata.get(
+                                    "schema_version", 1
+                                ),
+                                "cached": True,
+                                "similarity": float(best_sim),
+                                "matched_problem": metadata.get("problem", ""),
+                            }
+            return None
+
         if not self.entries:
             return None
 
@@ -713,40 +750,6 @@ class CLRResultCache:
 
         # Semantic similarity path (EMBEDDINGS mode).
         q_emb = self.model.encode([problem])[0].reshape(1, -1)
-
-        # AgentDB-only mode: search the vector store directly.
-        if self.agentdb_only and self._vector_store is not None:
-            results = self._vector_store.search(
-                q_emb.tolist(), top_k=1
-            )
-            if results:
-                _vid, best_sim, metadata = results[0]
-                if best_sim >= self.similarity_threshold:
-                    if float(metadata.get("best_score", 0)) >= self.min_score:
-                        entry = dict(metadata)
-                        if is_cache_entry_trustworthy(
-                            entry, allow_weak_cache=allow_weak_cache
-                        ):
-                            return {
-                                "best_answer": metadata.get("best_answer", ""),
-                                "best_score": float(metadata.get("best_score", 0)),
-                                "k": metadata.get("k"),
-                                "timestamp": metadata.get("timestamp"),
-                                "trajectory_count": metadata.get("trajectory_count"),
-                                "verification_method": metadata.get(
-                                    "verification_method", "self_claims_only"
-                                ),
-                                "verified": bool(metadata.get("verified", False)),
-                                "schema_version": metadata.get(
-                                    "schema_version", 1
-                                ),
-                                "cached": True,
-                                "similarity": float(best_sim),
-                                "matched_problem": metadata.get("problem", ""),
-                            }
-            return None
-
-        sims = cosine_similarity(q_emb, self._embeddings_matrix)[0]
         # Search entries in order of similarity, return the first
         # trustworthy one above the threshold.
         ranked_indices = np.argsort(sims)[::-1]
@@ -852,7 +855,7 @@ class CLRResultCache:
             self.save()
         # AgentDB vector store: when configured, mirror the insert to it.
         # In agentdb_only mode this is the primary search index; otherwise
-        # it is a migration target. Failures are non-fatal.
+        # it is a mirror for migration. Failures are non-fatal.
         #
         # CRITICAL: do NOT upsert empty embeddings. When the embedding
         # model is unavailable (self.model is None), embedding is [].
@@ -1095,6 +1098,39 @@ class VerifiedTrajectoryStore:
           - verification_method: how it was verified
           - similarity: cosine similarity to the current query
         """
+        # AgentDB-only mode: the vector store is the authoritative index.
+        # Run this FIRST so that an empty or archived local JSON file does
+        # not hide AgentDB results.
+        if self.agentdb_only and self._vector_store is not None:
+            if self.model is None:
+                return []
+            q_emb = self.model.encode([query])[0].reshape(1, -1)
+            results = self._vector_store.search(
+                q_emb.tolist(), top_k=self.max_few_shot
+            )
+            candidates = []
+            for _vid, sim, metadata in results:
+                if sim < self.retrieval_threshold:
+                    break
+                if task_type and metadata.get("task_type") != task_type:
+                    continue
+                entry = dict(metadata)
+                if not is_cache_entry_trustworthy(entry):
+                    continue
+                candidates.append({
+                    "query": metadata.get("query", ""),
+                    "answer": metadata.get("answer", ""),
+                    "score": float(metadata.get("score", 0.0)),
+                    "verification_method": metadata.get(
+                        "verification_method", ""
+                    ),
+                    "task_type": metadata.get("task_type", ""),
+                    "similarity": float(sim),
+                })
+                if len(candidates) >= self.max_few_shot:
+                    break
+            return candidates
+
         if not self.entries:
             return []
 
@@ -1132,35 +1168,6 @@ class VerifiedTrajectoryStore:
 
         # Semantic similarity path (EMBEDDINGS mode).
         q_emb = self.model.encode([query])[0].reshape(1, -1)
-
-        # AgentDB-only mode: search the vector store directly.
-        if self.agentdb_only and self._vector_store is not None:
-            results = self._vector_store.search(
-                q_emb.tolist(), top_k=self.max_few_shot
-            )
-            candidates = []
-            for _vid, sim, metadata in results:
-                if sim < self.retrieval_threshold:
-                    break
-                if task_type and metadata.get("task_type") != task_type:
-                    continue
-                entry = dict(metadata)
-                if not is_cache_entry_trustworthy(entry):
-                    continue
-                candidates.append({
-                    "query": metadata.get("query", ""),
-                    "answer": metadata.get("answer", ""),
-                    "score": float(metadata.get("score", 0.0)),
-                    "verification_method": metadata.get(
-                        "verification_method", ""
-                    ),
-                    "task_type": metadata.get("task_type", ""),
-                    "similarity": float(sim),
-                })
-                if len(candidates) >= self.max_few_shot:
-                    break
-            return candidates
-
         sims = cosine_similarity(q_emb, self._embeddings_matrix)[0]
 
         candidates = []
@@ -1301,7 +1308,7 @@ class VerifiedTrajectoryStore:
             self.save()
         # AgentDB vector store: when configured, mirror the insert to it.
         # In agentdb_only mode this is the primary search index; otherwise
-        # it is a migration target. Failures are non-fatal.
+        # it is a mirror for migration. Failures are non-fatal.
         #
         # CRITICAL: do NOT upsert empty embeddings. When the embedding
         # model is unavailable (self.model is None), embedding is [].
@@ -1317,6 +1324,8 @@ class VerifiedTrajectoryStore:
                         "query": query,
                         "answer": answer,
                         "score": float(score),
+                        "best_answer": answer,
+                        "best_score": float(score),
                         "verification_method": verification_method,
                         "task_type": task_type,
                         "route_taken": route_taken,
@@ -1325,6 +1334,7 @@ class VerifiedTrajectoryStore:
                         "schema_version": int(
                             entry.get("schema_version", 1)
                         ),
+                        "claim_count": 10,
                     },
                 )
             except Exception:

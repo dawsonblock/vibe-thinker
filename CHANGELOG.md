@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.4.6a8
+
+Fixes for the critical AgentDB cutover path, network enforcement, and UI option
+forwarding flagged in the v0.4.6a7 audit.
+
+### Fixed
+- `CLRResultCache.lookup()` and `VerifiedTrajectoryStore.retrieve()` now search
+  the AgentDB vector store *before* the `if not self.entries` local-JSON early
+  return, so `agentdb_only=True` works even after local JSON files are archived.
+- `sni_proxy.py` now applies CIDR port restrictions to concrete IPs inside the
+  CIDR (e.g. `10.0.0.0/24:443` blocks `10.0.0.5:80`).
+- HTTP proxy path in `sni_proxy.py` now uses the absolute-URL target host for
+  allow-list and port decisions, and rejects requests where the absolute URL
+  host mismatches the `Host` header.
+- `run_ui.py` now forwards every orchestrator option exposed by `rfsn_cli.py`
+  (including `--agentdb-only`, `--use-structured-output`, `--specialist-*`,
+  `--sandbox-network`, `--proxy-egress`, `--sona-*`, etc.).
+- Removed stale "shadow-mode" and "no-op" wording from CLI help, README,
+  AGENTS.md, and tests so the docs match the actual dual-write / cut-over
+  behavior.
+
+### Added
+- `tests/test_agentdb_only.py` with empty-local-JSON + AgentDB-result tests for
+  both `CLRResultCache` and `VerifiedTrajectoryStore`.
+- Tests for CIDR port restrictions and HTTP absolute-URL / Host-header mismatch
+  in `tests/test_sni_proxy.py`.
+
 ## v0.4.6a7
 
 Packaging, enforcement, and AgentDB consistency fixes from the build-40

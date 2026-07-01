@@ -381,6 +381,12 @@ class SNIEgressProxy:
         pattern key ``*.example.com``; without this lookup a request to
         ``foo.example.com:80`` would find no exact key and be allowed,
         defeating the port restriction.
+
+        CIDR-aware: when the host is a concrete IP and there is no exact
+        IP port restriction, we also check any CIDR prefix in allowed_ports
+        that contains the IP. A CIDR entry like ``10.0.0.0/24:443`` stores
+        its restriction under the key ``10.0.0.0/24``; without this lookup a
+        request to ``10.0.0.5:80`` would find no exact key and be allowed.
         """
         host = host.lower().strip()
         ports = self.allowed_ports.get(host)
@@ -395,7 +401,20 @@ class SNIEgressProxy:
                 ports = self.allowed_ports.get(pattern.lower())
                 if ports:
                     return port in ports
-        # No exact key and no matching wildcard key with a restriction —
+        # CIDR-aware: if the host is an IP, check any containing CIDR.
+        try:
+            addr = ipaddress.ip_address(host)
+        except ValueError:
+            addr = None
+        if addr is not None:
+            for key, ports in self.allowed_ports.items():
+                try:
+                    network = ipaddress.ip_network(key, strict=False)
+                    if addr in network:
+                        return port in ports
+                except ValueError:
+                    continue
+        # No exact key and no matching wildcard/CIDR key with a restriction —
         # all ports allowed (backward compat).
         return True
 
@@ -617,16 +636,17 @@ class SNIEgressProxy:
     ):
         """Handle a plain HTTP request.
 
-        Extract the Host header and check the host AND port against
-        the allow-list. The port is taken from the Host header (or
-        defaults to 80 if not specified). If the allow-list entry for
-        this host specifies ports (e.g. example.com:80), only those
-        ports are allowed for plain HTTP.
+        The allow decision is based on the request target host:
+          - An absolute URL (``GET http://host/path``) is authoritative.
+          - A relative URL uses the ``Host`` header.
+        If both are present, they must agree (the Host header must name
+        the same host as the absolute URL). The allow-list is then
+        checked against the target host and port.
         """
         # Read headers to find Host.
         headers = ""
-        host = None
-        host_port = None  # port from Host header (if specified)
+        host_header = None
+        host_header_port = None  # port from Host header (if specified)
         while True:
             header = await asyncio.wait_for(
                 client_reader.readline(), timeout=5.0
@@ -637,80 +657,99 @@ class SNIEgressProxy:
             headers += header_str
             if header_str.lower().startswith("host:"):
                 host_value = header_str.split(":", 1)[1].strip()
-                # Preserve port from Host header for allow-list check.
                 if ":" in host_value:
-                    host, _, hport = host_value.rpartition(":")
-                    host_port = hport
+                    host_header, _, hport = host_value.rpartition(":")
+                    host_header_port = hport
                 else:
-                    host = host_value
-                    host_port = None
+                    host_header = host_value
+                    host_header_port = None
 
-        if host and is_domain_allowed(
-            host,
+        # Parse the URL from the request line.
+        parts = first_line.split()
+        url = parts[1] if len(parts) > 1 else "/"
+        if url.startswith("http://"):
+            # Absolute URL — extract host and path.
+            url_parts = url[7:].split("/", 1)
+            target_authority = url_parts[0]
+            path = "/" + url_parts[1] if len(url_parts) > 1 else "/"
+        else:
+            target_authority = host_header
+            path = url
+
+        if target_authority is None:
+            self._denied_count += 1
+            client_writer.write(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+            await client_writer.drain()
+            return
+
+        target_host, _, target_port_str = target_authority.rpartition(":")
+        if not target_host:
+            target_host = target_authority
+            target_port_str = ""
+
+        # If both absolute URL and Host header are present, they must
+        # agree on the host (defense against Host-header spoofing).
+        if host_header is not None and url.startswith("http://"):
+            if host_header.lower() != target_host.lower():
+                self._denied_count += 1
+                client_writer.write(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+                await client_writer.drain()
+                return
+
+        # Effective port: URL port > Host header port > default 80.
+        try:
+            effective_port = (
+                int(target_port_str) if target_port_str
+                else int(host_header_port) if host_header_port
+                else 80
+            )
+        except ValueError:
+            effective_port = 80
+
+        if not is_domain_allowed(
+            target_host,
             self.allowed_domains,
             self.allowed_wildcards,
             self.allowed_ips,
         ):
-            # Forward the request to the destination.
-            # Parse the URL from the request line.
-            parts = first_line.split()
-            url = parts[1] if len(parts) > 1 else "/"
-            if url.startswith("http://"):
-                # Absolute URL — extract host and path.
-                url_parts = url[7:].split("/", 1)
-                target_host = url_parts[0]
-                path = "/" + url_parts[1] if len(url_parts) > 1 else "/"
-            else:
-                target_host = host
-                path = url
-            host_part, _, port_part = target_host.rpartition(":")
-            if not host_part:
-                host_part = target_host
-                port_part = "80"
-            # Check the port against the allow-list. The effective port
-            # is the URL port (if specified) or the Host header port
-            # (if specified) or the default 80. If the allow-list entry
-            # for this host specifies ports, the port must match.
-            try:
-                effective_port = int(port_part) if port_part else (
-                    int(host_port) if host_port else 80)
-            except ValueError:
-                effective_port = 80
-            if not self._is_port_allowed(host, effective_port):
-                self._denied_count += 1
-                client_writer.write(b"HTTP/1.1 403 Forbidden\r\n\r\n")
-                await client_writer.drain()
-                return
-            # Resolve with audit + rate limiting before connecting (Phase 1.2).
-            resolved_ip = await self._resolve_host(host_part)
-            if resolved_ip is None:
-                # Resolution denied/failed — fail-closed.
-                self._denied_count += 1
-                client_writer.write(b"HTTP/1.1 403 Forbidden\r\n\r\n")
-                await client_writer.drain()
-                return
-            self._allowed_count += 1
-            try:
-                remote_reader, remote_writer = await asyncio.open_connection(
-                    resolved_ip, int(port_part)
-                )
-                # Forward the request with rewritten request line.
-                # headers contains the header lines (each ending \r\n)
-                # but NOT the terminating empty line — add it so the
-                # remote server sees a complete HTTP request.
-                remote_writer.write(f"{parts[0]} {path} HTTP/1.1\r\n".encode())
-                remote_writer.write(headers.encode())
-                remote_writer.write(b"\r\n")
-                await remote_writer.drain()
-                # Tunnel bidirectionally.
-                await self._tunnel(client_reader, client_writer,
-                                   remote_reader, remote_writer)
-            except (ConnectionError, OSError, asyncio.TimeoutError):
-                pass
-        else:
             self._denied_count += 1
             client_writer.write(b"HTTP/1.1 403 Forbidden\r\n\r\n")
             await client_writer.drain()
+            return
+
+        if not self._is_port_allowed(target_host, effective_port):
+            self._denied_count += 1
+            client_writer.write(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+            await client_writer.drain()
+            return
+
+        # Resolve with audit + rate limiting before connecting (Phase 1.2).
+        resolved_ip = await self._resolve_host(target_host)
+        if resolved_ip is None:
+            # Resolution denied/failed — fail-closed.
+            self._denied_count += 1
+            client_writer.write(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+            await client_writer.drain()
+            return
+
+        self._allowed_count += 1
+        try:
+            remote_reader, remote_writer = await asyncio.open_connection(
+                resolved_ip, effective_port
+            )
+            # Forward the request with rewritten request line.
+            # headers contains the header lines (each ending \r\n)
+            # but NOT the terminating empty line — add it so the
+            # remote server sees a complete HTTP request.
+            remote_writer.write(f"{parts[0]} {path} HTTP/1.1\r\n".encode())
+            remote_writer.write(headers.encode())
+            remote_writer.write(b"\r\n")
+            await remote_writer.drain()
+            # Tunnel bidirectionally.
+            await self._tunnel(client_reader, client_writer,
+                               remote_reader, remote_writer)
+        except (ConnectionError, OSError, asyncio.TimeoutError):
+            pass
 
     async def _tunnel(
         self,

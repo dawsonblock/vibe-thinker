@@ -42,7 +42,12 @@ def main():
         remaining.append(args[i]); i += 1
 
     # Build the orchestrator argparser to parse the remaining flags.
-    from rfsn_cli import build_argparser, _build_network_allowlist, _build_retrieval_backend
+    from rfsn_cli import (
+        build_argparser,
+        _build_network_allowlist,
+        _build_retrieval_backend,
+        _sandbox_network_mode,
+    )
     parser = build_argparser()
     # Remove the 'command' positional if present (UI doesn't use REPL commands).
     opts = parser.parse_args(remaining)
@@ -75,11 +80,24 @@ def main():
         local_specialist_n_threads=opts.local_specialist_n_threads,
         local_specialist_pool_size=opts.local_specialist_pool_size,
         agentdb_url=opts.agentdb_url or None,
+        agentdb_only=opts.agentdb_only,
         retrieval_backend=_build_retrieval_backend(opts),
         network_allowlist=_build_network_allowlist(opts),
         dns_resolver=opts.dns_resolver or None,
         sandbox_image=opts.sandbox_image or None,
+        proxy_egress=opts.proxy_egress or None,
+        network_mode=_sandbox_network_mode(opts.sandbox_network),
         docker_network=opts.docker_network or None,
+        use_structured_output=opts.use_structured_output,
+        specialist_transport=opts.specialist_transport,
+        specialist_api_key=opts.specialist_api_key or None,
+        specialist_model_name=opts.specialist_model_name or None,
+        max_parse_repairs=opts.max_parse_repairs,
+        prefer_encoder_nli=opts.prefer_encoder_nli,
+        sona_sync_url=opts.sona_sync_url or None,
+        sona_sync_interval=opts.sona_sync_interval,
+        federation_secret=opts.federation_secret or None,
+        allow_static_fallback=opts.allow_static_fallback,
     )
 
     from web.app import create_app

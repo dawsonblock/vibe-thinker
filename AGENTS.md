@@ -89,7 +89,8 @@
   plain IP addresses and CIDR ranges, not just domains/wildcards.
 - **AgentDB-only mode**: when `agentdb_only=True` and `--agentdb-url` is set,
   `CLRResultCache.lookup()` and `VerifiedTrajectoryStore.retrieve()` search the
-  AgentDB vector store directly instead of the local embeddings matrix.
+  AgentDB vector store directly instead of the local embeddings matrix, even
+  when the local JSON file is empty or archived.
 - **Compose sandbox networking**: `RFSN_DOCKER_NETWORK` / `--docker-network` lets
   executor-spawned containers join an existing Docker network (e.g.
   `vibe-thinker_default`), so they can reach the compose `sni-proxy` service.
@@ -129,10 +130,11 @@ orchestrator process into a purpose-built vector index (AgentDB):
   `POST /v1/vector/search`). Fail-closed: returns `[]` when the sidecar
   is down (caller falls back). Moves lookups from ms to <25µs with zero
   RAM bloat on the Python side.
-- `ShadowVectorStore` — REMOVED in v3.2.1. Was a dual-write,
-  primary-read-with-fallback migration scaffold. When `agentdb_url` is
-  now set, AgentDB is used directly (no local fallback). Operators cut
-  over to AgentDB-only directly (run `finalize-migration` first).
+- `ShadowVectorStore` — REMOVED in v3.2.1. The dual-write behavior moved
+  into `CLRResultCache` / `VerifiedTrajectoryStore`: when `agentdb_url`
+  is set, inserts are mirrored to AgentDB while the local JSON file
+  remains the primary read index. Use `--agentdb-only` after running
+  `finalize-migration` to make AgentDB the authoritative read index.
 `CLRResultCache` and `VerifiedTrajectoryStore` accept `vector_store=`
 or `agentdb_url=` (convenience: builds an AgentDBVectorStore directly).
 Default is None = unchanged in-memory behavior.
@@ -219,13 +221,14 @@ completing.
 
 ### AgentDB-only mode (Phase 4.3)
 `--agentdb-only` CLI flag (or `VIBE_THINKER_AGENTDB_ONLY` env) for
-post-cut-over AgentDB-only mode. After running `finalize-migration`
-(which archives local JSON files), restart with `--agentdb-only` to
-use AgentDB directly (no local shadow/fallback). Fail-closed: searches
-return empty if AgentDB is down. Requires `--agentdb-url` (warns and
-falls back to in-memory numpy if set without it). `agentdb_only`
-parameter is threaded through the orchestrator → CLRResultCache and
-VerifiedTrajectoryStore → `make_vector_store()` (AgentDB direct, no shadow).
+post-cut-over AgentDB-only mode. With `--agentdb-url` alone, inserts
+are mirrored to AgentDB but reads still use the local JSON file. After
+running `finalize-migration` (which archives local JSON files), restart
+with `--agentdb-only` to make AgentDB the authoritative read index.
+Fail-closed: searches return empty if AgentDB is down. Requires
+`--agentdb-url` (warns and falls back to in-memory numpy if set without
+it). `agentdb_only` is threaded through the orchestrator →
+CLRResultCache and VerifiedTrajectoryStore.
 
 ### Hardware guardrails (Phase 4.1)
 `hardware_guardrail.py` prevents OOM crashes by checking model size
@@ -583,9 +586,10 @@ pruning memory without losing the distilled knowledge.
 
 ## AgentDB migration script + finalize-migration (v0.4.0)
 One-shot backfill and zero-downtime migration from local JSON cache files
-to AgentDB. The `ShadowVectorStore` (dual-write, primary-read-with-fallback)
-was already implemented in v0.3.9; this adds the operational tooling to
-actually perform the migration.
+to AgentDB. With `--agentdb-url` the caches mirror inserts to AgentDB
+while keeping the local JSON file as the primary read index.
+`finalize-migration` verifies AgentDB recall, archives the local JSON
+files, and then `--agentdb-only` switches reads to AgentDB.
 
 ### `scripts/migrate_to_agentdb.py`
 Reads all entries from the local CLR cache and trajectory store JSON files
@@ -604,8 +608,7 @@ Verifies AgentDB recall, then archives the local JSON files (renamed to
 - Fail-closed: if recall is below threshold, refuses to finalize (exit 2)
   and does NOT archive local files (no data loss).
 - `--force`: override the recall check (DANGEROUS — data loss risk).
-- To roll back: rename `.bak` files back and restart with `--agentdb-url`
-  (shadow mode).
+- To roll back: rename `.bak` files back and restart without `--agentdb-only`.
 
 ## Network allow-listing (v0.4.0, hardened)
 Granular egress filtering for the Docker sandbox. Replaces the binary

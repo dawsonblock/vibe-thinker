@@ -381,10 +381,9 @@ class TestCacheIntegration:
         store = VerifiedTrajectoryStore(cache_path)
         assert store._vector_store is None
 
-    # v3.2.1: agentdb_only is now a no-op (kept for backward CLI compat).
-    # Setting agentdb_url always means AgentDB-only since ShadowVectorStore
-    # was removed. These tests verify the flag is accepted without error
-    # and produces an AgentDBVectorStore regardless of its value.
+    # agentdb_only is a real behavioral switch: both values create an
+    # AgentDBVectorStore, but True uses the vector store as the primary
+    # search index while False keeps the local embeddings matrix as primary.
     def test_clr_cache_agentdb_only_true_creates_agentdb(self, cache_path):
         """agentdb_only=True creates an AgentDBVectorStore directly."""
         from persistent_cache import CLRResultCache
@@ -395,12 +394,14 @@ class TestCacheIntegration:
         )
         assert cache._vector_store is not None
         assert isinstance(cache._vector_store, AgentDBVectorStore)
+        assert cache.agentdb_only is True
 
     def test_clr_cache_agentdb_only_false_also_creates_agentdb(
         self, cache_path,
     ):
-        """v3.2.1: agentdb_only=False now ALSO creates an AgentDBVectorStore
-        (previously created a ShadowVectorStore). The flag is a no-op."""
+        """agentdb_only=False still creates an AgentDBVectorStore (for
+        dual-write migration), but the local embeddings matrix remains the
+        primary read path."""
         from persistent_cache import CLRResultCache
         cache = CLRResultCache(
             cache_path,
@@ -408,6 +409,7 @@ class TestCacheIntegration:
             agentdb_only=False,
         )
         assert isinstance(cache._vector_store, AgentDBVectorStore)
+        assert cache.agentdb_only is False
 
     def test_trajectory_store_agentdb_only_creates_agentdb_directly(
         self, cache_path,

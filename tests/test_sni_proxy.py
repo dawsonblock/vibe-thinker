@@ -1379,3 +1379,130 @@ class TestIpCidrEnforcement:
         _, _, _, ports = extract_allowlist_sets(al)
         assert ports.get("10.0.0.0/24") == {443}
 
+    def test_is_port_allowed_cidr_matches_concrete_ip(self):
+        """A CIDR port restriction must apply to concrete IPs inside it."""
+        proxy = SNIEgressProxy(
+            allowed_domains=set(),
+            allowed_wildcards=set(),
+            allowed_ips={"10.0.0.0/24"},
+            allowed_ports={"10.0.0.0/24": {443}},
+            port=0,
+        )
+        assert proxy._is_port_allowed("10.0.0.5", 443)
+        assert not proxy._is_port_allowed("10.0.0.5", 80)
+        # Outside the CIDR, no restriction applies.
+        assert proxy._is_port_allowed("192.168.0.5", 80)
+
+    def test_is_port_allowed_exact_ip_preferred_over_cidr(self):
+        """An exact IP port restriction takes precedence over CIDR."""
+        proxy = SNIEgressProxy(
+            allowed_domains=set(),
+            allowed_wildcards=set(),
+            allowed_ips={"10.0.0.1", "10.0.0.0/24"},
+            allowed_ports={
+                "10.0.0.1": {80},
+                "10.0.0.0/24": {443},
+            },
+            port=0,
+        )
+        assert proxy._is_port_allowed("10.0.0.1", 80)
+        assert not proxy._is_port_allowed("10.0.0.1", 443)
+        # Other IPs in the CIDR still use the CIDR restriction.
+        assert proxy._is_port_allowed("10.0.0.5", 443)
+        assert not proxy._is_port_allowed("10.0.0.5", 80)
+
+
+class TestHttpHostUrlMismatch:
+    """Tests for HTTP proxy absolute-URL vs Host-header consistency."""
+
+    @pytest.mark.asyncio
+    async def test_http_allows_url_host(self):
+        """A plain HTTP request with an absolute URL is allowed when the
+        URL host is allow-listed."""
+        proxy = SNIEgressProxy(
+            allowed_domains={"example.com"},
+            allowed_wildcards=set(),
+            port=0,
+        )
+        await proxy.start()
+        proxy_addr = proxy._server.sockets[0].getsockname()
+
+        try:
+            async def mock_resolve(host):
+                return "127.0.0.1"
+            proxy._resolve_host = mock_resolve
+
+            reader, writer = await asyncio.open_connection(
+                proxy_addr[0], proxy_addr[1]
+            )
+            writer.write(
+                b"GET http://example.com/path HTTP/1.1\r\n"
+                b"Host: example.com\r\n\r\n"
+            )
+            await writer.drain()
+            response = await asyncio.wait_for(reader.read(1024), timeout=5.0)
+            assert b"403" not in response, (
+                f"Allowed URL host should not get 403, got: {response!r}")
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_http_blocks_url_host_mismatch(self):
+        """A request with an allowed Host header but a disallowed absolute
+        URL target must be blocked."""
+        proxy = SNIEgressProxy(
+            allowed_domains={"example.com"},
+            allowed_wildcards=set(),
+            port=0,
+        )
+        await proxy.start()
+        proxy_addr = proxy._server.sockets[0].getsockname()
+
+        try:
+            reader, writer = await asyncio.open_connection(
+                proxy_addr[0], proxy_addr[1]
+            )
+            writer.write(
+                b"GET http://evil.com/path HTTP/1.1\r\n"
+                b"Host: example.com\r\n\r\n"
+            )
+            await writer.drain()
+            response = await asyncio.wait_for(reader.read(1024), timeout=5.0)
+            assert b"403" in response, (
+                f"URL host mismatch should be 403, got: {response!r}")
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_http_blocks_url_host_with_allowed_host_header(self):
+        """Even with an allowed Host header, a disallowed absolute URL
+        target is denied."""
+        proxy = SNIEgressProxy(
+            allowed_domains={"allowed.com"},
+            allowed_wildcards=set(),
+            port=0,
+        )
+        await proxy.start()
+        proxy_addr = proxy._server.sockets[0].getsockname()
+
+        try:
+            reader, writer = await asyncio.open_connection(
+                proxy_addr[0], proxy_addr[1]
+            )
+            writer.write(
+                b"GET http://blocked.com/ HTTP/1.1\r\n"
+                b"Host: allowed.com\r\n\r\n"
+            )
+            await writer.drain()
+            response = await asyncio.wait_for(reader.read(1024), timeout=5.0)
+            assert b"403" in response, (
+                f"Blocked URL host must get 403, got: {response!r}")
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            await proxy.stop()
+

@@ -657,26 +657,23 @@ def build_argparser() -> argparse.ArgumentParser:
                         "(nodes that read but don't write the log). Takes "
                         "precedence over --signing-key for verification.")
     # --- AgentDB vector store ---
-    # When set, CLRResultCache and VerifiedTrajectoryStore delegate similarity
-    # search to a RuFlo/AgentDB HTTP sidecar (with shadow-mode dual-write to
-    # the local JSON file for zero-downtime migration).
+    # When set, CLRResultCache and VerifiedTrajectoryStore mirror inserts to
+    # AgentDB while keeping the local JSON file as the primary read index.
+    # Add --agentdb-only to make AgentDB the authoritative read index after
+    # running finalize-migration.
     p.add_argument("--agentdb-url",
                    default=os.environ.get("AGENTDB_URL", ""),
                    help="RuFlo/AgentDB HTTP endpoint for vector similarity "
-                        "search "
-                        "(e.g. http://127.0.0.1:8088). When set, the CLR "
-                        "result cache "
-                        "and trajectory store dual-write to both the local "
-                        "JSON file "
-                        "and AgentDB (shadow mode). Reads fall back to "
-                        "local if AgentDB "
-                        "is down. Empty = in-memory numpy (default, "
-                        "unchanged).")
+                        "search (e.g. http://127.0.0.1:8088). When set, the "
+                        "CLR result cache and trajectory store mirror "
+                        "inserts to AgentDB while keeping the local JSON file "
+                        "as the primary read index. Use --agentdb-only to "
+                        "switch reads to AgentDB. Empty = in-memory numpy "
+                        "(default, unchanged).")
     p.add_argument("--agentdb-only", action="store_true",
                    default=_env_bool("VIBE_THINKER_AGENTDB_ONLY", False),
-                   help="Use AgentDB as the SOLE vector store (no shadow "
-                        "mode, "
-                        "no local JSON fallback). Use this AFTER running "
+                   help="Use AgentDB as the SOLE vector store (no local JSON "
+                        "fallback). Use this AFTER running "
                         "'finalize-migration' to cut over to AgentDB-only. "
                         "Requires --agentdb-url. Fail-closed: if AgentDB is "
                         "down, searches return empty (no local fallback).")
@@ -892,21 +889,25 @@ async def _amain() -> None:
               "Using LLM judge for factual verification.")
 
     # --- AgentDB vector store mode ---
-    # ShadowVectorStore was removed: when --agentdb-url is set, AgentDB is
-    # used directly (no local shadow/fallback). --agentdb-only is kept as
-    # a no-op flag for backward CLI compat — setting --agentdb-url alone
-    # is now always AgentDB-only.
+    # When --agentdb-url is set, inserts are mirrored to AgentDB. Reads use
+    # AgentDB only when --agentdb-only is also set; otherwise reads use the
+    # local embeddings matrix (safe migration posture).
     if args.agentdb_only and not args.agentdb_url:
         print("[CLI] WARNING: --agentdb-only set but --agentdb-url is empty. "
               "AgentDB-only mode requires --agentdb-url. Falling back to "
               "in-memory numpy (default behavior).")
         args.agentdb_only = False
     elif args.agentdb_url:
-        print(f"[CLI] AgentDB mode: vector store is AgentDB at "
-              f"{args.agentdb_url} (no local fallback). Fail-closed: "
-              f"searches return empty if AgentDB is down. "
-              f"(--agentdb-only is now a no-op; shadow mode was removed — "
-              f"run finalize-migration before relying on this.)")
+        if args.agentdb_only:
+            print(f"[CLI] AgentDB-only mode: vector store is AgentDB at "
+                  f"{args.agentdb_url} (no local fallback). Fail-closed: "
+                  f"searches return empty if AgentDB is down. "
+                  f"Run finalize-migration before relying on this.")
+        else:
+            print(f"[CLI] AgentDB mirror mode: inserts are written to AgentDB "
+                  f"at {args.agentdb_url} and the local JSON file; reads use "
+                  f"the local embeddings matrix. Add --agentdb-only to cut "
+                  f"over to AgentDB reads after running finalize-migration.")
 
     # --- Fast code-specialist preset ---
     # Bumps code_candidates to 15 for ultra-fast 0.5B code models.
@@ -1390,13 +1391,14 @@ class _FakeVectorStore:
 
 
 def _run_finalize_migration() -> int:
-    """Finalize the AgentDB shadow-mode migration.
+    """Finalize the AgentDB migration.
 
     Verifies that AgentDB has sufficient recall compared to the local
-    store, then switches the orchestrator config to AgentDB-only by
-    archiving the local JSON files (renamed to .bak). Fail-closed: if
-    recall fails or AgentDB is unreachable, refuses to finalize (no
-    data loss).
+    store, then archives the local JSON files (renamed to .bak). After
+    archiving, restart the orchestrator with --agentdb-url and
+    --agentdb-only to use AgentDB as the authoritative read index.
+    Fail-closed: if recall fails or AgentDB is unreachable, refuses to
+    finalize (no data loss).
 
     Usage:
         python rfsn_cli.py finalize-migration \\
@@ -1494,11 +1496,11 @@ def _run_finalize_migration() -> int:
         print(f"\n[Finalize] Migration complete! {len(archived)} file(s) "
               f"archived. AgentDB is now the primary vector store.")
         print("[Finalize] Restart the orchestrator with --agentdb-only to "
-              "use AgentDB-only mode (no local fallback):")
+              "use AgentDB as the authoritative read index:")
         print(f"  python3 rfsn_cli.py --agentdb-url {args.agentdb_url} "
               f"--agentdb-only [other flags...]")
         print("[Finalize] To roll back, rename the .bak files back and "
-              "restart with --agentdb-url (shadow mode, no --agentdb-only).")
+              "restart without --agentdb-only.")
 
     return 0
 

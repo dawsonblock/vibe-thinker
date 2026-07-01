@@ -660,19 +660,19 @@ so the embedding matrix can move out of the orchestrator process into a
 purpose-built vector index (AgentDB):
 
 ```bash
-# Shadow mode: dual-write to local JSON + AgentDB, read from local first
-python rfsn_cli.py --agentdb-url http://127.0.0.1:8088
+# AgentDB-only mode: read from and write to AgentDB directly
+python rfsn_cli.py --agentdb-url http://127.0.0.1:8088 --agentdb-only
 ```
 
 | Flag / env | Default | Purpose |
 |---|---|---|
-| `--agentdb-url` / `AGENTDB_URL` | empty | RuFlo/AgentDB HTTP endpoint for vector search (AgentDB-only mode) |
+| `--agentdb-url` / `AGENTDB_URL` | empty | RuFlo/AgentDB HTTP endpoint for vector search |
+| `--agentdb-only` / `VIBE_THINKER_AGENTDB_ONLY` | false | Use AgentDB directly; do not fall back to local JSON |
 
-When `--agentdb-url` is set, AgentDB is used directly for similarity
-search (fail-closed: searches return empty if AgentDB is down). The
-`ShadowVectorStore` dual-write migration scaffold was removed
-— operators cut over to AgentDB-only directly (run `finalize-migration`
-first to archive local JSON, then restart with `--agentdb-url`).
+When `--agentdb-url` and `--agentdb-only` are set, the semantic caches
+use AgentDB directly for similarity search (fail-closed: searches return
+empty if AgentDB is down). Run `finalize-migration` first to backfill
+AgentDB and archive local JSON files.
 
 ### RuvLLM inference backend (`ruvllm_adapter.py`) — experimental
 
