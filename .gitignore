@@ -21,6 +21,10 @@ rfsn_jobs_bitemporal.jsonl
 orchestrator_memory.jsonl
 verified_trajectories.json
 
+# Downloaded model weights and tokenizers (large, fetched at runtime)
+models/
+*.gguf
+
 # Virtual environments
 .venv/
 .venv-core/
