@@ -79,6 +79,7 @@ def main():
         network_allowlist=_build_network_allowlist(opts),
         dns_resolver=opts.dns_resolver or None,
         sandbox_image=opts.sandbox_image or None,
+        docker_network=opts.docker_network or None,
     )
 
     from web.app import create_app

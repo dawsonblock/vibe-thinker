@@ -460,7 +460,7 @@ class TestDockerNetworkEnforcement:
         """Build a multi-line Python script that tries to connect to
         ``host:port`` and prints CONNECTED or BLOCKED:<ExceptionType>."""
         return (
-            "import socket\n"
+            "import socket, sys\n"
             "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
             f"s.settimeout({timeout})\n"
             "try:\n"
@@ -470,6 +470,7 @@ class TestDockerNetworkEnforcement:
             "    print(f'BLOCKED:{type(e).__name__}')\n"
             "finally:\n"
             "    s.close()\n"
+            "sys.exit(0)\n"
         )
 
     @staticmethod
@@ -556,12 +557,13 @@ class TestDockerNetworkEnforcement:
         internet directly (no gateway to the outside)."""
         if not self._docker_available():
             pytest.skip("Docker daemon not running")
-        net = "vibe-test-internal"
+        import uuid
+        net = f"vibe-test-internal-{uuid.uuid4().hex[:8]}"
         if not self._create_internal_network(net):
             pytest.skip("could not create --internal network")
         try:
             script = self._connect_script("1.1.1.1", 80, 5)
-            rc, out, err = self._run_container(net, script, timeout=20)
+            rc, out, err = self._run_container(net, script, timeout=30)
             assert "BLOCKED" in out, (
                 f"--internal network should block internet, but got: {out!r} "
                 f"(stderr: {err!r})"
@@ -577,12 +579,13 @@ class TestDockerNetworkEnforcement:
         """A container on a --internal network cannot reach 169.254.169.254."""
         if not self._docker_available():
             pytest.skip("Docker daemon not running")
-        net = "vibe-test-internal"
+        import uuid
+        net = f"vibe-test-internal-{uuid.uuid4().hex[:8]}"
         if not self._create_internal_network(net):
             pytest.skip("could not create --internal network")
         try:
             script = self._connect_script("169.254.169.254", 80, 5)
-            rc, out, err = self._run_container(net, script, timeout=20)
+            rc, out, err = self._run_container(net, script, timeout=30)
             assert "BLOCKED" in out, (
                 f"Metadata service should be blocked on --internal, got: {out!r}"
             )
@@ -597,12 +600,13 @@ class TestDockerNetworkEnforcement:
         """A container on a --internal network cannot reach host LAN (10.x)."""
         if not self._docker_available():
             pytest.skip("Docker daemon not running")
-        net = "vibe-test-internal"
+        import uuid
+        net = f"vibe-test-internal-{uuid.uuid4().hex[:8]}"
         if not self._create_internal_network(net):
             pytest.skip("could not create --internal network")
         try:
             script = self._connect_script("10.0.0.1", 80, 5)
-            rc, out, err = self._run_container(net, script, timeout=20)
+            rc, out, err = self._run_container(net, script, timeout=30)
             assert "BLOCKED" in out, (
                 f"Host LAN should be blocked on --internal, got: {out!r}"
             )

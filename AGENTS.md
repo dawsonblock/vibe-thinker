@@ -3,7 +3,7 @@
 > **Version-tag convention:** Tags like `v3.2`, `v3.2.1`, `v0.3.9`,
 > `v1.1`, `v1.2` etc. refer to **historical internal phase numbering**
 > from earlier development cycles. They do NOT correspond to the
-> package version (currently `v0.4.6a6`, set in `pyproject.toml`).
+> package version (currently `v0.4.6a7`, set in `pyproject.toml`).
 > Treat them as historical context labels, not current release markers.
 
 ## Verify / test
@@ -79,6 +79,20 @@
   (`--envoy-sidecar` / `sandbox/envoy_sidecar.py`) is for standalone
   transparent-routing experiments on the host and is **not** used as the
   HTTP proxy in compose. Validate with `./scripts/test_compose.sh`.
+- **Wheel packaging**: the wheel now ships `web/static/index.html`,
+  `sandbox/entrypoint.sh`, all shell scripts, Docker files, and compose files
+  as package/data files. `vibe-thinker-ui` is a console entry point for the web
+  UI. `finalize-migration` imports from the `agentdb_migration` module, so it
+  works from wheel installs. Validate with
+  `python3 -m pytest tests/test_wheel_install.py -q`.
+- **IP/CIDR enforcement**: `sni_proxy.py` now enforces allow-list entries for
+  plain IP addresses and CIDR ranges, not just domains/wildcards.
+- **AgentDB-only mode**: when `agentdb_only=True` and `--agentdb-url` is set,
+  `CLRResultCache.lookup()` and `VerifiedTrajectoryStore.retrieve()` search the
+  AgentDB vector store directly instead of the local embeddings matrix.
+- **Compose sandbox networking**: `RFSN_DOCKER_NETWORK` / `--docker-network` lets
+  executor-spawned containers join an existing Docker network (e.g.
+  `vibe-thinker_default`), so they can reach the compose `sni-proxy` service.
 
 ## RuFlo integration abstractions (v0.3.9)
 Four pluggable abstractions from the Vibe-Thinker + RuFlo Integration Plan.

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vibe-thinker"
-version = "0.4.6a6"
+version = "0.4.6a7"
 description = "Verifier-driven local reasoning engine with adaptive CLR, deterministic verifiers, and bi-temporal audit logging"
 readme = "README.md"
 license = "MIT"
@@ -116,6 +116,7 @@ all = [
 
 [project.scripts]
 vibe-thinker = "rfsn_cli:main"
+vibe-thinker-ui = "run_ui:main"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -167,7 +168,10 @@ py-modules = [
     "federation_server",
     "vt_config",
     "vt_logging",
+    "run_ui",
+    "agentdb_migration",
 ]
+include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -175,6 +179,49 @@ include = [
     "verifiers*",
     "sandbox*",
     "web*",
+    "scripts*",
+    "docker*",
+    "profiles*",
+]
+
+[tool.setuptools.package-data]
+"web" = [
+    "static/*",
+]
+"sandbox" = [
+    "entrypoint.sh",
+    "Dockerfile",
+]
+"docker" = [
+    "*",
+    "envoy/*",
+]
+"scripts" = [
+    "*.sh",
+    "*.py",
+]
+"profiles" = [
+    "*.env",
+]
+
+[tool.setuptools.data-files]
+"share/vibe-thinker" = [
+    "docker-compose.yml",
+    "Dockerfile",
+    "README.md",
+    "AGENTS.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    ".env.example",
+    ".dockerignore",
+    "requirements.txt",
+    "requirements-core.txt",
+    "requirements-dev.txt",
+    "requirements-embeddings.txt",
+    "requirements-federation.txt",
+    "requirements-sandbox.txt",
+    "requirements-models.txt",
+    "requirements-legacy-full.txt",
 ]
 
 [tool.ruff]

@@ -593,6 +593,11 @@ class CLRResultCache:
         self.min_score = min_score
         self.max_entries = max_entries
         self.autosave = autosave
+        self.agentdb_only = agentdb_only and self._vector_store is not None
+        if agentdb_only and self._vector_store is None:
+            print("[CLRResultCache] WARNING: agentdb_only=True but no "
+                  "AgentDB vector store configured — falling back to local "
+                  "cache behavior.")
 
         # Load the embedding model only when in EMBEDDINGS mode (or when a
         # vector_store is injected — it needs pre-computed embeddings for
@@ -708,6 +713,39 @@ class CLRResultCache:
 
         # Semantic similarity path (EMBEDDINGS mode).
         q_emb = self.model.encode([problem])[0].reshape(1, -1)
+
+        # AgentDB-only mode: search the vector store directly.
+        if self.agentdb_only and self._vector_store is not None:
+            results = self._vector_store.search(
+                q_emb.tolist(), top_k=1
+            )
+            if results:
+                _vid, best_sim, metadata = results[0]
+                if best_sim >= self.similarity_threshold:
+                    if float(metadata.get("best_score", 0)) >= self.min_score:
+                        entry = dict(metadata)
+                        if is_cache_entry_trustworthy(
+                            entry, allow_weak_cache=allow_weak_cache
+                        ):
+                            return {
+                                "best_answer": metadata.get("best_answer", ""),
+                                "best_score": float(metadata.get("best_score", 0)),
+                                "k": metadata.get("k"),
+                                "timestamp": metadata.get("timestamp"),
+                                "trajectory_count": metadata.get("trajectory_count"),
+                                "verification_method": metadata.get(
+                                    "verification_method", "self_claims_only"
+                                ),
+                                "verified": bool(metadata.get("verified", False)),
+                                "schema_version": metadata.get(
+                                    "schema_version", 1
+                                ),
+                                "cached": True,
+                                "similarity": float(best_sim),
+                                "matched_problem": metadata.get("problem", ""),
+                            }
+            return None
+
         sims = cosine_similarity(q_emb, self._embeddings_matrix)[0]
         # Search entries in order of similarity, return the first
         # trustworthy one above the threshold.
@@ -812,11 +850,9 @@ class CLRResultCache:
         self._rebuild_embeddings_matrix()
         if self.autosave:
             self.save()
-        # Shadow-mode dual-write: if a vector store is configured (e.g.
-        # via --agentdb-url), mirror the insert to it. The local
-        # embeddings matrix remains the primary read path; the vector
-        # store is the shadow that receives writes for migration to
-        # AgentDB. Failures are non-fatal (shadow is best-effort).
+        # AgentDB vector store: when configured, mirror the insert to it.
+        # In agentdb_only mode this is the primary search index; otherwise
+        # it is a migration target. Failures are non-fatal.
         #
         # CRITICAL: do NOT upsert empty embeddings. When the embedding
         # model is unavailable (self.model is None), embedding is [].
@@ -833,13 +869,19 @@ class CLRResultCache:
                         "problem": problem,
                         "best_answer": best_answer,
                         "best_score": float(best_score),
+                        "k": int(k),
+                        "timestamp": entry.get("timestamp"),
+                        "trajectory_count": int(trajectory_count),
                         "verified": verified,
                         "verification_method": verification_method,
                         "task_type": entry.get("task_type", "unknown"),
+                        "schema_version": int(
+                            entry.get("schema_version", 1)
+                        ),
                     },
                 )
             except Exception:
-                pass  # shadow write failure is non-fatal
+                pass  # vector store write failure is non-fatal
         elif (self._vector_store is not None
               and not _is_valid_embedding_vector(embedding)):
             print("[CLRResultCache] WARNING: vector store configured but no "
@@ -963,6 +1005,11 @@ class VerifiedTrajectoryStore:
         self.max_entries = max_entries
         self.max_few_shot = max_few_shot
         self.autosave = autosave
+        self.agentdb_only = agentdb_only and self._vector_store is not None
+        if agentdb_only and self._vector_store is None:
+            print("[VerifiedTrajectoryStore] WARNING: agentdb_only=True but "
+                  "no AgentDB vector store configured — falling back to local "
+                  "trajectory behavior.")
 
         # Load the embedding model: prefer an injected model (for tests /
         # custom backends), then the shared sentence-transformers model in
@@ -1085,6 +1132,35 @@ class VerifiedTrajectoryStore:
 
         # Semantic similarity path (EMBEDDINGS mode).
         q_emb = self.model.encode([query])[0].reshape(1, -1)
+
+        # AgentDB-only mode: search the vector store directly.
+        if self.agentdb_only and self._vector_store is not None:
+            results = self._vector_store.search(
+                q_emb.tolist(), top_k=self.max_few_shot
+            )
+            candidates = []
+            for _vid, sim, metadata in results:
+                if sim < self.retrieval_threshold:
+                    break
+                if task_type and metadata.get("task_type") != task_type:
+                    continue
+                entry = dict(metadata)
+                if not is_cache_entry_trustworthy(entry):
+                    continue
+                candidates.append({
+                    "query": metadata.get("query", ""),
+                    "answer": metadata.get("answer", ""),
+                    "score": float(metadata.get("score", 0.0)),
+                    "verification_method": metadata.get(
+                        "verification_method", ""
+                    ),
+                    "task_type": metadata.get("task_type", ""),
+                    "similarity": float(sim),
+                })
+                if len(candidates) >= self.max_few_shot:
+                    break
+            return candidates
+
         sims = cosine_similarity(q_emb, self._embeddings_matrix)[0]
 
         candidates = []
@@ -1223,8 +1299,9 @@ class VerifiedTrajectoryStore:
         self._rebuild_embeddings_matrix()
         if self.autosave:
             self.save()
-        # Shadow-mode dual-write: mirror to the vector store (e.g. AgentDB)
-        # for migration. Non-fatal on failure.
+        # AgentDB vector store: when configured, mirror the insert to it.
+        # In agentdb_only mode this is the primary search index; otherwise
+        # it is a migration target. Failures are non-fatal.
         #
         # CRITICAL: do NOT upsert empty embeddings. When the embedding
         # model is unavailable (self.model is None), embedding is [].
@@ -1242,10 +1319,16 @@ class VerifiedTrajectoryStore:
                         "score": float(score),
                         "verification_method": verification_method,
                         "task_type": task_type,
+                        "route_taken": route_taken,
+                        "timestamp": entry.get("timestamp"),
+                        "verified": True,
+                        "schema_version": int(
+                            entry.get("schema_version", 1)
+                        ),
                     },
                 )
             except Exception:
-                pass  # shadow write failure is non-fatal
+                pass  # vector store write failure is non-fatal
         elif (self._vector_store is not None
               and not _is_valid_embedding_vector(embedding)):
             print("[TrajectoryStore] WARNING: vector store configured but no "

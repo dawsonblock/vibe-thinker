@@ -12,6 +12,7 @@ from sandbox.sni_proxy import (
     extract_sni,
     domain_matches,
     is_domain_allowed,
+    _is_ip_allowed,
     SNIEgressProxy,
     DnsAuditor,
     _is_ip_literal,
@@ -1198,3 +1199,183 @@ class TestWildcardPortEnforcement:
         assert not proxy2._is_port_allowed("example.com", 80)
         assert not is_domain_allowed(
             "foo.example.com", proxy2.allowed_domains, proxy2.allowed_wildcards)
+
+
+# ---------------------------------------------------------------------- #
+# IP/CIDR allow-list enforcement
+# ---------------------------------------------------------------------- #
+class TestIpCidrEnforcement:
+    """Tests for IP and CIDR allow-list enforcement.
+
+    The parser accepts IPv4/IPv6 and CIDR entries; the proxy must enforce
+    them in both CONNECT and HTTP paths.
+    """
+
+    def test_is_ip_allowed_plain_ip_match(self):
+        assert _is_ip_allowed("10.0.0.1", {"10.0.0.1"})
+
+    def test_is_ip_allowed_plain_ip_no_match(self):
+        assert not _is_ip_allowed("10.0.0.2", {"10.0.0.1"})
+
+    def test_is_ip_allowed_cidr_match(self):
+        assert _is_ip_allowed("10.0.0.5", {"10.0.0.0/24"})
+
+    def test_is_ip_allowed_cidr_no_match(self):
+        assert not _is_ip_allowed("11.0.0.5", {"10.0.0.0/24"})
+
+    def test_is_ip_allowed_hostname_returns_false(self):
+        """Hostnames are not IP literals and should be ignored here."""
+        assert not _is_ip_allowed("example.com", {"10.0.0.0/24"})
+
+    def test_is_domain_allowed_with_allowed_ips(self):
+        assert is_domain_allowed(
+            "10.0.0.1", set(), set(), {"10.0.0.0/24"})
+        assert not is_domain_allowed(
+            "10.0.0.1", set(), set(), {"192.168.0.0/24"})
+
+    def test_extract_allowlist_sets_uses_host_not_raw_for_ip(self):
+        """IP entries must store the host without the port for matching."""
+        al = NetworkAllowList.from_string("10.0.0.1:443,10.0.0.0/24:443")
+        _, _, ips, ports = extract_allowlist_sets(al)
+        assert ips == {"10.0.0.1", "10.0.0.0/24"}
+        assert ports.get("10.0.0.1") == {443}
+        assert ports.get("10.0.0.0/24") == {443}
+
+    @pytest.mark.asyncio
+    async def test_connect_allowed_ip_returns_200(self):
+        """CONNECT to an allowlisted IP literal is allowed."""
+        proxy = SNIEgressProxy(
+            allowed_domains=set(),
+            allowed_wildcards=set(),
+            allowed_ips={"127.0.0.1"},
+            port=0,
+        )
+        await proxy.start()
+        proxy_addr = proxy._server.sockets[0].getsockname()
+
+        async def mock_remote_handler(reader, writer):
+            data = await asyncio.wait_for(reader.read(1024), timeout=5.0)
+            writer.write(b"REMOTE_ECHO:" + data)
+            await writer.drain()
+            writer.close()
+
+        remote_server = await asyncio.start_server(
+            mock_remote_handler, "127.0.0.1", 0
+        )
+        remote_addr = remote_server.sockets[0].getsockname()
+
+        try:
+            async def mock_resolve(host):
+                return remote_addr[0]
+            proxy._resolve_host = mock_resolve
+
+            reader, writer = await asyncio.open_connection(
+                proxy_addr[0], proxy_addr[1]
+            )
+            connect_port = remote_addr[1]
+            writer.write(
+                f"CONNECT 127.0.0.1:{connect_port} HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{connect_port}\r\n\r\n".encode()
+            )
+            await writer.drain()
+            response = await asyncio.wait_for(reader.read(1024), timeout=5.0)
+            assert b"200" in response, f"Expected 200, got: {response!r}"
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            await proxy.stop()
+            remote_server.close()
+            await remote_server.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_connect_denied_ip_returns_403(self):
+        """CONNECT to a denied IP literal returns 403."""
+        proxy = SNIEgressProxy(
+            allowed_domains=set(),
+            allowed_wildcards=set(),
+            allowed_ips={"10.0.0.1"},
+            port=0,
+        )
+        await proxy.start()
+        addr = proxy._server.sockets[0].getsockname()
+
+        try:
+            reader, writer = await asyncio.open_connection(addr[0], addr[1])
+            writer.write(b"CONNECT 10.0.0.2:443 HTTP/1.1\r\nHost: 10.0.0.2:443\r\n\r\n")
+            await writer.drain()
+            response = await asyncio.wait_for(reader.read(1024), timeout=5.0)
+            assert b"403" in response, f"Expected 403, got: {response!r}"
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_http_allowed_ip_not_blocked(self):
+        """HTTP request to an allowlisted IP literal is not blocked."""
+        proxy = SNIEgressProxy(
+            allowed_domains=set(),
+            allowed_wildcards=set(),
+            allowed_ips={"127.0.0.1"},
+            port=0,
+        )
+        await proxy.start()
+        proxy_addr = proxy._server.sockets[0].getsockname()
+
+        try:
+            async def mock_resolve(host):
+                return "127.0.0.1"
+            proxy._resolve_host = mock_resolve
+
+            reader, writer = await asyncio.open_connection(
+                proxy_addr[0], proxy_addr[1]
+            )
+            writer.write(
+                b"GET http://127.0.0.1/ HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n\r\n"
+            )
+            await writer.drain()
+            response = await asyncio.wait_for(reader.read(1024), timeout=5.0)
+            assert b"403" not in response, (
+                f"Allowed IP should not get 403, got: {response!r}")
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_http_denied_ip_is_blocked(self):
+        """HTTP request to a denied IP literal is blocked."""
+        proxy = SNIEgressProxy(
+            allowed_domains=set(),
+            allowed_wildcards=set(),
+            allowed_ips={"10.0.0.1"},
+            port=0,
+        )
+        await proxy.start()
+        proxy_addr = proxy._server.sockets[0].getsockname()
+
+        try:
+            reader, writer = await asyncio.open_connection(
+                proxy_addr[0], proxy_addr[1]
+            )
+            writer.write(
+                b"GET http://10.0.0.2/ HTTP/1.1\r\n"
+                b"Host: 10.0.0.2\r\n\r\n"
+            )
+            await writer.drain()
+            response = await asyncio.wait_for(reader.read(1024), timeout=5.0)
+            # HTTP denial closes the connection; we should not see a 200.
+            assert b"200" not in response, (
+                f"Denied IP should not get 200, got: {response!r}")
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            await proxy.stop()
+
+    def test_cidr_port_restriction(self):
+        """Port restrictions apply to IP/CIDR entries via allowed_ports."""
+        al = NetworkAllowList.from_string("10.0.0.0/24:443")
+        _, _, _, ports = extract_allowlist_sets(al)
+        assert ports.get("10.0.0.0/24") == {443}
+

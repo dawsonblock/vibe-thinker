@@ -819,6 +819,14 @@ def build_argparser() -> argparse.ArgumentParser:
                         "this flag overrides the default address. Run the "
                         "proxy with: python3 -m sandbox.sni_proxy "
                         "--allowlist '...'")
+    p.add_argument("--docker-network",
+                   default=os.environ.get("RFSN_DOCKER_NETWORK", ""),
+                   help="Name of an existing Docker network to attach "
+                        "sandbox containers to in best-effort-proxy mode. "
+                        "Use this when the SNI proxy is a compose service "
+                        "(e.g. 'vibe-thinker_default') so executor-spawned "
+                        "containers can reach it by service name. "
+                        "Default is the Docker bridge network.")
     p.add_argument("--envoy-sidecar",
                    action="store_true",
                    default=os.environ.get("RFSN_ENVOY_SIDECAR", "") != "",
@@ -939,6 +947,7 @@ async def _amain() -> None:
         sandbox_image=args.sandbox_image or None,
         proxy_egress=args.proxy_egress or None,
         network_mode=_sandbox_network_mode(args.sandbox_network),
+        docker_network=args.docker_network or None,
         use_structured_output=args.use_structured_output,
         specialist_transport=args.specialist_transport,
         specialist_api_key=args.specialist_api_key or None,
@@ -1432,17 +1441,9 @@ def _run_finalize_migration() -> int:
 
     # Check reachability via test upsert+delete (count() returns 0 both
     # for "empty" and "unreachable" — fail-closed).
-    import importlib.util
-    _mig_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "scripts", "migrate_to_agentdb.py",
-    )
-    _spec = importlib.util.spec_from_file_location(
-        "migrate_to_agentdb", _mig_path)
-    _mig_mod = importlib.util.module_from_spec(_spec)
-    _spec.loader.exec_module(_mig_mod)
+    from agentdb_migration import check_agentdb_reachable, verify_recall
 
-    if not _mig_mod._check_agentdb_reachable(agentdb):
+    if not check_agentdb_reachable(agentdb):
         print(f"Error: AgentDB at {args.agentdb_url} is unreachable "
               f"— refusing to finalize (fail-closed, no data loss)")
         return 1
@@ -1450,9 +1451,6 @@ def _run_finalize_migration() -> int:
     print(f"[Finalize] AgentDB connected: {count} entries in collection "
           f"'{args.collection}'")
 
-    # Import the recall verification from the migration script (already
-    # loaded above for the reachability check).
-    verify_recall = _mig_mod.verify_recall
     print("\n=== Recall verification ===")
     vres = verify_recall(
         agentdb, clr_path, traj_path,

@@ -32,3 +32,11 @@ def test_sni_proxy_not_public_unless_intentional():
     svc = yaml.safe_load(Path("docker-compose.yml").read_text())["services"]["sni-proxy"]
     assert "ports" not in svc
     assert "8888" in svc.get("expose", [])
+
+
+def test_compose_configures_sandbox_docker_network():
+    compose = yaml.safe_load(Path("docker-compose.yml").read_text())
+    env = compose["x-orchestrator-env"]
+    assert "vibe-thinker_default" in env["RFSN_DOCKER_NETWORK"]
+    networks = compose.get("networks", {})
+    assert networks.get("default", {}).get("name") == "vibe-thinker_default"

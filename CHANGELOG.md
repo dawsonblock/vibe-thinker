@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.4.6a7
+
+Packaging, enforcement, and AgentDB consistency fixes from the build-40
+audit report.
+
+### Fixed
+- Wheel packaging now includes `web/static/index.html`, `sandbox/entrypoint.sh`,
+  shell scripts, Docker files, and compose files via `package-data` + `data-files`.
+- Refactored `finalize-migration` to import from the new `agentdb_migration`
+  module instead of loading `scripts/migrate_to_agentdb.py` from the filesystem.
+- IP/CIDR allow-list entries are now enforced by `sni_proxy.py` in both CONNECT
+  and HTTP paths.
+- Compose sandbox networking: added `RFSN_DOCKER_NETWORK` and `--docker-network` so
+  executor-spawned containers join the compose network and can reach `sni-proxy`.
+- `agentdb_only=True` now drives cache/trajectory lookup through the AgentDB
+  vector store instead of silently using the local embeddings matrix.
+- Removed stale "shadow-mode" comments from `persistent_cache.py`.
+
+### Added
+- `vibe-thinker-ui` console entry point for `run_ui.py`.
+- `agentdb_migration.py` module.
+- `tests/test_wheel_install.py` integration test: builds the wheel, installs it
+  in a fresh venv, and verifies CLI + web UI entry points.
+
 ## v0.4.6a6
 
 Compose proxy hardening and validation.

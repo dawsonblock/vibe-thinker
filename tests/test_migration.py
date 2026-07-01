@@ -4,11 +4,11 @@ Tests the backfill, recall verification, and fail-closed paths using
 LocalVectorStore as a stand-in for AgentDB (so no live sidecar is needed).
 """
 
+import importlib
 import json
 import os
 import sys
 import pytest
-import importlib.util
 from unittest.mock import patch, MagicMock
 
 
@@ -37,13 +37,9 @@ if _NUMPY_AVAILABLE:
 else:
     np = None  # type: ignore[assignment]
 
-# Load the migration script as a module (it's not in a package).
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_MIG_PATH = os.path.join(_PROJECT_ROOT, "scripts", "migrate_to_agentdb.py")
-_spec = importlib.util.spec_from_file_location("migrate_to_agentdb", _MIG_PATH)
-migrate_mod = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(migrate_mod)
 
+import agentdb_migration as migrate_mod
 from vector_store import LocalVectorStore, AgentDBVectorStore
 
 

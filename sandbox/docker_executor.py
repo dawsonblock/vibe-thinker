@@ -138,6 +138,12 @@ class DockerSandboxExecutor:
             for ENFORCED_GATEWAY mode. Defaults to
             ``vibe-thinker-gateway-net``. The executor creates this
             network if it doesn't exist.
+        docker_network: name of an existing Docker network to attach the
+            sandbox container to in BEST_EFFORT_PROXY mode. When set, it
+            overrides the default ``bridge`` network. This is useful when
+            the SNI proxy is running as a compose service (e.g.
+            ``vibe-thinker_default``) and the sandbox container must join
+            that network to reach it by service name.
     """
 
     name = "docker_sandbox"
@@ -150,6 +156,7 @@ class DockerSandboxExecutor:
         dns_resolver: Optional[str] = None,
         network_mode: Optional[NetworkMode] = None,
         gateway_network: str = GATEWAY_NETWORK_NAME,
+        docker_network: Optional[str] = None,
     ):
         self.image = image
         self.default_timeout = timeout
@@ -161,6 +168,7 @@ class DockerSandboxExecutor:
         # DISABLED otherwise. Explicitly setting a mode overrides this.
         self._network_mode = network_mode
         self._gateway_network = gateway_network
+        self._docker_network = docker_network
         self._gateway_network_created = False
         # Gateway container lifecycle (ENFORCED_GATEWAY mode).
         self._gateway_container_name = f"vibe-thinker-gw-{uuid.uuid4().hex[:8]}"
@@ -205,6 +213,15 @@ class DockerSandboxExecutor:
         an allow-list is present, DISABLED otherwise).
         """
         self._network_mode = mode
+
+    def set_docker_network(self, network: Optional[str]) -> None:
+        """Set the Docker network to attach sandbox containers to.
+
+        Only affects BEST_EFFORT_PROXY mode (and ENFORCED_GATEWAY's
+        gateway container if needed). When None, the default bridge
+        network is used.
+        """
+        self._docker_network = network
 
     async def _ensure_gateway_network(self) -> Optional[str]:
         """Create the Docker --internal network for ENFORCED_GATEWAY mode.
@@ -496,7 +513,10 @@ class DockerSandboxExecutor:
             use_proxy = use_allowlist
             use_gateway = False
             if use_proxy:
-                docker_network = "default"
+                # Prefer an explicitly configured Docker network (e.g. the
+                # compose stack network) so the sandbox can reach a sidecar
+                # SNI proxy by service name. Default bridge otherwise.
+                docker_network = self._docker_network or "default"
             else:
                 docker_network = "none" if not network else "default"
 

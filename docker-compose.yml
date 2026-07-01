@@ -74,6 +74,12 @@ x-orchestrator-env: &orchestrator-env
   # Empty = deny all egress (fail-closed, same as --network=none).
   RFSN_NETWORK_ALLOWLIST: ${RFSN_NETWORK_ALLOWLIST:-pypi.org:443,files.pythonhosted.org:443}
   RFSN_DNS_RESOLVER: ${RFSN_DNS_RESOLVER:-}
+  # --- Docker network for sandbox containers ---
+  # When the orchestrator runs inside compose, sandbox containers are
+  # spawned via the mounted Docker socket. They must join the compose
+  # network to reach the `sni-proxy` service by name. Set this to the
+  # compose project network (default: <project>_default).
+  RFSN_DOCKER_NETWORK: ${RFSN_DOCKER_NETWORK:-vibe-thinker_default}
   # --- Federation (Redis-backed coordinator state) ---
   # The federation coordinator URL. When set, jobs are published to the swarm.
   # Leave empty for single-node. Redis is always started for the web UI Pub/Sub
@@ -387,3 +393,7 @@ volumes:
   redis-data:
   agentdb-data:
   orchestrator-data:
+
+networks:
+  default:
+    name: vibe-thinker_default

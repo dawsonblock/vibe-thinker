@@ -49,12 +49,16 @@ class WarmDockerPool:
         timeout: float = 10.0,
         max_uses_per_container: int = 50,
         container_prefix: str = "vibe_sbx",
+        docker_network: Optional[str] = None,
+        proxy_egress: Optional[str] = None,
     ):
         self.image = image
         self.pool_size = pool_size
         self.default_timeout = timeout
         self.max_uses_per_container = max_uses_per_container
         self.container_prefix = container_prefix
+        self._docker_network = docker_network
+        self._proxy_egress = proxy_egress
 
         self._containers: List[Dict[str, Any]] = []
         self._next_idx = 0
@@ -65,6 +69,22 @@ class WarmDockerPool:
         # candidates queue up behind the semaphore.
         self._container_locks: List[asyncio.Semaphore] = []
         self._locks_initialized = False
+
+    def set_docker_network(self, network: Optional[str]) -> None:
+        """Set the Docker network to attach warm containers to.
+
+        Must be called before ``start()``. Changing the network after the
+        pool is started requires a restart (``cleanup()`` + ``start()``).
+        """
+        self._docker_network = network
+
+    def set_proxy_egress(self, proxy_addr: Optional[str]) -> None:
+        """Set HTTP_PROXY/HTTPS_PROXY for warm containers.
+
+        Must be called before ``start()``. The proxy env vars are baked
+        into the container at creation time.
+        """
+        self._proxy_egress = proxy_addr
 
     async def start(self) -> None:
         """Start the warm container pool."""
@@ -82,18 +102,22 @@ class WarmDockerPool:
             # PIDs > 1) would kill sleep and stop the container. Without
             # --init, sleep IS PID 1 and is correctly skipped by the
             # /proc loop. Zombie reaping is handled by the /proc cleanup.
+            network = self._docker_network or "none"
             cmd = [
                 "docker", "run", "-d",
                 "--name", name,
-                "--network", "none",
+                "--network", network,
                 "--read-only",
                 "--security-opt", "no-new-privileges",
                 "--cap-drop", "ALL",
                 "--pids-limit", "64",
                 "--tmpfs", "/tmp:rw,size=10m",
                 "--workdir", "/tmp",
-                self.image, "sleep", "3600",
             ]
+            if self._proxy_egress:
+                cmd.extend(["-e", f"HTTP_PROXY=http://{self._proxy_egress}"])
+                cmd.extend(["-e", f"HTTPS_PROXY=http://{self._proxy_egress}"])
+            cmd.extend([self.image, "sleep", "3600"])
             result = await self._run_docker(cmd, timeout=30.0)
             if result.exit_code == 0:
                 self._containers.append({

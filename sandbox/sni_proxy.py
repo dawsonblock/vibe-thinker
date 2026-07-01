@@ -169,18 +169,56 @@ def domain_matches(hostname: str, pattern: str) -> bool:
     return hostname == pattern
 
 
+def _is_ip_allowed(host: str, allowed_ips: Set[str]) -> bool:
+    """Check if ``host`` is an IP literal that matches an allowed IP/CIDR.
+
+    ``allowed_ips`` may contain plain IPv4/IPv6 addresses (e.g. ``10.0.0.1``)
+    or CIDR networks (e.g. ``10.0.0.0/24``). Plain hostnames are ignored; use
+    :func:`is_domain_allowed` for those.
+
+    Returns False for unparseable hosts so the caller can fall back to domain
+    matching (or deny, depending on context).
+    """
+    if not allowed_ips:
+        return False
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+
+    for spec in allowed_ips:
+        spec = spec.strip()
+        if not spec:
+            continue
+        try:
+            network = ipaddress.ip_network(spec, strict=False)
+            if addr in network:
+                return True
+        except ValueError:
+            # Not a CIDR; try a single address.
+            try:
+                if addr == ipaddress.ip_address(spec):
+                    return True
+            except ValueError:
+                continue
+    return False
+
+
 def is_domain_allowed(
     hostname: str,
     allowed_domains: Set[str],
     allowed_wildcards: Set[str],
+    allowed_ips: Optional[Set[str]] = None,
 ) -> bool:
-    """Check if a hostname is allowed by the allow-list."""
+    """Check if a hostname or IP literal is allowed by the allow-list."""
     hostname = hostname.lower().strip()
     if hostname in allowed_domains:
         return True
     for pattern in allowed_wildcards:
         if domain_matches(hostname, pattern):
             return True
+    if allowed_ips and _is_ip_allowed(hostname, allowed_ips):
+        return True
     return False
 
 
@@ -476,7 +514,12 @@ class SNIEgressProxy:
         # Check the CONNECT target host against the allow-list. This is
         # the primary allow decision — the CONNECT target is the
         # authoritative destination, available before the ClientHello.
-        if not is_domain_allowed(host, self.allowed_domains, self.allowed_wildcards):
+        if not is_domain_allowed(
+            host,
+            self.allowed_domains,
+            self.allowed_wildcards,
+            self.allowed_ips,
+        ):
             self._denied_count += 1
             client_writer.write(b"HTTP/1.1 403 Forbidden\r\n\r\n")
             await client_writer.drain()
@@ -602,7 +645,12 @@ class SNIEgressProxy:
                     host = host_value
                     host_port = None
 
-        if host and is_domain_allowed(host, self.allowed_domains, self.allowed_wildcards):
+        if host and is_domain_allowed(
+            host,
+            self.allowed_domains,
+            self.allowed_wildcards,
+            self.allowed_ips,
+        ):
             # Forward the request to the destination.
             # Parse the URL from the request line.
             parts = first_line.split()
@@ -737,7 +785,8 @@ def extract_allowlist_sets(al) -> Tuple[Set[str], Set[str], Set[str], Dict[str, 
                         allowed_ports[host_key] = set()
                     allowed_ports[host_key].add(entry.port)
         elif entry.kind in ("ip", "cidr"):
-            allowed_ips.add(entry.raw)
+            # Store the host (IP/CIDR) without the port for matching.
+            allowed_ips.add(entry.host)
             if entry.port is not None:
                 host_key = entry.host.lower()
                 if host_key not in allowed_ports:

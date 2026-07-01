@@ -102,6 +102,7 @@ The most important ones:
 | `RFSN_ENVOY_SIDECAR` | `--envoy-sidecar` | (empty) | Launch Envoy as a child process (host mode, not used in compose) |
 | `RFSN_PROXY_EGRESS` | `--proxy-egress` | `sni-proxy:8888` | Sandbox egress proxy address (Python SNI proxy in compose) |
 | `RFSN_NETWORK_ALLOWLIST` | `--network-allowlist` | `pypi.org:443,files.pythonhosted.org:443` | Allowed sandbox egress domains |
+| `RFSN_DOCKER_NETWORK` | `--docker-network` | `vibe-thinker_default` | Docker network for executor-spawned sandbox containers |
 | `FEDERATION_URL` | `--federation-url` | (empty) | Federation coordinator URL (multi-node) |
 | `RFSN_MAX_CONCURRENT` | `--max-concurrent` | `2` | Max concurrent jobs |
 | `RFSN_USE_CLR` | `--clr` | `true` | Enable Claim-Level Reliability |
@@ -197,6 +198,12 @@ The default allow-list is `pypi.org:443,files.pythonhosted.org:443`. The
 proxy is hardened with a read-only filesystem, dropped capabilities, no new
 privileges, non-root user, PID and memory limits, and a tmpfs `/tmp`.
 
+When the orchestrator runs inside compose, the code sandbox spawns containers
+via the mounted Docker socket. Those containers are attached to the Docker
+network configured by `RFSN_DOCKER_NETWORK` (default `vibe-thinker_default`)
+so they can reach the compose `sni-proxy` service by name. The default
+compose file sets this automatically.
+
 The Envoy sidecar (`--envoy-sidecar`) is an alternative for standalone
 transparent-routing experiments on the host and is not used in the compose
 stack.
@@ -209,4 +216,11 @@ non-allowlisted domains:
 
 ```bash
 ./scripts/test_compose.sh
+```
+
+Run the wheel-install test to verify the built wheel ships all runtime files
+and the installed entry points work:
+
+```bash
+python3 -m pytest tests/test_wheel_install.py -q
 ```

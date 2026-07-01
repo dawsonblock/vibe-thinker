@@ -656,6 +656,7 @@ class HybridReasoningOrchestrator:
         sandbox_image: Optional[str] = None,
         proxy_egress: Optional[str] = None,
         network_mode: Optional["NetworkMode"] = None,
+        docker_network: Optional[str] = None,
         use_structured_output: bool = False,
         specialist_transport: str = "completion",
         specialist_api_key: Optional[str] = None,
@@ -739,6 +740,10 @@ class HybridReasoningOrchestrator:
                           f"{proxy_egress}"
                           + (" (domain-level filtering)"
                              if network_allowlist else ""))
+                if docker_network and hasattr(executor, "set_docker_network"):
+                    executor.set_docker_network(docker_network)
+                    print(f"[Orchestrator] Sandbox Docker network set to "
+                          f"{docker_network}")
                 # Explicit sandbox network mode (Blocker 12 safety cleanup).
                 # network_mode=None means auto-detect (BEST_EFFORT_PROXY when
                 # an allow-list is present, DISABLED otherwise) — the default,
