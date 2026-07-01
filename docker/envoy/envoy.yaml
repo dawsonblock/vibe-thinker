@@ -34,56 +34,29 @@ static_resources:
           address: 0.0.0.0
           port_value: 8888
       filter_chains:
+        - filter_chain_match:
+            server_names: ["pypi.org"]
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: allow_pypi.org
+                cluster: dynamic_upstream
+        - filter_chain_match:
+            server_names: ["files.pythonhosted.org"]
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: allow_files.pythonhosted.org
+                cluster: dynamic_upstream
+        # Default: deny (no SNI match -> close connection via sinkhole).
         - filters:
             - name: envoy.filters.network.tcp_proxy
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
-                stat_prefix: egress_sni
-                matcher:
-                  matcher_tree:
-                    input:
-                      name: envoy.matching.inputs.server_name
-                      typed_config:
-                        "@type": type.googleapis.com/envoy.extensions.matching.common_inputs.network.v3.ServerNameInput
-                    exact_match_map:
-                      # --- Allowed domains (SNI / Host match) ---
-                      # Add one entry per domain the sandbox may reach.
-                      # The key is the exact hostname (no port).
-                      pypi.org:
-                        action:
-                          name: allow
-                          typed_config:
-                            "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
-                            stat_prefix: allow_pypi.org
-                            cluster: dynamic_upstream
-                      files.pythonhosted.org:
-                        action:
-                          name: allow
-                          typed_config:
-                            "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
-                            stat_prefix: allow_files.pythonhosted.org
-                            cluster: dynamic_upstream
-                  # Default: deny (no SNI match -> close connection via sinkhole).
-                  on_no_match:
-                    action:
-                      name: deny
-                      typed_config:
-                        "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
-                        stat_prefix: deny
-                        cluster: deny_sinkhole
-                access_log:
-                  - name: envoy.access_loggers.file
-                    typed_config:
-                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
-                      path: /dev/stdout
-                      log_format:
-                        json_format:
-                          timestamp: "%START_TIME%"
-                          upstream_host: "%UPSTREAM_HOST%"
-                          server_name: "%REQUESTED_SERVER_NAME%"
-                          bytes_sent: "%BYTES_SENT%"
-                          bytes_received: "%BYTES_RECEIVED%"
-                          duration: "%DURATION%"
+                stat_prefix: deny
+                cluster: deny_sinkhole
 
   clusters:
     # dynamic_upstream: tunnels allowed connections to the resolved upstream.
