@@ -1,0 +1,32 @@
+{
+  "version": "0.4.6a9",
+  "release_ready": true,
+  "production_ready": false,
+  "alpha_ready": true,
+  "clean_zip_passed": true,
+  "proof_bundle_passed": true,
+  "gates": {
+    "core": "passed",
+    "docker": "passed",
+    "embeddings": "passed",
+    "federation": "passed",
+    "ruvllm": "passed",
+    "release_web_queue": "passed",
+    "demo": "passed"
+  },
+  "artifacts": {
+    "gate_results_dir": "gate_results/",
+    "logs": [
+      "check_ruvllm.txt",
+      "compileall.txt",
+      "demo_verified_swarm.json",
+      "demo_verified_swarm.txt",
+      "environment.txt",
+      "pytest_release_web_queue.txt",
+      "test_core.txt",
+      "test_docker.txt",
+      "test_embeddings.txt",
+      "test_federation.txt"
+    ]
+  }
+}

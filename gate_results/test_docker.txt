@@ -8,8 +8,8 @@ timeout: 60.0s
 timeout method: thread
 timeout func_only: False
 asyncio: mode=Mode.AUTO, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
-collected 1403 items / 1390 deselected / 13 selected
+collected 1411 items / 1398 deselected / 13 selected
 
 tests/test_sandbox_network_enforcement.py .............                  [100%]
 
-===================== 13 passed, 1390 deselected in 41.32s =====================
+================ 13 passed, 1398 deselected in 82.94s (0:01:22) ================

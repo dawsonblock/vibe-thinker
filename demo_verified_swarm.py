@@ -35,12 +35,18 @@ Success standard:
 Usage:
     python3 demo_verified_swarm.py
     python3 demo_verified_swarm.py --verbose
+    python3 demo_verified_swarm.py --verbose --json-out gate_results/demo_verified_swarm.json
 
 Note: This script is source-checkout-only. It is NOT included in the
 wheel package (pyproject.toml py-modules). It requires the full source
 tree with tests, scripts, and optional dependencies installed.
-To install all demo dependencies:
-    bash scripts/demo_setup.sh
+
+Official Mac setup path:
+    python3 -m venv .venv
+    source .venv/bin/activate
+    python -m pip install -U pip setuptools wheel
+    bash scripts/demo_setup.sh --venv
+    python demo_verified_swarm.py --verbose --json-out gate_results/demo_verified_swarm.json
 """
 
 from __future__ import annotations
@@ -332,11 +338,11 @@ async def phase_1_core_reasoning() -> bool:
     from verifiers.code_verifier import CodeVerifier
     from sandbox import LocalSubprocessExecutor
 
-    # NOTE: LocalSubprocessExecutor is NOT a security sandbox. It runs
-    # code in a local subprocess with no filesystem or network isolation.
-    # It is used here only for benign generated code (the scheduler).
-    # Hostile code isolation is tested in Phase 2 via the network
-    # enforcement test suite and the Docker sandbox gate.
+    # NOTE: LocalSubprocessExecutor does not prove filesystem isolation.
+    # It runs code in a local subprocess with no filesystem or network
+    # isolation. Used here only for benign generated code (the scheduler).
+    # Real sandbox isolation is covered only by Docker sandbox tests
+    # (scripts/test_docker.sh). See Phase 2 for the full honesty statement.
 
     scheduler_code = """
 import itertools
@@ -473,12 +479,16 @@ async def phase_2_sandbox_isolation() -> bool:
     from verifiers.code_verifier import CodeVerifier
     from sandbox import LocalSubprocessExecutor
 
-    # NOTE: LocalSubprocessExecutor is NOT a security sandbox — it has
-    # no filesystem or network isolation. We use it here only to show
-    # that the *verifier* rejects wrong output. Real isolation is tested
-    # by the network enforcement test suite (2c) and the Docker sandbox
-    # gate (scripts/test_docker.sh). The /etc/passwd test below shows
-    # that verification fails, NOT that file access was blocked.
+    # BRUTAL TRUTH about this phase:
+    #   LocalSubprocessExecutor does not prove filesystem isolation.
+    #   This phase proves unsafe output is rejected by verifier logic.
+    #   Real sandbox isolation is covered only by Docker sandbox tests
+    #   (scripts/test_docker.sh, sub-check 2c below).
+    #
+    # No checklist item in the final report says "/etc/passwd blocked"
+    # unless Docker actually blocked it. The /etc/passwd sub-check below
+    # proves the VERIFIER rejects the output, not that file access was
+    # prevented — LocalSubprocessExecutor has no filesystem isolation.
     executor = LocalSubprocessExecutor(timeout=5.0)
     cv = CodeVerifier(timeout=5.0, executor=executor)
 
@@ -496,7 +506,12 @@ print(json.dumps(result))
     sub("Normal code (json import + schedule) passes",
         result_allowed.verified, f"method={result_allowed.method}")
 
-    # --- 2b. Blocked: filesystem abuse ---
+    # --- 2b. Filesystem abuse: /etc/passwd ---
+    # This sub-check proves the VERIFIER rejects the output. It does NOT
+    # prove filesystem isolation — LocalSubprocessExecutor has none.
+    # The subprocess may actually read /etc/passwd; the verifier rejects
+    # the output because it doesn't match the expected output. Real
+    # filesystem isolation is covered only by Docker sandbox tests (2c).
     fs_abuse_code = """
 try:
     with open("/etc/passwd") as f:
@@ -510,15 +525,14 @@ except Exception as e:
         fs_abuse_code,
         {"expected_output": "should_not_match"},
     )
-    # It should either fail verification or the output should not contain passwd data.
-    # NOTE: This tests that the VERIFIER rejects the output, not that the
-    # subprocess was prevented from reading the file. LocalSubprocessExecutor
-    # does not provide filesystem isolation. Use the Docker sandbox for that.
-    fs_blocked = not result_fs.verified or "root:" not in str(getattr(result_fs, 'evidence', ''))
-    sub("Filesystem abuse (/etc/passwd) — verifier rejects output (not sandbox isolation)",
-        fs_blocked, f"verified={result_fs.verified}")
-    evidence("network_bypass", fs_blocked)
-    evidence("verifier_evidence", bool(getattr(result_fs, "method", None)))
+    # The verifier rejects the output (it doesn't match expected_output).
+    # This is verifier logic, NOT sandbox isolation.
+    fs_rejected = not result_fs.verified or "root:" not in str(getattr(result_fs, 'evidence', ''))
+    sub("/etc/passwd output rejected by verifier; not a sandbox isolation proof",
+        fs_rejected, f"verified={result_fs.verified}")
+    evidence("network_bypass", fs_rejected)
+    evidence("verifier_evidence",
+             bool(getattr(result_fs, "method", None)))
 
     # --- 2c. Network enforcement tests ---
     # Run the actual network enforcement test suite
@@ -552,7 +566,7 @@ except Exception as e:
     evidence("network_bypass",
              not is_domain_allowed("evil.com", domains, wildcards))
 
-    ok = result_allowed.verified and fs_blocked and net_ok
+    ok = result_allowed.verified and fs_rejected and net_ok
     record("Phase 2: Sandbox Isolation", ok)
     return ok
 
@@ -1202,8 +1216,9 @@ async def phase_9_final_e2e() -> bool:
         from verifiers.code_verifier import CodeVerifier
         from sandbox import LocalSubprocessExecutor
 
-        # NOTE: LocalSubprocessExecutor is not a security sandbox.
-        # Used here only for benign generated code. See Phase 2 note.
+        # NOTE: LocalSubprocessExecutor does not prove filesystem isolation.
+        # Used here only for benign generated code. See Phase 2 for the
+        # full honesty statement. Real isolation is Docker sandbox only.
         executor = LocalSubprocessExecutor(timeout=10.0)
 
         scheduler_code = """
@@ -1481,7 +1496,7 @@ def final_report() -> None:
         ("Network bypass attempts shown",
          evidence_all("network_bypass"),
          "evil.com rejected, /etc/passwd verifier-rejected "
-         "(not sandbox-isolated)"),
+         "(NOT sandbox-isolated — Docker tests cover isolation)"),
         ("Memory reuse improves without skipping verification",
          evidence_all("memory_reuse_verified"),
          "trajectory retrieved + re-verified"),

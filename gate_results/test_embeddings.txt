@@ -8,7 +8,7 @@ timeout: 60.0s
 timeout method: thread
 timeout func_only: False
 asyncio: mode=Mode.AUTO, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
-collected 1403 items / 1303 deselected / 100 selected
+collected 1411 items / 1311 deselected / 100 selected
 
 tests/test_agentdb_only.py .....                                         [  5%]
 tests/test_migration.py ..................                               [ 23%]
@@ -16,4 +16,4 @@ tests/test_trajectory_store.py .............                             [ 36%]
 tests/test_trajectory_synthesis.py ...................                   [ 55%]
 tests/test_vector_store.py .......................................sssss. [100%]
 
-=============== 95 passed, 5 skipped, 1303 deselected in 20.94s ================
+=============== 95 passed, 5 skipped, 1311 deselected in 19.06s ================

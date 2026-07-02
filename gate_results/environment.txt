@@ -1,0 +1,24 @@
+vibe-thinker v0.4.6a9 — proof bundle environment
+timestamp: 2026-07-02T06:52:59Z
+host: Darwin 25.2.0 arm64
+python: Python 3.12.0
+shell: /bin/zsh
+
+=== prerequisites ===
+docker: Docker version 29.6.1, build 8900f1d
+docker daemon: running
+cargo: cargo 1.95.0 (f2d3ce0bd 2026-03-21)
+redis-server: NOT FOUND
+
+=== python packages ===
+pytest 8.4.2
+aiohttp 3.14.1
+fastapi 0.128.0
+httpx 0.28.1
+fakeredis 2.36.2
+wasmtime: NOT FOUND
+sentence_transformers 2.7.0
+scikit-learn 1.8.0
+numpy 1.26.4
+z3-solver
+cryptography 45.0.7

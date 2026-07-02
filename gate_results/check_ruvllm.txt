@@ -1,14 +1,14 @@
 [ruvllm] Python: /Users/dawsonblock/vibe-thinker/.venv-ruvllm/bin/python
 [ruvllm] sys.executable: /Users/dawsonblock/vibe-thinker/.venv-ruvllm/bin/python
 [ruvllm] cargo check...
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.60s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.18s
 [ruvllm] installing maturin...
 Requirement already satisfied: maturin in /Users/dawsonblock/vibe-thinker/.venv-ruvllm/lib/python3.12/site-packages (1.14.1)
 [ruvllm] building with inference-metal (Apple Silicon)...
 🐍 Found CPython 3.12 at /Users/dawsonblock/vibe-thinker/.venv-ruvllm/bin/python
 🔗 Found pyo3 bindings with abi3-py3.8 support
-    Finished `release` profile [optimized] target(s) in 0.41s
-📦 Built wheel for abi3 Python ≥ 3.8 to /var/folders/xt/jh84t2kj6hl26tk5qx3m_28h0000gn/T/.tmpQKCXs3/ruvllm_py-0.2.0-cp38-abi3-macosx_11_0_arm64.whl
+    Finished `release` profile [optimized] target(s) in 1.14s
+📦 Built wheel for abi3 Python ≥ 3.8 to /var/folders/xt/jh84t2kj6hl26tk5qx3m_28h0000gn/T/.tmpNFAX9x/ruvllm_py-0.2.0-cp38-abi3-macosx_11_0_arm64.whl
 ✏️ Setting installed package as editable
 🛠 Installed ruvllm_py-0.2.0
 [ruvllm] import check...

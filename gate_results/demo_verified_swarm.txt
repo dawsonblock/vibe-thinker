@@ -32,8 +32,8 @@ RuntimeWarning: Enable tracemalloc to get the object allocation traceback
   Phase 2: Sandbox Isolation — Allowed vs Blocked Behavior
 ========================================================================[0m
   [[92mPASS[0m] Normal code (json import + schedule) passes — method=python_exec
-  [[92mPASS[0m] Filesystem abuse (/etc/passwd) — verifier rejects output (not sandbox isolation) — verified=False
-  [[92mPASS[0m] Sandbox network enforcement tests pass — 50 passed in 58.17s
+  [[92mPASS[0m] /etc/passwd output rejected by verifier; not a sandbox isolation proof — verified=False
+  [[92mPASS[0m] Sandbox network enforcement tests pass — 50 passed in 54.43s
   [[92mPASS[0m] NetworkMode.DISABLED exists — value=disabled
   [[92mPASS[0m] Allow-listed domain (pypi.org) allowed
   [[92mPASS[0m] Non-allowlisted domain (evil.com) blocked
@@ -54,9 +54,9 @@ RuntimeWarning: Enable tracemalloc to get the object allocation traceback
 
 [Orchestrator] Route: GENERALIST (conf=0.750)
 [Generalist] chat endpoint failed (Cannot connect to host 127.0.0.1:8081 ssl:default [Connect call failed ('127.0.0.1', 8081)]), falling back to /completion
+[WebUI] Job da8a5c46a13a failed: Generalist call failed (both endpoints): Cannot connect to host 127.0.0.1:8081 ssl:default [Connect call failed ('127.0.0.1', 8081)]
   [[92mPASS[0m] POST /api/query accepts job — status=200
-  [2mQuery response: {"job_id": "57f7020fe5d4", "status": "pending"}[0m
-[WebUI] Job 57f7020fe5d4 failed: Generalist call failed (both endpoints): Cannot connect to host 127.0.0.1:8081 ssl:default [Connect call failed ('127.0.0.1', 8081)]
+  [2mQuery response: {"job_id": "da8a5c46a13a", "status": "pending"}[0m
   [[92mPASS[0m] GET /api/jobs returns 200 — status=200
   [[92mPASS[0m] GET /api/memory returns 200 — status=200
   [[92mPASS[0m] GET /api/trajectories returns 200 — status=200
@@ -75,7 +75,7 @@ RuntimeWarning: Enable tracemalloc to get the object allocation traceback
 [1m[96m========================================================================
   Phase 4: Web Security — API Key, CORS, Body Limits, No-CL Bypass
 ========================================================================[0m
-  [[92mPASS[0m] test_web_security.py passes — 21 passed in 0.25s
+  [[92mPASS[0m] test_web_security.py passes — 21 passed in 0.43s
   [[92mPASS[0m] Small body (5 bytes) passes — status=200, body={"size":5}
   [[92mPASS[0m] Large body with Content-Length -> 413 — status=413
   [[92mPASS[0m] Lying Content-Length (5/100) blocked (not 200) — status=413
@@ -102,7 +102,7 @@ RuntimeWarning: Enable tracemalloc to get the object allocation traceback
 [1m[96m========================================================================
   Phase 6: AgentDB-Only Cutover — Empty Local Cache Retrieval
 ========================================================================[0m
-  [[92mPASS[0m] test_agentdb_only.py passes — 5 passed in 6.50s
+  [[92mPASS[0m] test_agentdb_only.py passes — 5 passed in 11.22s
 [AgentDB] /v1/vector/search connection failed: Cannot connect to host 127.0.0.1:19999 ssl:default [Connect call failed ('127.0.0.1', 19999)] — sidecar not running at http://127.0.0.1:19999?
   [[92mPASS[0m] Empty local + dead AgentDB -> fail-closed (no hit) — hit=no
   [[92mPASS[0m] Missing embedder fails closed (no crash) — no crash, no hit
@@ -112,7 +112,7 @@ RuntimeWarning: Enable tracemalloc to get the object allocation traceback
 [1m[96m========================================================================
   Phase 7: Federation — Claim, Heartbeat, Complete, Zombie Reaper
 ========================================================================[0m
-  [[92mPASS[0m] Federation test suite passes — 94 passed in 5.01s
+  [[92mPASS[0m] Federation test suite passes — 94 passed in 8.16s
   [[92mPASS[0m] Job submitted to federation — status=200
   [[92mPASS[0m] Worker claims pending job — job_id=fed-demo-1
   [[92mPASS[0m] Heartbeat accepted — status=200
@@ -138,7 +138,7 @@ RuntimeWarning: Enable tracemalloc to get the object allocation traceback
   [[92mPASS[0m] Step 2: Math invariant verified (3×2=6) — score=1.0
   [[92mPASS[0m] Step 3: Verified solution stored in trajectory store — entries=1
   [[92mPASS[0m] Step 3: Verified solution stored in CLR cache — entries=1
-  [[92mPASS[0m] Step 4: Similar trajectory retrieved — found=1, time=0.012s
+  [[92mPASS[0m] Step 4: Similar trajectory retrieved — found=1, time=0.355s
   [[92mPASS[0m] Step 4: New problem solved + independently verified — method=unit_tests
   [[92mPASS[0m] Step 5: Memory used as context, not blindly trusted — retrieved+verified
   [[92mPASS[0m] Trajectory file has verified entries — entries=3
@@ -170,7 +170,7 @@ RuntimeWarning: Enable tracemalloc to get the object allocation traceback
     [92m✓[0m Every result has verifier evidence — 9/9 results had a method
     [92m✓[0m Failed optional systems fail closed — 1/1 fail-closed checks passed
     [92m✓[0m Web security actually tested — API key, CORS, body limits, no-CL bypass
-    [92m✓[0m Network bypass attempts shown — evil.com rejected, /etc/passwd verifier-rejected (not sandbox-isolated)
+    [92m✓[0m Network bypass attempts shown — evil.com rejected, /etc/passwd verifier-rejected (NOT sandbox-isolated — Docker tests cover isolation)
     [92m✓[0m Memory reuse improves without skipping verification — trajectory retrieved + re-verified
     [92m✓[0m Final report names every failure — 0 failure(s) named above
 

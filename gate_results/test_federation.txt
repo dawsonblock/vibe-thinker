@@ -8,7 +8,7 @@ timeout: 60.0s
 timeout method: thread
 timeout func_only: False
 asyncio: mode=Mode.AUTO, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
-collected 1403 items / 1261 deselected / 142 selected
+collected 1411 items / 1269 deselected / 142 selected
 
 tests/test_federation_server.py ....................................     [ 25%]
 tests/test_federation_zombie.py ..................                       [ 38%]
@@ -18,4 +18,4 @@ tests/test_web_federation.py ........                                    [ 78%]
 tests/test_web_pubsub.py .........                                       [ 85%]
 tests/test_web_security.py .....................                         [100%]
 
-==================== 142 passed, 1261 deselected in 10.24s =====================
+===================== 142 passed, 1269 deselected in 6.15s =====================

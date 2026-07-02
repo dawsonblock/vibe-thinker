@@ -14,26 +14,44 @@ The pytest step uses no --timeout flags so it works with plain pytest
 (no pytest-timeout required). A subprocess timeout provides the outer
 guard.
 
-Mode flags:
+Two official artifact modes (the freeze plan's Artifact A and B):
+
+    --release         Artifact A: clean source release ZIP.
+                      Excludes gate_results/ (proof logs are not source).
+                      Output: dist/vibe-thinker-v<version>.zip
+                      This is the shippable source archive.
+
+    --proof-bundle    Artifact B: proof bundle ZIP.
+                      Includes gate_results/ (proof logs + demo JSON +
+                      summary.json) on top of the full source.
+                      Output: dist/vibe-thinker-v<version>-proof-bundle.zip
+                      This is the evidence archive, NOT for redistribution.
+
+Both modes run the self-contained gate (temp venv + install .[dev,test] +
+core pytest) before creating the ZIP. Both fail if junk files are present.
+
+Legacy / convenience flags (still work, produce the default ZIP name):
+
     (default)          Run compile + core tests in the current Python
                        environment. Fails if test deps (pytest) are
                        missing — install with: pip install -e '.[dev,test]'
     --use-current-env  Explicit alias for the default: run tests in the
                        current environment.
     --self-contained   Create a temporary venv, install .[dev,test], run
-                       core tests there, then build the ZIP. Best for
-                       release use — proves the repo works from clean.
+                       core tests there, then build the ZIP. Produces the
+                       release ZIP name (equivalent to --release).
     --no-tests         Skip the pytest gate entirely (compileall only).
     --tests            Force the pytest gate; fail if pytest is absent.
 
 Usage:
-    python scripts/build_clean_zip.py
-    python scripts/build_clean_zip.py --no-tests
-    python scripts/build_clean_zip.py --use-current-env
+    python scripts/build_clean_zip.py --release
+    python scripts/build_clean_zip.py --proof-bundle
     python scripts/build_clean_zip.py --self-contained
+    python scripts/build_clean_zip.py --no-tests
 
 Output:
-    dist/vibe-thinker-v<version>.zip   (version from pyproject.toml)
+    dist/vibe-thinker-v<version>.zip                 (--release / default)
+    dist/vibe-thinker-v<version>-proof-bundle.zip    (--proof-bundle)
 
 Exit code is nonzero if compileall fails, or if the core pytest gate
 fails. If pytest is absent and tests are not skipped (--no-tests), the
@@ -81,6 +99,7 @@ def get_project_version() -> str:
 
 VERSION = get_project_version()
 ZIP_NAME = f"vibe-thinker-v{VERSION}.zip"
+PROOF_BUNDLE_NAME = f"vibe-thinker-v{VERSION}-proof-bundle.zip"
 
 # Directories to include (full source snapshot). Everything else in the
 # project root is excluded. This MUST cover all project content so the
@@ -131,6 +150,8 @@ INCLUDE_FILES = _discover_root_py_modules() + _INCLUDE_NONPY_FILES
 # - .DS_Store: macOS metadata
 # - .venv: isolated venvs created by gate scripts / self-contained builds
 # - .mypy_cache, .ruff_cache: tool caches that bloat archives
+# - gate_results: proof logs — excluded from the release ZIP, included
+#   ONLY in the --proof-bundle artifact (handled separately in main())
 # - .git (exact): Git metadata — NOT .github (which is CI config we ship)
 EXCLUDE_PATTERNS = [
     "__pycache__", ".pyc", ".pyo", ".pytest_cache",
@@ -140,6 +161,7 @@ EXCLUDE_PATTERNS = [
     "orchestrator_memory.jsonl",
     ".DS_Store",
     ".venv", ".mypy_cache", ".ruff_cache",
+    "gate_results",
 ]
 # Directory/file names to exclude ONLY on exact match (not substring).
 # This prevents ".git" from matching ".github". Also catches editor
@@ -147,23 +169,29 @@ EXCLUDE_PATTERNS = [
 EXCLUDE_EXACT = {".git", ".idea", ".vscode"}
 
 
-def should_exclude(name: str) -> bool:
+def should_exclude(name: str, include_gate_results: bool = False) -> bool:
     base = os.path.basename(name)
     if base in EXCLUDE_EXACT:
         return True
     for pat in EXCLUDE_PATTERNS:
+        # gate_results is excluded from the release ZIP but included in
+        # the proof bundle. Skip this pattern when the caller opts in.
+        if pat == "gate_results" and include_gate_results:
+            continue
         if pat in name:
             return True
     return False
 
 
-def copy_tree_clean(src: str, dst: str) -> None:
+def copy_tree_clean(src: str, dst: str,
+                    include_gate_results: bool = False) -> None:
     """Copy a directory tree, excluding junk files."""
     for root, dirs, files in os.walk(src):
         # Filter out excluded dirs in-place
-        dirs[:] = [d for d in dirs if not should_exclude(d)]
+        dirs[:] = [d for d in dirs
+                   if not should_exclude(d, include_gate_results)]
         for fname in files:
-            if should_exclude(fname):
+            if should_exclude(fname, include_gate_results):
                 continue
             rel = os.path.relpath(os.path.join(root, fname), src)
             dst_path = os.path.join(dst, rel)
@@ -200,18 +228,25 @@ def require_test_deps() -> None:
 def _parse_args() -> tuple:
     """Parse command-line flags.
 
-    Returns (no_tests, force_tests, self_contained).
+    Returns (no_tests, force_tests, self_contained, mode) where mode is
+    one of "default", "release", "proof-bundle".
 
+    --release         : Artifact A — clean source ZIP, excludes gate_results/.
+                       Implies --self-contained (temp venv + core gate).
+    --proof-bundle    : Artifact B — proof bundle ZIP, includes gate_results/.
+                       Implies --self-contained (temp venv + core gate).
     --no-tests        : skip the pytest gate (compileall only).
     --tests           : force the pytest gate; fail if pytest is absent.
     --use-current-env : explicit alias for the default (run tests in the
                         current environment).
     --self-contained  : create a temp venv, install .[dev,test], run core
-                        tests there, then build the ZIP.
+                        tests there, then build the ZIP. Produces the
+                        release ZIP name (equivalent to --release).
     """
     no_tests = False
     force_tests = False
     self_contained = False
+    mode = "default"
     args = sys.argv[1:]
     for arg in args:
         if arg == "--no-tests":
@@ -222,16 +257,24 @@ def _parse_args() -> tuple:
             pass  # explicit alias for default; no flag needed
         elif arg == "--self-contained":
             self_contained = True
+            mode = "release"
+        elif arg == "--release":
+            mode = "release"
+            self_contained = True
+        elif arg == "--proof-bundle":
+            mode = "proof-bundle"
+            self_contained = True
         elif arg in ("--help", "-h"):
             print(__doc__)
             sys.exit(0)
         else:
             print(f"Unknown argument: {arg}", file=sys.stderr)
             print("Usage: python scripts/build_clean_zip.py "
-                  "[--no-tests|--use-current-env|--self-contained]",
+                  "[--release|--proof-bundle|"
+                  "--self-contained|--no-tests]",
                   file=sys.stderr)
             sys.exit(2)
-    return no_tests, force_tests, self_contained
+    return no_tests, force_tests, self_contained, mode
 
 
 def _run_self_contained_tests(staging: str) -> int:
@@ -285,7 +328,7 @@ def _run_self_contained_tests(staging: str) -> int:
 
 
 def main() -> int:
-    no_tests, force_tests, self_contained = _parse_args()
+    no_tests, force_tests, self_contained, mode = _parse_args()
     staging = tempfile.mkdtemp(prefix="vibe_build_")
     try:
         # Copy included dirs
@@ -299,6 +342,24 @@ def main() -> int:
             src = os.path.join(PROJECT_ROOT, f)
             if os.path.isfile(src):
                 shutil.copy2(src, os.path.join(staging, f))
+
+        # --- Proof bundle: include gate_results/ on top of the source ---
+        # The release ZIP excludes gate_results/ (it's in EXCLUDE_PATTERNS).
+        # The proof bundle includes it so the evidence travels with the
+        # archive. We copy it AFTER the source tree so it's the only
+        # addition.
+        include_gr = (mode == "proof-bundle")
+        if include_gr:
+            gr_src = os.path.join(PROJECT_ROOT, "gate_results")
+            if os.path.isdir(gr_src):
+                copy_tree_clean(gr_src, os.path.join(staging, "gate_results"),
+                                include_gate_results=True)
+                print(f"Included gate_results/ in proof bundle "
+                      f"({len(os.listdir(gr_src))} entries)")
+            else:
+                print("WARNING: --proof-bundle but no gate_results/ dir "
+                      "found — bundle will have no proof logs",
+                      file=sys.stderr)
 
         # --- Validation: compileall (mandatory) ---
         print("Running compileall...")
@@ -372,14 +433,19 @@ def main() -> int:
         # ``find "$WORKDIR" -mindepth 1 -maxdepth 1 -type d | head -n 1``.
         top_dir = f"vibe-thinker-v{VERSION}"
         os.makedirs(DIST_DIR, exist_ok=True)
-        zip_path = os.path.join(DIST_DIR, ZIP_NAME)
+        if mode == "proof-bundle":
+            zip_name = PROOF_BUNDLE_NAME
+        else:
+            zip_name = ZIP_NAME
+        zip_path = os.path.join(DIST_DIR, zip_name)
         if os.path.exists(zip_path):
             os.unlink(zip_path)
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for root, dirs, files in os.walk(staging):
-                dirs[:] = [d for d in dirs if not should_exclude(d)]
+                dirs[:] = [d for d in dirs
+                           if not should_exclude(d, include_gr)]
                 for fname in files:
-                    if should_exclude(fname):
+                    if should_exclude(fname, include_gr):
                         continue
                     fpath = os.path.join(root, fname)
                     arcname = os.path.join(
@@ -393,16 +459,47 @@ def main() -> int:
         print(f"\nClean ZIP created: {zip_path}")
         print(f"  Size: {os.path.getsize(zip_path)} bytes")
 
-        # Verify no junk in the ZIP
+        # Verify no junk in the ZIP (full hygiene check, mode-aware).
+        # The proof bundle legitimately contains gate_results/ — that is
+        # NOT junk. Everything else in the junk list is always rejected.
         with zipfile.ZipFile(zip_path, "r") as zf:
             names = zf.namelist()
-            bad = [n for n in names
-                   if "__pycache__" in n or n.endswith(".pyc")]
+            # Full junk token list — mirrors tests/test_release_zip_hygiene.py
+            junk_tokens = (
+                "__pycache__", ".pyc", ".pyo", ".pytest_cache",
+                ".egg-info", ".venv", ".mypy_cache", ".ruff_cache",
+                ".DS_Store",
+            )
+            junk_exact = {".git", ".idea", ".vscode"}
+            bad = []
+            for n in names:
+                norm = n.replace("\\", "/")
+                if any(tok in norm for tok in junk_tokens):
+                    bad.append(n)
+                    continue
+                segments = [s for s in norm.split("/") if s]
+                if any(seg in junk_exact for seg in segments):
+                    bad.append(n)
             if bad:
                 print(f"  ERROR: ZIP contains junk files: {bad}")
                 return 1
-            print("  Verified: no __pycache__ or .pyc files in ZIP")
+            print("  Verified: no junk files in ZIP")
             print(f"  Entries: {len(names)}")
+
+            # Mode-specific content check
+            has_gate_results = any(
+                n.startswith(top_dir + "/gate_results/") for n in names)
+            if mode == "proof-bundle":
+                if not has_gate_results:
+                    print("  ERROR: proof bundle missing gate_results/")
+                    return 1
+                print("  Verified: proof bundle contains gate_results/")
+            else:
+                if has_gate_results:
+                    print("  ERROR: release ZIP contains gate_results/ "
+                          "(should be excluded)")
+                    return 1
+                print("  Verified: release ZIP excludes gate_results/")
 
             # Verify every .sh file in the ZIP has the executable bit
             # set in external_attr. ZIP extraction tools that honor

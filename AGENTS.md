@@ -26,27 +26,41 @@
     FAIL; `--keep-going` runs all gates instead of aborting on first
     failure). This is the "run and capture the full gate matrix" command.
 - **ZIP release build + self-test**:
-  - **Release-grade build (the ONE supported path):**
-    `./scripts/release_zip.sh` — chains
-    `python scripts/build_clean_zip.py --self-contained` (temp venv +
-    install `.[dev,test]` + core pytest gate + clean ZIP) with
-    `./scripts/test_zip_release.sh dist/vibe-thinker-v<version>.zip`
-    (extract, reject `__pycache__`/`.pyc` junk, check +x bits, fresh venv
-    install, doctor, smoke, `test_core.sh`). Do NOT ship a ZIP built any
-    other way; `--skip-test` produces a non-release artifact.
+  - **Two official artifacts (freeze plan):**
+    - **Artifact A — clean source release:**
+      `./scripts/release_zip.sh` — chains
+      `python scripts/build_clean_zip.py --release` (temp venv +
+      install `.[dev,test]` + core pytest gate + clean ZIP) with
+      `./scripts/test_zip_release.sh dist/vibe-thinker-v<version>.zip`
+      (extract, reject `__pycache__`/`.pyc` junk, check +x bits, fresh venv
+      install, doctor, smoke, `test_core.sh`). Excludes `gate_results/`.
+      Output: `dist/vibe-thinker-v<version>.zip`. Do NOT ship a ZIP built
+      any other way; `--skip-test` produces a non-release artifact.
+    - **Artifact B — proof bundle:**
+      `./scripts/release_zip.sh --proof-bundle` — builds
+      `dist/vibe-thinker-v<version>-proof-bundle.zip` via
+      `python scripts/build_clean_zip.py --proof-bundle`. Includes
+      `gate_results/` (proof logs + demo JSON + summary.json) on top of
+      the full source. This is the evidence archive, NOT for
+      redistribution. No self-test (it's not a clean-install target).
   - Low-level build: `python scripts/build_clean_zip.py` (compile + core
     pytest gate + ZIP; verifies every `.sh` in the ZIP has the +x bit set
-    in `external_attr`). Use `--self-contained` for release use.
+    in `external_attr`). Use `--release` or `--proof-bundle` for official
+    artifacts. `--self-contained` is a legacy alias for `--release`.
   - Self-test: `./scripts/test_zip_release.sh dist/vibe-thinker-v<version>.zip`
     (extracts to a temp dir, checks +x bits, no junk, installs in a fresh
     venv, runs `bash scripts/test_core.sh`)
   - **Automated hygiene guard (pytest):**
     `python3 -m pytest tests/test_release_zip_hygiene.py -q` — scans every
-    `dist/vibe-thinker-v*.zip` and fails if any entry is
-    `__pycache__`/`.pyc`/`.pyo`/`.pytest_cache`/`.egg-info`/`build`/`.DS_Store`
-    or any `.sh` lacks the +x bit in `external_attr`. Skips when no
-    release ZIP exists. Mirrors the junk check in
-    `scripts/test_zip_release.sh` and `EXCLUDE_PATTERNS` in
+    `dist/vibe-thinker-v*.zip` and `dist/vibe-thinker-v*-proof-bundle.zip`.
+    Fails if any entry is `__pycache__`/`.pyc`/`.pyo`/`.pytest_cache`/
+    `.egg-info`/`build`/`.DS_Store`/`.venv`/`.mypy_cache`/`.ruff_cache`/
+    `.idea`/`.vscode` or any `.sh` lacks the +x bit in `external_attr`.
+    Also verifies: release ZIP excludes `gate_results/`, proof bundle
+    includes it, both contain `pyproject.toml`/`demo_verified_swarm.py`/
+    `README.md`/`AGENTS.md`/`CHANGELOG.md`, and the filename version
+    matches `pyproject.toml`. Skips when no ZIP exists. Mirrors the junk
+    check in `scripts/test_zip_release.sh` and `EXCLUDE_PATTERNS` in
     `scripts/build_clean_zip.py`.
 - **Anti-regression static checks** (AST-based, no execution):
   - Missing private methods: `python3 -m pytest tests/test_static_missing_self_methods.py -q` (flags `self.<name>()` calls with no defining method on the class)
@@ -122,11 +136,22 @@
   `vibe-thinker_default`), so they can reach the compose `sni-proxy` service.
 - **Demo dependencies**: `demo_verified_swarm.py` exercises every major
   subsystem (core, sandbox, web UI, web security, memory/trajectory,
-  AgentDB, federation, RuvLLM) and needs the full set of optional extras.
-  Install them with one command: `bash scripts/demo_setup.sh` (current
-  env) or `bash scripts/demo_setup.sh --venv` (creates `.venv-demo`).
-  Then run the demo with `python3 demo_verified_swarm.py --verbose`.
-  For a minimal core-only env (no Docker/Redis/Rust): `bash scripts/mac_setup.sh`.
+  AgentDB, federation, RuvLLM). It is source-checkout-only (NOT installed
+  from wheel — see `pyproject.toml` `[project.scripts]` note).
+  **Official Mac setup path:**
+  ```
+  python3 -m venv .venv
+  source .venv/bin/activate
+  python -m pip install -U pip setuptools wheel
+  bash scripts/demo_setup.sh --venv
+  python -m compileall -q .
+  python -m pytest tests/test_release_zip_hygiene.py tests/test_web_security.py tests/test_job_queue.py -q
+  python demo_verified_swarm.py --verbose --json-out gate_results/demo_verified_swarm.json
+  ```
+  `demo_setup.sh` installs only `[dev,test,web,federation,sandbox]` — NOT
+  the heavy `embeddings`/`models`/`nli`/`rust` extras (no demo code path
+  needs them). For a minimal core-only env (no Docker/Redis/Rust):
+  `bash scripts/mac_setup.sh`.
 
 ## RuFlo integration abstractions (v0.3.9)
 Four pluggable abstractions from the Vibe-Thinker + RuFlo Integration Plan.

@@ -26,9 +26,17 @@
 # Usage:
 #   bash scripts/demo_setup.sh          # install into current env
 #   bash scripts/demo_setup.sh --venv   # create .venv-demo and install there
+#
+# OFFICIAL MAC SETUP PATH (the freeze plan's standardized sequence):
+#   python3 -m venv .venv
+#   source .venv/bin/activate
+#   python -m pip install -U pip setuptools wheel
 #   bash scripts/demo_setup.sh --venv
-#   source .venv-demo/bin/activate
-#   python demo_verified_swarm.py --verbose
+#
+# Then verify + run the demo:
+#   python -m compileall -q .
+#   python -m pytest tests/test_release_zip_hygiene.py tests/test_web_security.py tests/test_job_queue.py -q
+#   python demo_verified_swarm.py --verbose --json-out gate_results/demo_verified_swarm.json
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
