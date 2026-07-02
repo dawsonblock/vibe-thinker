@@ -1,13 +1,34 @@
 #!/usr/bin/env bash
-# demo_setup.sh — install all dependencies needed to run demo_verified_swarm.py
+# demo_setup.sh — install the dependencies needed to run demo_verified_swarm.py
 #
 # The demo exercises every major subsystem: core reasoning, sandbox, web UI,
 # web security, memory/trajectory, AgentDB, federation, and RuvLLM. This
-# script installs the full set of optional extras so every phase can run.
+# script installs ONLY the extras the demo actually imports — not every
+# optional heavy dependency.
+#
+# Installed extras:
+#   dev         pytest (the demo shells out to pytest for several phases)
+#   test        numpy, scikit-learn, cryptography, z3-solver, pyyaml
+#               (covers the logic verifier + vector store + agentdb test)
+#   web         fastapi, uvicorn, websockets, pydantic, httpx
+#   federation  redis, fakeredis, cryptography
+#   sandbox     docker, wasmtime (Docker tests skip gracefully if Docker
+#               is absent; wasmtime powers the static-analysis fallback)
+#
+# Deliberately NOT installed (heavy, not imported by any demo code path):
+#   embeddings  sentence-transformers + torch + faiss-cpu (~2+ GB)
+#   models      llama-cpp-python, onnxruntime, huggingface_hub, ...
+#   nli         transformers + torch
+#   rust        maturin (only needed to BUILD the ruvllm_py binding)
+# The demo's AgentDB phase uses a FakeVectorStore / dead-sidecar fail-closed
+# path, so the embeddings extra is not required.
 #
 # Usage:
 #   bash scripts/demo_setup.sh          # install into current env
 #   bash scripts/demo_setup.sh --venv   # create .venv-demo and install there
+#   bash scripts/demo_setup.sh --venv
+#   source .venv-demo/bin/activate
+#   python demo_verified_swarm.py --verbose
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,11 +48,16 @@ if $USE_VENV; then
     pip install --upgrade pip setuptools wheel
 fi
 
-echo "Installing vibe-thinker with all extras for demo..."
+echo "Installing vibe-thinker with the demo's required extras..."
+echo "  (dev, test, web, federation, sandbox — NOT embeddings/models/nli/rust)"
 cd "$ROOT"
-pip install -e ".[dev,test,web,federation,sandbox,embeddings,logic]"
+pip install -e ".[dev,test,web,federation,sandbox]"
 
 echo ""
 echo "Demo dependencies installed."
 echo "Run the demo with:"
 echo "  python3 demo_verified_swarm.py --verbose"
+echo ""
+echo "Note: Docker-dependent sandbox tests skip gracefully if Docker is"
+echo "not running. The embeddings/models/nli/rust extras are not needed"
+echo "for any demo code path."

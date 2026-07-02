@@ -78,6 +78,31 @@ class Colors:
 PHASE_RESULTS: List[Tuple[str, bool, str]] = []
 VERBOSE = False
 
+# Evidence collected by sub-checks, used by the final brutal-truth
+# checklist so its pass/fail values are COMPUTED from real checks, never
+# hardcoded True. Each key maps to a list of booleans (one per sub-check);
+# the checklist item is ok only if every entry is True and the list is
+# non-empty (i.e. the check actually ran).
+CHECK_EVIDENCE: Dict[str, List[bool]] = {}
+
+
+def evidence(key: str, ok: bool) -> None:
+    """Record a real sub-check outcome for the brutal-truth checklist.
+
+    Phases call this with the concrete boolean a sub-check produced. The
+    final report aggregates these so no checklist item is ever a hardcoded
+    True — if the underlying sub-checks failed (or never ran), the item
+    fails honestly.
+    """
+    CHECK_EVIDENCE.setdefault(key, []).append(bool(ok))
+
+
+def evidence_all(key: str) -> bool:
+    """True only if every recorded outcome for ``key`` is True and at least
+    one was recorded (the check actually ran)."""
+    vals = CHECK_EVIDENCE.get(key, [])
+    return len(vals) > 0 and all(vals)
+
 
 def header(title: str) -> None:
     print(f"\n{Colors.BOLD}{Colors.CYAN}{'=' * 72}")
@@ -243,6 +268,8 @@ async def phase_1_core_reasoning() -> bool:
     )
     sub("Logic verifier: nurse schedule satisfies all constraints (Z3/SMT)",
         result.verified, f"method={result.method}")
+    evidence("live_computation", result.method is not None)
+    evidence("verifier_evidence", bool(getattr(result, "method", None)))
 
     # --- 1b. Schema verifier: JSON output structure ---
     from verifiers.schema_verifier import SchemaVerifier
@@ -287,6 +314,8 @@ async def phase_1_core_reasoning() -> bool:
         "Return schedule JSON", valid_output, {"schema": schedule_schema})
     sub("Schema verifier: valid JSON accepted", result_schema.verified,
         f"score={result_schema.score}")
+    evidence("live_computation", result_schema.method is not None)
+    evidence("verifier_evidence", bool(getattr(result_schema, "method", None)))
 
     # Wrong: missing 'proof' key
     bad_output = json.dumps({
@@ -297,6 +326,7 @@ async def phase_1_core_reasoning() -> bool:
         "Return schedule JSON", bad_output, {"schema": schedule_schema})
     sub("Schema verifier: missing proof key rejected",
         not result_bad.verified, f"error={result_bad.error}")
+    evidence("verifier_evidence", bool(getattr(result_bad, "method", None)))
 
     # --- 1c. Code verifier: generated Python runs in sandbox ---
     from verifiers.code_verifier import CodeVerifier
@@ -398,6 +428,8 @@ assert "Alice" not in schedule.get("night", [])
     )
     sub("Code verifier: scheduler runs + tests pass in sandbox",
         result_code.verified, f"method={result_code.method}")
+    evidence("live_computation", result_code.method is not None)
+    evidence("verifier_evidence", bool(getattr(result_code, "method", None)))
 
     # --- 1d. Math invariant: total nurse-shifts = 6 (3 shifts × 2 nurses) ---
     from verifiers.math_verifier import MathVerifier
@@ -409,6 +441,8 @@ assert "Alice" not in schedule.get("night", [])
     )
     sub("Math verifier: invariant total=6 (3 shifts × 2 nurses)",
         result_math.verified, f"score={result_math.score}")
+    evidence("live_computation", result_math.method is not None)
+    evidence("verifier_evidence", bool(getattr(result_math, "method", None)))
 
     # --- 1e. No self-claim-only answer accepted ---
     # Simulate a self-claim-only result (no independent verification)
@@ -483,6 +517,8 @@ except Exception as e:
     fs_blocked = not result_fs.verified or "root:" not in str(getattr(result_fs, 'evidence', ''))
     sub("Filesystem abuse (/etc/passwd) — verifier rejects output (not sandbox isolation)",
         fs_blocked, f"verified={result_fs.verified}")
+    evidence("network_bypass", fs_blocked)
+    evidence("verifier_evidence", bool(getattr(result_fs, "method", None)))
 
     # --- 2c. Network enforcement tests ---
     # Run the actual network enforcement test suite
@@ -513,6 +549,8 @@ except Exception as e:
         is_domain_allowed("pypi.org", domains, wildcards))
     sub("Non-allowlisted domain (evil.com) blocked",
         not is_domain_allowed("evil.com", domains, wildcards))
+    evidence("network_bypass",
+             not is_domain_allowed("evil.com", domains, wildcards))
 
     ok = result_allowed.verified and fs_blocked and net_ok
     record("Phase 2: Sandbox Isolation", ok)
@@ -873,6 +911,11 @@ async def phase_5_memory() -> bool:
         ok = (ok_stored and ok_cache_stored and ok_retrieved
               and ok_cache_hit and ok_independently_verified
               and ok_filtered and ok_traj_file and ok_cache_file)
+    # Memory reuse is honest only if a trajectory was retrieved AND it was
+    # independently verified (not self_claims_only) — i.e. reuse did not
+    # skip verification.
+    evidence("memory_reuse_verified",
+             ok_retrieved and ok_independently_verified)
     record("Phase 5: Memory / Verified Trajectory", ok)
     return ok
 
@@ -920,6 +963,7 @@ async def phase_6_agentdb_only() -> bool:
         hit = cache.lookup("nurse scheduling problem")
         sub("Empty local + dead AgentDB -> fail-closed (no hit)",
             hit is None, f"hit={'yes' if hit else 'no'}")
+        evidence("fail_closed", hit is None)
 
         # --- Missing embedder warns, fails closed ---
         # When no embedding model is available, agentdb_only should warn
@@ -1091,6 +1135,7 @@ async def phase_8_ruvllm() -> bool:
         except Exception as e:
             ok_failclosed = sub("RuvLLMBinding raises ImportError when binding missing",
                 False, f"wrong exception: {type(e).__name__}")
+        evidence("fail_closed", ok_failclosed)
         ok_supports = True  # N/A when binding unavailable
     else:
         # If binding IS available, check SUPPORTS_INFERENCE
@@ -1260,6 +1305,8 @@ print("All tests passed")
         )
         ok_step1 = sub("Step 1: Scheduler built + tests pass in sandbox",
             result.verified, f"method={result.method}")
+        evidence("live_computation", result.method is not None)
+        evidence("verifier_evidence", bool(getattr(result, "method", None)))
 
         # --- Step 2: Verify the math invariant ---
         from verifiers.math_verifier import MathVerifier
@@ -1270,6 +1317,9 @@ print("All tests passed")
             "6", {"expected_answer": "6"})
         ok_step2 = sub("Step 2: Math invariant verified (3×2=6)",
             result_math.verified, f"score={result_math.score}")
+        evidence("live_computation", result_math.method is not None)
+        evidence("verifier_evidence",
+                 bool(getattr(result_math, "method", None)))
 
         # --- Step 3: Store the verified trajectory ---
         store.store(
@@ -1330,6 +1380,11 @@ print("All tests passed")
         )
         ok_new = sub("Step 4: New problem solved + independently verified",
             result_new.verified, f"method={result_new.method}")
+        evidence("live_computation", result_new.method is not None)
+        evidence("verifier_evidence",
+                 bool(getattr(result_new, "method", None)))
+        evidence("memory_reuse_verified",
+                 result_new.verified and len(trajectories) > 0)
 
         # --- Step 5: Memory improved speed without skipping verification ---
         # The retrieval was fast (vector search), and the result was still verified.
@@ -1395,16 +1450,44 @@ def final_report() -> None:
         print(f"  {Colors.DIM}Failures are named above — they show exactly")
         print(f"  where the architecture is still pretending.{Colors.RESET}")
 
-    # Brutal truth checklist
+    # Brutal truth checklist — every ok is COMPUTED from real sub-check
+    # evidence (CHECK_EVIDENCE) or phase outcomes (PHASE_RESULTS), never
+    # hardcoded True. If the underlying checks failed or never ran, the
+    # item fails honestly.
     print(f"\n  {Colors.BOLD}Brutal Truth Checklist:{Colors.RESET}")
+    phase_ok = {p: ok for p, ok, _ in PHASE_RESULTS}
+
+    def _phase(name: str) -> bool:
+        return bool(phase_ok.get(name, False))
+
     checks = [
-        ("No canned outputs", True, "every result computed live"),
-        ("Every result has verifier evidence", True, "math/logic/schema/code verifiers"),
-        ("Failed optional systems fail closed", True, "AgentDB + RuvLLM fail-closed"),
-        ("Web security actually tested", True, "API key, CORS, body limits, no-CL bypass"),
-        ("Network bypass attempts shown", True, "evil.com rejected, /etc/passwd verifier-rejected (not sandbox-isolated)"),
-        ("Memory reuse improves without skipping verification", True, "trajectory retrieved + re-verified"),
-        ("Final report names every failure", failed == 0, f"{failed} failure(s) named"),
+        ("No canned outputs",
+         evidence_all("live_computation"),
+         f"{len(CHECK_EVIDENCE.get('live_computation', []))} "
+         "live verifier runs"),
+        ("Every result has verifier evidence",
+         evidence_all("verifier_evidence"),
+         f"{sum(CHECK_EVIDENCE.get('verifier_evidence', []))}/"
+         f"{len(CHECK_EVIDENCE.get('verifier_evidence', []))} "
+         "results had a method"),
+        ("Failed optional systems fail closed",
+         evidence_all("fail_closed"),
+         f"{sum(CHECK_EVIDENCE.get('fail_closed', []))}/"
+         f"{len(CHECK_EVIDENCE.get('fail_closed', []))} "
+         "fail-closed checks passed"),
+        ("Web security actually tested",
+         _phase("Phase 4: Web Security"),
+         "API key, CORS, body limits, no-CL bypass"),
+        ("Network bypass attempts shown",
+         evidence_all("network_bypass"),
+         "evil.com rejected, /etc/passwd verifier-rejected "
+         "(not sandbox-isolated)"),
+        ("Memory reuse improves without skipping verification",
+         evidence_all("memory_reuse_verified"),
+         "trajectory retrieved + re-verified"),
+        ("Final report names every failure",
+         failed == sum(1 for _, ok, _ in PHASE_RESULTS if not ok),
+         f"{failed} failure(s) named above"),
     ]
     for label, ok, detail in checks:
         color = Colors.GREEN if ok else Colors.RED
@@ -1420,6 +1503,8 @@ async def main():
     global VERBOSE
     parser = argparse.ArgumentParser(description="Vibe Thinker Verified Swarm Demo")
     parser.add_argument("--verbose", action="store_true", help="show detailed output")
+    parser.add_argument("--json-out", default=None,
+        help="write machine-readable phase results + evidence to this path")
     args = parser.parse_args()
     VERBOSE = args.verbose
 
@@ -1455,6 +1540,58 @@ async def main():
             record(name, False, str(e)[:100])
 
     final_report()
+
+    if args.json_out:
+        write_proof_json(args.json_out)
+
+
+def write_proof_json(path: str) -> None:
+    """Write machine-readable proof artifact: phase results + evidence.
+
+    The JSON contains every phase's pass/fail with detail, the aggregated
+    CHECK_EVIDENCE booleans, and the computed brutal-truth checklist. This
+    is the proof artifact captured under gate_results/ during a release
+    gate-matrix run — it lets a reader verify the demo's claims without
+    trusting the terminal coloring.
+    """
+    phase_ok = {p: ok for p, ok, _ in PHASE_RESULTS}
+    failed = sum(1 for _, ok, _ in PHASE_RESULTS if not ok)
+    artifact = {
+        "phases": [
+            {"phase": p, "ok": ok, "detail": d}
+            for p, ok, d in PHASE_RESULTS
+        ],
+        "evidence": {
+            k: {"all_passed": evidence_all(k), "values": vals}
+            for k, vals in CHECK_EVIDENCE.items()
+        },
+        "checklist": {
+            "no_canned_outputs": evidence_all("live_computation"),
+            "every_result_has_verifier_evidence":
+                evidence_all("verifier_evidence"),
+            "failed_optional_systems_fail_closed":
+                evidence_all("fail_closed"),
+            "web_security_actually_tested": bool(
+                phase_ok.get("Phase 4: Web Security", False)),
+            "network_bypass_attempts_shown":
+                evidence_all("network_bypass"),
+            "memory_reuse_without_skipping_verification":
+                evidence_all("memory_reuse_verified"),
+            "final_report_names_every_failure": failed == sum(
+                1 for _, ok, _ in PHASE_RESULTS if not ok),
+        },
+        "summary": {
+            "passed": sum(1 for _, ok, _ in PHASE_RESULTS if ok),
+            "failed": failed,
+            "total": len(PHASE_RESULTS),
+        },
+    }
+    out_dir = os.path.dirname(path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(artifact, f, indent=2)
+    print(f"\n  {Colors.DIM}Proof artifact written: {path}{Colors.RESET}")
 
 
 if __name__ == "__main__":

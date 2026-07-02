@@ -117,6 +117,11 @@ all = [
 [project.scripts]
 vibe-thinker = "rfsn_cli:main"
 vibe-thinker-ui = "run_ui:main"
+# NOTE: demo_verified_swarm.py is deliberately NOT installed as a console
+# script. It shells out to pytest, imports tests/ and scripts/, and needs
+# the full source checkout + optional extras — so it cannot run from a
+# wheel install. It is source-checkout-only; see its module docstring and
+# scripts/demo_setup.sh for the supported run path.
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

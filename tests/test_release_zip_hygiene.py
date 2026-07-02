@@ -29,10 +29,21 @@ _DIST_DIR = os.path.join(_PROJECT_ROOT, "dist")
 _JUNK_TOKENS = (
     "__pycache__", ".pyc", ".pyo", ".pytest_cache",
     ".egg-info", "/build/", "\\build\\",
+    # Isolated venvs created by the gate scripts / self-contained builds.
+    # A release archive must never carry a virtualenv.
+    ".venv",
+    # Tool caches that bloat archives and are never source.
+    ".mypy_cache", ".ruff_cache",
 )
 # .DS_Store is macOS metadata, not Python junk, but the clean builder
 # excludes it too — flag it so a release archive never carries it.
 _EXTRA_JUNK = (".DS_Store",)
+# Hidden directories that are never legitimate release content. The clean
+# builder intentionally ships .github (CI config), .env.example,
+# .gitignore, and .dockerignore — those are NOT junk and are excluded
+# from this list. Anything else starting with a dot and looking like an
+# editor/tool private dir is rejected.
+_JUNK_HIDDEN_DIRS = (".idea", ".vscode", ".git/")
 
 
 def _release_zips():
@@ -54,6 +65,13 @@ def _is_junk(name: str) -> bool:
     base = os.path.basename(name)
     if base in _EXTRA_JUNK:
         return True
+    # Reject hidden junk directories as exact path components — but NOT
+    # .github (legitimate CI config we ship) which would be falsely matched
+    # by a naive ".git" substring test.
+    segments = [s for s in norm.split("/") if s]
+    for hidden in _JUNK_HIDDEN_DIRS:
+        if hidden.rstrip("/") in segments:
+            return True
     return False
 
 

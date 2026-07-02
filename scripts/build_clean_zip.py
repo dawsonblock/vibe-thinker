@@ -129,6 +129,8 @@ INCLUDE_FILES = _discover_root_py_modules() + _INCLUDE_NONPY_FILES
 # - dist: built wheels/sdists (the ZIP itself goes there)
 # - route_cache.json etc.: runtime cache/audit files
 # - .DS_Store: macOS metadata
+# - .venv: isolated venvs created by gate scripts / self-contained builds
+# - .mypy_cache, .ruff_cache: tool caches that bloat archives
 # - .git (exact): Git metadata — NOT .github (which is CI config we ship)
 EXCLUDE_PATTERNS = [
     "__pycache__", ".pyc", ".pyo", ".pytest_cache",
@@ -137,10 +139,12 @@ EXCLUDE_PATTERNS = [
     "rfsn_jobs.jsonl", "rfsn_jobs_bitemporal.jsonl",
     "orchestrator_memory.jsonl",
     ".DS_Store",
+    ".venv", ".mypy_cache", ".ruff_cache",
 ]
 # Directory/file names to exclude ONLY on exact match (not substring).
-# This prevents ".git" from matching ".github".
-EXCLUDE_EXACT = {".git"}
+# This prevents ".git" from matching ".github". Also catches editor
+# private dirs (.idea, .vscode) that should never ship in a release.
+EXCLUDE_EXACT = {".git", ".idea", ".vscode"}
 
 
 def should_exclude(name: str) -> bool:

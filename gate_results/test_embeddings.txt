@@ -1,0 +1,19 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.12.0, pytest-8.4.2, pluggy-1.6.0
+rootdir: /Users/dawsonblock/vibe-thinker
+configfile: pyproject.toml
+testpaths: tests
+plugins: cov-5.0.0, timeout-2.4.0, asyncio-0.26.0, hypothesis-6.155.7
+timeout: 60.0s
+timeout method: thread
+timeout func_only: False
+asyncio: mode=Mode.AUTO, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 1403 items / 1303 deselected / 100 selected
+
+tests/test_agentdb_only.py .....                                         [  5%]
+tests/test_migration.py ..................                               [ 23%]
+tests/test_trajectory_store.py .............                             [ 36%]
+tests/test_trajectory_synthesis.py ...................                   [ 55%]
+tests/test_vector_store.py .......................................sssss. [100%]
+
+=============== 95 passed, 5 skipped, 1303 deselected in 20.94s ================

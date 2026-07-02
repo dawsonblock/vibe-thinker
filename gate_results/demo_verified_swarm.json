@@ -1,0 +1,116 @@
+{
+  "phases": [
+    {
+      "phase": "Phase 0: Preflight",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "phase": "Phase 1: Core Reasoning",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "phase": "Phase 2: Sandbox Isolation",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "phase": "Phase 3: Web UI",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "phase": "Phase 4: Web Security",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "phase": "Phase 5: Memory / Verified Trajectory",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "phase": "Phase 6: AgentDB-Only Cutover",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "phase": "Phase 7: Federation",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "phase": "Phase 8: RuvLLM",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "phase": "Phase 9: Final E2E",
+      "ok": true,
+      "detail": ""
+    }
+  ],
+  "evidence": {
+    "live_computation": {
+      "all_passed": true,
+      "values": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ]
+    },
+    "verifier_evidence": {
+      "all_passed": true,
+      "values": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ]
+    },
+    "network_bypass": {
+      "all_passed": true,
+      "values": [
+        true,
+        true
+      ]
+    },
+    "memory_reuse_verified": {
+      "all_passed": true,
+      "values": [
+        true,
+        true
+      ]
+    },
+    "fail_closed": {
+      "all_passed": true,
+      "values": [
+        true
+      ]
+    }
+  },
+  "checklist": {
+    "no_canned_outputs": true,
+    "every_result_has_verifier_evidence": true,
+    "failed_optional_systems_fail_closed": true,
+    "web_security_actually_tested": true,
+    "network_bypass_attempts_shown": true,
+    "memory_reuse_without_skipping_verification": true,
+    "final_report_names_every_failure": true
+  },
+  "summary": {
+    "passed": 10,
+    "failed": 0,
+    "total": 10
+  }
+}

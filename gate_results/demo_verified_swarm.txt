@@ -1,0 +1,177 @@
+/Users/dawsonblock/vibe-thinker/vector_store.py:339: RuntimeWarning: coroutine 'AgentDBVectorStore._post_async' was never awaited
+  with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+RuntimeWarning: Enable tracemalloc to get the object allocation traceback
+
+[1m[96m  ╔══════════════════════════════════════════════════════════╗
+  ║  Vibe Thinker: Verified Swarm Coding Demo                 ║
+  ║  9-phase pressure test — honest results only              ║
+  ╚══════════════════════════════════════════════════════════╝[0m
+  [2mEvery result must have verifier evidence.
+  Failed optional systems must fail closed.
+  The final report names every failure.[0m
+
+[1m[96m========================================================================
+  Phase 0: Preflight
+========================================================================[0m
+  [[92mPASS[0m] compileall
+  [[92mPASS[0m] doctor
+  [[92mPASS[0m] smoke
+  [[92mPASS[0m] core imports
+
+[1m[96m========================================================================
+  Phase 1: Core Reasoning — Nurse Scheduling with Verifiers
+========================================================================[0m
+  [[92mPASS[0m] Logic verifier: nurse schedule satisfies all constraints (Z3/SMT) — method=smt_check
+  [[92mPASS[0m] Schema verifier: valid JSON accepted — score=1.0
+  [[92mPASS[0m] Schema verifier: missing proof key rejected — error=$: missing required keys: ['proof']
+  [[92mPASS[0m] Code verifier: scheduler runs + tests pass in sandbox — method=unit_tests
+  [[92mPASS[0m] Math verifier: invariant total=6 (3 shifts × 2 nurses) — score=1.0
+  [[92mPASS[0m] No self-claim-only answer accepted as high-confidence — trustworthy=False
+
+[1m[96m========================================================================
+  Phase 2: Sandbox Isolation — Allowed vs Blocked Behavior
+========================================================================[0m
+  [[92mPASS[0m] Normal code (json import + schedule) passes — method=python_exec
+  [[92mPASS[0m] Filesystem abuse (/etc/passwd) — verifier rejects output (not sandbox isolation) — verified=False
+  [[92mPASS[0m] Sandbox network enforcement tests pass — 50 passed in 58.17s
+  [[92mPASS[0m] NetworkMode.DISABLED exists — value=disabled
+  [[92mPASS[0m] Allow-listed domain (pypi.org) allowed
+  [[92mPASS[0m] Non-allowlisted domain (evil.com) blocked
+
+[1m[96m========================================================================
+  Phase 3: Web UI — Jobs, WebSocket, Auth/Rate Limits
+========================================================================[0m
+[EmbeddingRouter] Loading all-MiniLM-L6-v2 with cache_size=512
+[EmbeddingModel] Loading shared model: all-MiniLM-L6-v2
+[PersistentRouteCache] Loaded 3 embeddings, 3 route decisions from route_cache.json
+[EmbeddingRouter] Ready with caching enabled
+[Orchestrator] SONA trajectory recorder initialized (ruvllm_py binding)
+  [[92mPASS[0m] GET /api/status returns 200 — status=200
+  [[92mPASS[0m] Status has config — ['specialist_endpoint', 'generalist_endpoint', 'code_specialist_endpoint', 'use_clr', 'use_clr_cache']
+[WarmPool] Started container vibe_sbx_0
+[WarmPool] Started container vibe_sbx_1
+[WarmPool] Started container vibe_sbx_2
+
+[Orchestrator] Route: GENERALIST (conf=0.750)
+[Generalist] chat endpoint failed (Cannot connect to host 127.0.0.1:8081 ssl:default [Connect call failed ('127.0.0.1', 8081)]), falling back to /completion
+  [[92mPASS[0m] POST /api/query accepts job — status=200
+  [2mQuery response: {"job_id": "57f7020fe5d4", "status": "pending"}[0m
+[WebUI] Job 57f7020fe5d4 failed: Generalist call failed (both endpoints): Cannot connect to host 127.0.0.1:8081 ssl:default [Connect call failed ('127.0.0.1', 8081)]
+  [[92mPASS[0m] GET /api/jobs returns 200 — status=200
+  [[92mPASS[0m] GET /api/memory returns 200 — status=200
+  [[92mPASS[0m] GET /api/trajectories returns 200 — status=200
+[WarmPool] Removed container vibe_sbx_0
+[WarmPool] Removed container vibe_sbx_1
+[WarmPool] Removed container vibe_sbx_2
+  [[92mPASS[0m] No API key -> 401 — status=401
+  [[92mPASS[0m] Wrong API key -> 401 — status=401
+  [[92mPASS[0m] Correct API key -> 200 — status=200
+  [[92mPASS[0m] Rate limit returns 429 after exceeding limit — statuses=[200, 200, 200, 429, 429]
+  [[92mPASS[0m] WebSocket /ws connects
+  [[92mPASS[0m] run_ui.py exposes --api-key flag (build 45 fix) — api_key=secret
+  [[92mPASS[0m] run_ui.py accepts --port=9000 (equals form, build 45 fix) — port=9000
+  [[92mPASS[0m] run_ui.py forwards unknown args to orchestrator — remaining=['--vibe', 'http://localhost:8080']
+
+[1m[96m========================================================================
+  Phase 4: Web Security — API Key, CORS, Body Limits, No-CL Bypass
+========================================================================[0m
+  [[92mPASS[0m] test_web_security.py passes — 21 passed in 0.25s
+  [[92mPASS[0m] Small body (5 bytes) passes — status=200, body={"size":5}
+  [[92mPASS[0m] Large body with Content-Length -> 413 — status=413
+  [[92mPASS[0m] Lying Content-Length (5/100) blocked (not 200) — status=413
+  [[92mPASS[0m] CORS: allowed origin passes — status=200
+  [[92mPASS[0m] CORS: disallowed origin blocked — status=400, origin=None
+  [[92mPASS[0m] Env fallback: no key -> 401 — status=401
+  [[92mPASS[0m] Env fallback: correct env key -> 200 — status=200
+
+[1m[96m========================================================================
+  Phase 5: Memory / Verified Trajectory — Store + Reuse
+========================================================================[0m
+  [[92mPASS[0m] First verified solution stored — entries=1
+  [[92mPASS[0m] First verified solution stored — entries=1
+  [[92mPASS[0m] CLR cache entry stored — entries=1
+  [[92mPASS[0m] Similar trajectory retrieved for second task — found=1
+  [2mRetrieved: Assign 4 nurses to 3 shifts with no consecutive shifts and A...[0m
+  [2mScore: 0.8802587278684756[0m
+  [[92mPASS[0m] CLR cache hit for similar problem — answer={"schedule": {"day": ["Bob", "Carol"], "night": ["
+  [[92mPASS[0m] Retrieved memory was independently verified — method=logic_verifier
+  [[92mPASS[0m] Unverified results filtered from retrieval — retrieved=0
+  [[92mPASS[0m] Trajectory file exists
+  [[92mPASS[0m] Cache file exists
+
+[1m[96m========================================================================
+  Phase 6: AgentDB-Only Cutover — Empty Local Cache Retrieval
+========================================================================[0m
+  [[92mPASS[0m] test_agentdb_only.py passes — 5 passed in 6.50s
+[AgentDB] /v1/vector/search connection failed: Cannot connect to host 127.0.0.1:19999 ssl:default [Connect call failed ('127.0.0.1', 19999)] — sidecar not running at http://127.0.0.1:19999?
+  [[92mPASS[0m] Empty local + dead AgentDB -> fail-closed (no hit) — hit=no
+  [[92mPASS[0m] Missing embedder fails closed (no crash) — no crash, no hit
+  [[92mPASS[0m] Untrusted metadata (self_claims_only, claim_count=1) rejected — trusted=False
+  [[92mPASS[0m] Trusted metadata (math_verifier, claim_count=5) accepted — trusted=True
+
+[1m[96m========================================================================
+  Phase 7: Federation — Claim, Heartbeat, Complete, Zombie Reaper
+========================================================================[0m
+  [[92mPASS[0m] Federation test suite passes — 94 passed in 5.01s
+  [[92mPASS[0m] Job submitted to federation — status=200
+  [[92mPASS[0m] Worker claims pending job — job_id=fed-demo-1
+  [[92mPASS[0m] Heartbeat accepted — status=200
+[Federation] reputation: wid:unknown -> 1.000 (weight +1.0)
+  [[92mPASS[0m] Job completion recorded — status=200
+  [[92mPASS[0m] Zombie job claimed
+  [[92mPASS[0m] Zombie reaper reaps stale claims — reaped=['fed-demo-zombie']
+  [[92mPASS[0m] Stale worker cannot complete reaped job — job_status=done
+
+[1m[96m========================================================================
+  Phase 8: RuvLLM — Fail-Closed Check
+========================================================================[0m
+  [[92mPASS[0m] check_ruvllm.sh passes — RuvLLM validation PASSED.
+  [[92mPASS[0m] RuvLLM binding available — ruvllm_py installed
+  [[92mPASS[0m] SUPPORTS_INFERENCE flag exists — value=True
+  [[92mPASS[0m] HTTP sidecar start command generated — cmd=ruvllm-server -m fake.gguf --host 127.0.0.1 --port 8080 -c 8192 -t 6 --jinja --c
+  [[92mPASS[0m] No fake inference success claimed — binding available, inference supported
+
+[1m[96m========================================================================
+  Phase 9: Final End-to-End — Build, Verify, Store, Reuse Scheduler
+========================================================================[0m
+  [[92mPASS[0m] Step 1: Scheduler built + tests pass in sandbox — method=unit_tests
+  [[92mPASS[0m] Step 2: Math invariant verified (3×2=6) — score=1.0
+  [[92mPASS[0m] Step 3: Verified solution stored in trajectory store — entries=1
+  [[92mPASS[0m] Step 3: Verified solution stored in CLR cache — entries=1
+  [[92mPASS[0m] Step 4: Similar trajectory retrieved — found=1, time=0.012s
+  [[92mPASS[0m] Step 4: New problem solved + independently verified — method=unit_tests
+  [[92mPASS[0m] Step 5: Memory used as context, not blindly trusted — retrieved+verified
+  [[92mPASS[0m] Trajectory file has verified entries — entries=3
+  [[92mPASS[0m] Cache file has verified entries — entries=2
+
+[1m[96m========================================================================
+  FINAL REPORT — Verified Swarm Coding Demo
+========================================================================[0m
+
+  [[92mPASS[0m] Phase 0: Preflight
+  [[92mPASS[0m] Phase 1: Core Reasoning
+  [[92mPASS[0m] Phase 2: Sandbox Isolation
+  [[92mPASS[0m] Phase 3: Web UI
+  [[92mPASS[0m] Phase 4: Web Security
+  [[92mPASS[0m] Phase 5: Memory / Verified Trajectory
+  [[92mPASS[0m] Phase 6: AgentDB-Only Cutover
+  [[92mPASS[0m] Phase 7: Federation
+  [[92mPASS[0m] Phase 8: RuvLLM
+  [[92mPASS[0m] Phase 9: Final E2E
+
+  [1mTotal: 10 passed, 0 failed out of 10[0m
+
+  [92m[1m✓ ALL PHASES PASSED[0m
+  [2mThe system is a credible alpha — every subsystem
+  produced verified evidence under pressure.[0m
+
+  [1mBrutal Truth Checklist:[0m
+    [92m✓[0m No canned outputs — 7 live verifier runs
+    [92m✓[0m Every result has verifier evidence — 9/9 results had a method
+    [92m✓[0m Failed optional systems fail closed — 1/1 fail-closed checks passed
+    [92m✓[0m Web security actually tested — API key, CORS, body limits, no-CL bypass
+    [92m✓[0m Network bypass attempts shown — evil.com rejected, /etc/passwd verifier-rejected (not sandbox-isolated)
+    [92m✓[0m Memory reuse improves without skipping verification — trajectory retrieved + re-verified
+    [92m✓[0m Final report names every failure — 0 failure(s) named above
+
+  [2mProof artifact written: gate_results/demo_verified_swarm.json[0m

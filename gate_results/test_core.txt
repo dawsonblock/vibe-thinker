@@ -1,0 +1,67 @@
+Vibe Thinker Doctor
+==================================================
+
+Core:
+  Python: 3.12.0 OK
+  Package import: OK
+  CLI module: OK
+
+Optional:
+  z3-solver: present
+  sentence-transformers: missing
+  faiss-cpu: missing
+  fakeredis: missing
+  redis: missing
+  docker: present
+  fastapi: missing
+  cryptography: present
+  wasmtime: missing
+  numpy: present
+  scikit-learn: present
+  ruvllm: disabled
+
+Sandbox:
+  mode: disabled OK
+  network: auto OK
+
+Verdict:
+  core local profile is runnable
+Vibe Thinker Smoke Test
+==================================================
+[1/6] Import orchestrator: OK
+[2/6] Math verifier (2+2=4): OK
+[3/6] Schema verifier: OK
+[4/6] Audit log write/read: OK
+[5/6] Local cache write/read: OK
+
+[Orchestrator] Route: SPECIALIST (conf=0.800)
+[CLR] Selected verifier: math_verifier (task_type=math), no derivable context
+[6/6] Orchestrator spine: OK (orchestrator.run() -> _run_clr_with_cache -> reasoner.run OK)
+
+Smoke test PASSED.
+============================= test session starts ==============================
+platform darwin -- Python 3.12.0, pytest-8.4.2, pluggy-1.6.0
+rootdir: /Users/dawsonblock/vibe-thinker
+configfile: pyproject.toml
+plugins: cov-5.0.0, timeout-2.4.0, asyncio-0.26.0, hypothesis-6.155.7
+timeout: 60.0s
+timeout method: thread
+timeout func_only: False
+asyncio: mode=Mode.AUTO, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 280 items
+
+tests/test_orchestrator_runtime_spine.py ..                              [  0%]
+tests/test_static_missing_self_methods.py .                              [  1%]
+tests/test_static_unreachable_code.py .                                  [  1%]
+tests/test_trajectory_store.py .............                             [  6%]
+tests/test_routing.py .................................................. [ 23%]
+.....................................                                    [ 37%]
+tests/test_repl.py ..............................................        [ 53%]
+tests/test_cache.py ...................................                  [ 66%]
+tests/test_scoring.py ........                                           [ 68%]
+tests/test_signers.py .......................                            [ 77%]
+tests/test_deterministic_check.py .............                          [ 81%]
+tests/test_math_verifier.py ...................                          [ 88%]
+tests/test_format_enforcer.py ................................           [100%]
+
+============================= 280 passed in 53.56s =============================

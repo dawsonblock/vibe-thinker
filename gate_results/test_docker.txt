@@ -1,0 +1,15 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.12.0, pytest-8.4.2, pluggy-1.6.0
+rootdir: /Users/dawsonblock/vibe-thinker
+configfile: pyproject.toml
+testpaths: tests
+plugins: cov-5.0.0, timeout-2.4.0, asyncio-0.26.0, hypothesis-6.155.7
+timeout: 60.0s
+timeout method: thread
+timeout func_only: False
+asyncio: mode=Mode.AUTO, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 1403 items / 1390 deselected / 13 selected
+
+tests/test_sandbox_network_enforcement.py .............                  [100%]
+
+===================== 13 passed, 1390 deselected in 41.32s =====================
