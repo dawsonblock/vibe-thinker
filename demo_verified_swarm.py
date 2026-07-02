@@ -39,6 +39,8 @@ Usage:
 Note: This script is source-checkout-only. It is NOT included in the
 wheel package (pyproject.toml py-modules). It requires the full source
 tree with tests, scripts, and optional dependencies installed.
+To install all demo dependencies:
+    bash scripts/demo_setup.sh
 """
 
 from __future__ import annotations
@@ -1400,7 +1402,7 @@ def final_report() -> None:
         ("Every result has verifier evidence", True, "math/logic/schema/code verifiers"),
         ("Failed optional systems fail closed", True, "AgentDB + RuvLLM fail-closed"),
         ("Web security actually tested", True, "API key, CORS, body limits, no-CL bypass"),
-        ("Network bypass attempts shown", True, "evil.com rejected, /etc/passwd blocked"),
+        ("Network bypass attempts shown", True, "evil.com rejected, /etc/passwd verifier-rejected (not sandbox-isolated)"),
         ("Memory reuse improves without skipping verification", True, "trajectory retrieved + re-verified"),
         ("Final report names every failure", failed == 0, f"{failed} failure(s) named"),
     ]

@@ -1,6 +1,64 @@
 # Changelog
 
-## v0.4.6a9
+## v0.4.6a9 (build 46)
+
+Demo hardening pass — addresses all findings from the build-45 and
+build-46 audits. No production modules changed; all fixes are in the
+demo script, changelog wording, and release packaging.
+
+### Fixed (demo)
+- `demo_verified_swarm.py`: every phase now computes `ok` from actual
+  sub-check return values. `sub()` returns `bool` so failures propagate
+  to phase status. No more `ok = True` hardcodes.
+- Phase 0 `ok` now includes `compileall` and import-check results. The
+  old code used `r.returncode` from the smoke test (wrong variable) and
+  ignored the import check entirely.
+- `LocalSubprocessExecutor` explicitly labeled as NOT a security
+  sandbox in Phases 1, 2, and 9. The `/etc/passwd` test label now
+  honestly says "verifier rejects output (not sandbox isolation)".
+  The final checklist says "verifier-rejected (not sandbox-isolated)"
+  instead of "blocked".
+- Federation zombie reaper: `await state.reap_stale_claims(...)` (was
+  missing `await`, causing `TypeError` on `len(coroutine)`).
+- `AgentDBVectorStore`: `url=` → `base_url=`, added `collection=` param.
+- `is_cache_entry_trustworthy()`: removed invalid `min_score=` kwarg,
+  added required `best_answer` + `schema_version=3` fields to test
+  fixture.
+- `RuvLLMHTTPBackend.recommended_start_command()`: handle list return
+  value instead of calling `.lower()` on a string.
+- Body-size 422: import `Request` at module level (PEP 563 stringifies
+  annotations; FastAPI can't resolve function-local imports).
+- Phase 4 switched from sync `TestClient` to `httpx.AsyncClient` with
+  `ASGITransport` (demo runs inside an async function).
+- Scheduler examples use backtracking instead of a weak greedy
+  assignment that couldn't fill the night shift.
+
+### Fixed (packaging)
+- CHANGELOG wording: "No new surface area" was false — the demo script
+  was new. Corrected to acknowledge the addition and document it as
+  source-checkout-only (not in `pyproject.toml py-modules`, not in the
+  wheel).
+- Release ZIP built through `scripts/build_clean_zip.py`: 0
+  `__pycache__` entries, 0 `.pyc` files, all 15 `.sh` files have +x
+  bit. Verified by `scripts/test_zip_release.sh`.
+
+### Added
+- `scripts/demo_setup.sh` — installs all optional extras needed to run
+  `demo_verified_swarm.py` (`dev,test,web,federation,sandbox,
+  embeddings,logic`). Supports `--venv` flag for isolated installation.
+
+### Verified (gate matrix on macOS, 2026-07-01)
+- Core gate (`scripts/test_core.sh`): 280 passed in 45s
+- Web security (`tests/test_web_security.py`): 21 passed
+- Job queue (`tests/test_job_queue.py`): 20 passed
+- Static checks (`test_static_missing_self_methods.py`,
+  `test_static_unreachable_code.py`): 2 passed
+- RuvLLM (`scripts/check_ruvllm.sh`): PASSED (cargo + maturin + import)
+- ZIP release self-test (`scripts/test_zip_release.sh`): PASSED
+  (280 core tests in fresh venv from extracted ZIP)
+- Demo (`demo_verified_swarm.py`): 10/10 phases, 67/67 sub-checks
+
+## v0.4.6a9 (build 45)
 
 Production-code fixes for the issues flagged in the build-44 audit. Every
 production-code change closes an existing gap. A new source-only demo script
