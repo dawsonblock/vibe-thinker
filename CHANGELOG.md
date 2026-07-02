@@ -46,6 +46,25 @@ demo script, changelog wording, and release packaging.
 - `scripts/demo_setup.sh` — installs all optional extras needed to run
   `demo_verified_swarm.py` (`dev,test,web,federation,sandbox,
   embeddings,logic`). Supports `--venv` flag for isolated installation.
+- `scripts/release_zip.sh` — the single supported release-archive path.
+  Chains `build_clean_zip.py --self-contained` (temp venv + core pytest
+  gate + clean ZIP) with `test_zip_release.sh` (extract, reject junk,
+  fresh-venv install, doctor, smoke, `test_core.sh`). `--skip-test`
+  builds without self-test (non-release artifact). Addresses audit fix
+  #1: "Build the ZIP only through build_clean_zip.py --self-contained."
+- `scripts/test_gate_matrix.sh` — runs every release-gate profile
+  (core/local/release/zip-release/compose/docker/embeddings/federation/
+  ruvllm), records PASS/FAIL/SKIP, writes `dist/gate_matrix_<ts>.log`
+  + per-gate logs. Gates with missing prerequisites (Docker/Redis/Rust/
+  optional extras) SKIP rather than FAIL. `--keep-going` runs all gates.
+  Addresses audit fix #5: "Run and capture the full gate matrix."
+- `tests/test_release_zip_hygiene.py` — automated pytest guard that
+  scans every `dist/vibe-thinker-v*.zip` and fails on
+  `__pycache__`/`.pyc`/`.pyo`/`.pytest_cache`/`.egg-info`/`build`/
+  `.DS_Store` entries or any `.sh` missing the +x bit in
+  `external_attr`. Skips when no release ZIP exists. Mirrors the junk
+  check in `test_zip_release.sh` and `EXCLUDE_PATTERNS` in
+  `build_clean_zip.py`. Addresses audit fix #2.
 
 ### Verified (gate matrix on macOS, 2026-07-01)
 - Core gate (`scripts/test_core.sh`): 280 passed in 45s

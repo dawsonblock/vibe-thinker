@@ -19,9 +19,35 @@
   - Federation/web gate: `./scripts/test_federation.sh` (`.venv-federation`, `federation`/`web` markers)
   - RuvLLM gate: `./scripts/check_ruvllm.sh` (cargo check + maturin build + import; needs Rust)
   - Full release: `./scripts/release_gate.sh` (build wheel + clean-install smoke + core gate)
+  - **Full gate matrix** (single command, runs every gate profile above and
+    captures a report): `./scripts/test_gate_matrix.sh` (writes
+    `dist/gate_matrix_<ts>.log` + per-gate logs; gates whose prerequisites
+    are missing — Docker/Redis/Rust/optional extras — report SKIP, not
+    FAIL; `--keep-going` runs all gates instead of aborting on first
+    failure). This is the "run and capture the full gate matrix" command.
 - **ZIP release build + self-test**:
-  - Build: `python scripts/build_clean_zip.py` (compile + core pytest gate + ZIP; verifies every `.sh` in the ZIP has the +x bit set in `external_attr`)
-  - Self-test: `./scripts/test_zip_release.sh dist/vibe-thinker-v<version>.zip` (extracts to a temp dir, checks +x bits, no junk, installs in a fresh venv, runs `bash scripts/test_core.sh`)
+  - **Release-grade build (the ONE supported path):**
+    `./scripts/release_zip.sh` — chains
+    `python scripts/build_clean_zip.py --self-contained` (temp venv +
+    install `.[dev,test]` + core pytest gate + clean ZIP) with
+    `./scripts/test_zip_release.sh dist/vibe-thinker-v<version>.zip`
+    (extract, reject `__pycache__`/`.pyc` junk, check +x bits, fresh venv
+    install, doctor, smoke, `test_core.sh`). Do NOT ship a ZIP built any
+    other way; `--skip-test` produces a non-release artifact.
+  - Low-level build: `python scripts/build_clean_zip.py` (compile + core
+    pytest gate + ZIP; verifies every `.sh` in the ZIP has the +x bit set
+    in `external_attr`). Use `--self-contained` for release use.
+  - Self-test: `./scripts/test_zip_release.sh dist/vibe-thinker-v<version>.zip`
+    (extracts to a temp dir, checks +x bits, no junk, installs in a fresh
+    venv, runs `bash scripts/test_core.sh`)
+  - **Automated hygiene guard (pytest):**
+    `python3 -m pytest tests/test_release_zip_hygiene.py -q` — scans every
+    `dist/vibe-thinker-v*.zip` and fails if any entry is
+    `__pycache__`/`.pyc`/`.pyo`/`.pytest_cache`/`.egg-info`/`build`/`.DS_Store`
+    or any `.sh` lacks the +x bit in `external_attr`. Skips when no
+    release ZIP exists. Mirrors the junk check in
+    `scripts/test_zip_release.sh` and `EXCLUDE_PATTERNS` in
+    `scripts/build_clean_zip.py`.
 - **Anti-regression static checks** (AST-based, no execution):
   - Missing private methods: `python3 -m pytest tests/test_static_missing_self_methods.py -q` (flags `self.<name>()` calls with no defining method on the class)
   - Unreachable dead code: `python3 -m pytest tests/test_static_unreachable_code.py -q` (flags statements after return/raise/break/continue in the same block — the orphaned-method-body bug class)
@@ -94,6 +120,13 @@
 - **Compose sandbox networking**: `RFSN_DOCKER_NETWORK` / `--docker-network` lets
   executor-spawned containers join an existing Docker network (e.g.
   `vibe-thinker_default`), so they can reach the compose `sni-proxy` service.
+- **Demo dependencies**: `demo_verified_swarm.py` exercises every major
+  subsystem (core, sandbox, web UI, web security, memory/trajectory,
+  AgentDB, federation, RuvLLM) and needs the full set of optional extras.
+  Install them with one command: `bash scripts/demo_setup.sh` (current
+  env) or `bash scripts/demo_setup.sh --venv` (creates `.venv-demo`).
+  Then run the demo with `python3 demo_verified_swarm.py --verbose`.
+  For a minimal core-only env (no Docker/Redis/Rust): `bash scripts/mac_setup.sh`.
 
 ## RuFlo integration abstractions (v0.3.9)
 Four pluggable abstractions from the Vibe-Thinker + RuFlo Integration Plan.
