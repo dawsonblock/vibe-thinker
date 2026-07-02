@@ -2,8 +2,10 @@
 
 ## v0.4.6a9
 
-Production-code fixes for the issues flagged in the build-44 audit. No new
-surface area — every change closes an existing gap.
+Production-code fixes for the issues flagged in the build-44 audit. Every
+production-code change closes an existing gap. A new source-only demo script
+(`demo_verified_swarm.py`) was also added — it is not packaged in the wheel
+and is intended for source-checkout verification only.
 
 ### Fixed
 - `run_ui.py` now uses a real `argparse.parse_known_args()` parser for

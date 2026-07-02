@@ -35,6 +35,10 @@ Success standard:
 Usage:
     python3 demo_verified_swarm.py
     python3 demo_verified_swarm.py --verbose
+
+Note: This script is source-checkout-only. It is NOT included in the
+wheel package (pyproject.toml py-modules). It requires the full source
+tree with tests, scripts, and optional dependencies installed.
 """
 
 from __future__ import annotations
@@ -79,13 +83,14 @@ def header(title: str) -> None:
     print(f"{'=' * 72}{Colors.RESET}")
 
 
-def sub(label: str, ok: bool, detail: str = "") -> None:
+def sub(label: str, ok: bool, detail: str = "") -> bool:
     color = Colors.GREEN if ok else Colors.RED
     status = "PASS" if ok else "FAIL"
     line = f"  [{color}{status}{Colors.RESET}] {label}"
     if detail:
         line += f" — {detail}"
     print(line)
+    return ok
 
 
 def record(phase: str, ok: bool, detail: str = "") -> None:
@@ -106,11 +111,12 @@ async def phase_0_preflight() -> bool:
     import subprocess
 
     # compileall
-    r = subprocess.run(
+    r_compile = subprocess.run(
         [sys.executable, "-m", "compileall", "-q", "."],
         capture_output=True, text=True, cwd=str(ROOT))
-    sub("compileall", r.returncode == 0,
-        f"exit={r.returncode}" if r.returncode else "")
+    compile_ok = r_compile.returncode == 0
+    sub("compileall", compile_ok,
+        f"exit={r_compile.returncode}" if not compile_ok else "")
 
     # doctor
     r = subprocess.run(
@@ -127,6 +133,7 @@ async def phase_0_preflight() -> bool:
     sub("smoke", smoke_ok, "" if smoke_ok else r.stderr[:80])
 
     # import check
+    import_ok = True
     try:
         import hybrid_orchestrator
         import rfsn_job_queue
@@ -136,9 +143,10 @@ async def phase_0_preflight() -> bool:
         import ruvllm_adapter
         sub("core imports", True)
     except ImportError as e:
+        import_ok = False
         sub("core imports", False, str(e))
 
-    ok = doctor_ok and smoke_ok and r.returncode == 0
+    ok = compile_ok and doctor_ok and smoke_ok and import_ok
     record("Phase 0: Preflight", ok)
     return ok
 
@@ -292,6 +300,12 @@ async def phase_1_core_reasoning() -> bool:
     from verifiers.code_verifier import CodeVerifier
     from sandbox import LocalSubprocessExecutor
 
+    # NOTE: LocalSubprocessExecutor is NOT a security sandbox. It runs
+    # code in a local subprocess with no filesystem or network isolation.
+    # It is used here only for benign generated code (the scheduler).
+    # Hostile code isolation is tested in Phase 2 via the network
+    # enforcement test suite and the Docker sandbox gate.
+
     scheduler_code = """
 import itertools
 
@@ -423,6 +437,12 @@ async def phase_2_sandbox_isolation() -> bool:
     from verifiers.code_verifier import CodeVerifier
     from sandbox import LocalSubprocessExecutor
 
+    # NOTE: LocalSubprocessExecutor is NOT a security sandbox — it has
+    # no filesystem or network isolation. We use it here only to show
+    # that the *verifier* rejects wrong output. Real isolation is tested
+    # by the network enforcement test suite (2c) and the Docker sandbox
+    # gate (scripts/test_docker.sh). The /etc/passwd test below shows
+    # that verification fails, NOT that file access was blocked.
     executor = LocalSubprocessExecutor(timeout=5.0)
     cv = CodeVerifier(timeout=5.0, executor=executor)
 
@@ -454,9 +474,12 @@ except Exception as e:
         fs_abuse_code,
         {"expected_output": "should_not_match"},
     )
-    # It should either fail verification or the output should not contain passwd data
+    # It should either fail verification or the output should not contain passwd data.
+    # NOTE: This tests that the VERIFIER rejects the output, not that the
+    # subprocess was prevented from reading the file. LocalSubprocessExecutor
+    # does not provide filesystem isolation. Use the Docker sandbox for that.
     fs_blocked = not result_fs.verified or "root:" not in str(getattr(result_fs, 'evidence', ''))
-    sub("Filesystem abuse (/etc/passwd) blocked or fails safely",
+    sub("Filesystem abuse (/etc/passwd) — verifier rejects output (not sandbox isolation)",
         fs_blocked, f"verified={result_fs.verified}")
 
     # --- 2c. Network enforcement tests ---
@@ -517,16 +540,19 @@ async def phase_3_web_ui() -> bool:
     app = create_app(orch)
     with TestClient(app) as client:
         resp = client.get("/api/status")
-        sub("GET /api/status returns 200", resp.status_code == 200,
+        ok_status = sub("GET /api/status returns 200", resp.status_code == 200,
             f"status={resp.status_code}")
+        ok_config = False
         if resp.status_code == 200:
             data = resp.json()
-            sub("Status has config", isinstance(data, dict) and len(data) > 0,
+            ok_config = sub("Status has config", isinstance(data, dict) and len(data) > 0,
                 str(list(data.keys())[:5]))
+        else:
+            sub("Status has config", False, "status != 200")
 
         # --- 3b. Submit a job ---
         resp = client.post("/api/query", json={"query": "What is 2+2?"})
-        sub("POST /api/query accepts job",
+        ok_query = sub("POST /api/query accepts job",
             resp.status_code in (200, 201, 202),
             f"status={resp.status_code}")
         if resp.status_code in (200, 201, 202):
@@ -535,17 +561,17 @@ async def phase_3_web_ui() -> bool:
 
         # --- 3c. Job listing ---
         resp = client.get("/api/jobs")
-        sub("GET /api/jobs returns 200", resp.status_code == 200,
+        ok_jobs = sub("GET /api/jobs returns 200", resp.status_code == 200,
             f"status={resp.status_code}")
 
         # --- 3d. Memory endpoint ---
         resp = client.get("/api/memory")
-        sub("GET /api/memory returns 200", resp.status_code == 200,
+        ok_memory = sub("GET /api/memory returns 200", resp.status_code == 200,
             f"status={resp.status_code}")
 
         # --- 3e. Trajectories endpoint ---
         resp = client.get("/api/trajectories")
-        sub("GET /api/trajectories returns 200", resp.status_code == 200,
+        ok_traj = sub("GET /api/trajectories returns 200", resp.status_code == 200,
             f"status={resp.status_code}")
 
     # --- 3f. Auth enforcement ---
@@ -553,17 +579,17 @@ async def phase_3_web_ui() -> bool:
     with TestClient(app_secured) as client:
         # No key -> 401
         resp = client.get("/api/status")
-        sub("No API key -> 401", resp.status_code == 401,
+        ok_no_key = sub("No API key -> 401", resp.status_code == 401,
             f"status={resp.status_code}")
 
         # Wrong key -> 401
         resp = client.get("/api/status", headers={"X-API-Key": "wrong"})
-        sub("Wrong API key -> 401", resp.status_code == 401,
+        ok_wrong_key = sub("Wrong API key -> 401", resp.status_code == 401,
             f"status={resp.status_code}")
 
         # Correct key -> 200
         resp = client.get("/api/status", headers={"X-API-Key": "test-secret-key"})
-        sub("Correct API key -> 200", resp.status_code == 200,
+        ok_correct_key = sub("Correct API key -> 200", resp.status_code == 200,
             f"status={resp.status_code}")
 
     # --- 3g. Rate limiting ---
@@ -574,16 +600,17 @@ async def phase_3_web_ui() -> bool:
             resp = client.get("/api/status")
             statuses.append(resp.status_code)
         has_429 = 429 in statuses
-        sub("Rate limit returns 429 after exceeding limit", has_429,
+        ok_rate_limit = sub("Rate limit returns 429 after exceeding limit", has_429,
             f"statuses={statuses}")
 
     # --- 3h. WebSocket support ---
     app_ws = create_app(orch)
+    ok_ws = False
     with TestClient(app_ws) as client:
         try:
             with client.websocket_connect("/ws") as ws:
                 ws.send_json({"type": "subscribe"})
-                sub("WebSocket /ws connects", True)
+                ok_ws = sub("WebSocket /ws connects", True)
         except Exception as e:
             sub("WebSocket /ws connects", False, str(e)[:80])
 
@@ -599,14 +626,17 @@ async def phase_3_web_ui() -> bool:
     p = _build_ui_parser()
     opts, remaining = p.parse_known_args(
         ["--api-key", "secret", "--port=9000", "--vibe", "http://localhost:8080"])
-    sub("run_ui.py exposes --api-key flag (build 45 fix)",
+    ok_api_key = sub("run_ui.py exposes --api-key flag (build 45 fix)",
         opts.api_key == "secret", f"api_key={opts.api_key}")
-    sub("run_ui.py accepts --port=9000 (equals form, build 45 fix)",
+    ok_port = sub("run_ui.py accepts --port=9000 (equals form, build 45 fix)",
         opts.port == 9000, f"port={opts.port}")
-    sub("run_ui.py forwards unknown args to orchestrator",
+    ok_forward = sub("run_ui.py forwards unknown args to orchestrator",
         remaining == ["--vibe", "http://localhost:8080"], f"remaining={remaining}")
 
-    ok = True
+    ok = (ok_status and ok_config and ok_query and ok_jobs
+          and ok_memory and ok_traj and ok_no_key and ok_wrong_key
+          and ok_correct_key and ok_rate_limit and ok_ws
+          and ok_api_key and ok_port and ok_forward)
     record("Phase 3: Web UI", ok)
     return ok
 
@@ -776,7 +806,9 @@ async def phase_5_memory() -> bool:
             verification_method="logic_verifier",
             claim_count=5,
         )
-        sub("CLR cache entry stored", len(cache.entries) >= 1,
+        ok_stored = sub("First verified solution stored",
+            len(store.entries) >= 1, f"entries={len(store.entries)}")
+        ok_cache_stored = sub("CLR cache entry stored", len(cache.entries) >= 1,
             f"entries={len(cache.entries)}")
 
         # --- 5b. Retrieve similar trajectory for second task ---
@@ -785,7 +817,7 @@ async def phase_5_memory() -> bool:
             "Assign 4 nurses to 2 shifts with no consecutive shifts",
             task_type="scheduling",
         )
-        sub("Similar trajectory retrieved for second task",
+        ok_retrieved = sub("Similar trajectory retrieved for second task",
             len(trajectories) > 0, f"found={len(trajectories)}")
         if trajectories:
             dim(f"Retrieved: {trajectories[0]['query'][:60]}...")
@@ -794,7 +826,7 @@ async def phase_5_memory() -> bool:
         # --- 5c. Cache lookup for similar problem ---
         cache_hit = cache.lookup(
             "Assign 4 nurses to 3 shifts with constraints and no consecutive")
-        sub("CLR cache hit for similar problem",
+        ok_cache_hit = sub("CLR cache hit for similar problem",
             cache_hit is not None,
             f"answer={cache_hit.get('best_answer', 'N/A')[:50]}" if cache_hit else "no hit")
 
@@ -803,10 +835,11 @@ async def phase_5_memory() -> bool:
         # The orchestrator still independently verifies the final answer.
         # We verify this by checking that the retrieved trajectory has
         # verification_method != "self_claims_only"
+        ok_independently_verified = False
         if trajectories:
             t = trajectories[0]
             independently_verified = t.get("verification_method", "") != "self_claims_only"
-            sub("Retrieved memory was independently verified",
+            ok_independently_verified = sub("Retrieved memory was independently verified",
                 independently_verified,
                 f"method={t.get('verification_method')}")
         else:
@@ -828,15 +861,16 @@ async def phase_5_memory() -> bool:
             t.get("verification_method", "") != "self_claims_only"
             for t in bad_retrieval
         )
-        sub("Unverified results filtered from retrieval",
+        ok_filtered = sub("Unverified results filtered from retrieval",
             unverified_filtered, f"retrieved={len(bad_retrieval)}")
 
         # --- 5f. Verify files exist ---
-        sub("Trajectory file exists", os.path.exists(traj_path))
-        sub("Cache file exists", os.path.exists(cache_path))
+        ok_traj_file = sub("Trajectory file exists", os.path.exists(traj_path))
+        ok_cache_file = sub("Cache file exists", os.path.exists(cache_path))
 
-        ok = (len(store.entries) >= 1 and len(trajectories) > 0
-              and cache_hit is not None and unverified_filtered)
+        ok = (ok_stored and ok_cache_stored and ok_retrieved
+              and ok_cache_hit and ok_independently_verified
+              and ok_filtered and ok_traj_file and ok_cache_file)
     record("Phase 5: Memory / Verified Trajectory", ok)
     return ok
 
@@ -954,13 +988,13 @@ async def phase_7_federation() -> bool:
             "priority": 5,
             "submitted_by": "demo",
         })
-        sub("Job submitted to federation", resp.status_code == 200,
+        ok_submit = sub("Job submitted to federation", resp.status_code == 200,
             f"status={resp.status_code}")
 
         # Worker claims the job
         resp = client.post("/claim", json={"worker_id": "worker-1"})
         claim_data = resp.json()
-        sub("Worker claims pending job",
+        ok_claim = sub("Worker claims pending job",
             claim_data.get("job_id") == "fed-demo-1",
             f"job_id={claim_data.get('job_id')}")
 
@@ -969,7 +1003,7 @@ async def phase_7_federation() -> bool:
             "job_id": "fed-demo-1",
             "worker_id": "worker-1",
         })
-        sub("Heartbeat accepted", resp.status_code == 200,
+        ok_heartbeat = sub("Heartbeat accepted", resp.status_code == 200,
             f"status={resp.status_code}")
 
         # Complete the job
@@ -977,7 +1011,7 @@ async def phase_7_federation() -> bool:
             "job_id": "fed-demo-1",
             "result": {"final_answer": "schedule verified", "verified": True},
         })
-        sub("Job completion recorded", resp.status_code == 200,
+        ok_complete = sub("Job completion recorded", resp.status_code == 200,
             f"status={resp.status_code}")
 
         # --- Zombie reaper demo ---
@@ -989,11 +1023,11 @@ async def phase_7_federation() -> bool:
             "submitted_by": "demo",
         })
         client.post("/claim", json={"worker_id": "worker-2"})
-        sub("Zombie job claimed", True)
+        ok_zombie_claimed = sub("Zombie job claimed", True)
 
         # Reap stale claims with timeout=0 (everything is stale)
         reaped = await state.reap_stale_claims(timeout=0)
-        sub("Zombie reaper reaps stale claims", len(reaped) > 0,
+        ok_reaped = sub("Zombie reaper reaps stale claims", len(reaped) > 0,
             f"reaped={reaped}")
 
         # Stale worker cannot complete wrong job
@@ -1009,11 +1043,13 @@ async def phase_7_federation() -> bool:
                                      or job.claimed_by != "worker-2")
         else:
             stale_cannot_complete = True
-        sub("Stale worker cannot complete reaped job",
+        ok_stale_blocked = sub("Stale worker cannot complete reaped job",
             stale_cannot_complete,
             f"job_status={job.status if job else 'N/A'}")
 
-    ok = tests_pass and claim_data.get("job_id") == "fed-demo-1" and len(reaped) > 0
+    ok = (tests_pass and ok_submit and ok_claim and ok_heartbeat
+          and ok_complete and ok_zombie_claimed and ok_reaped
+          and ok_stale_blocked)
     record("Phase 7: Federation", ok)
     return ok
 
@@ -1031,35 +1067,39 @@ async def phase_8_ruvllm() -> bool:
         capture_output=True, text=True, cwd=str(ROOT), timeout=120)
     ruvllm_ok = r.returncode == 0
     summary = r.stdout.strip().split("\n")[-1] if r.stdout else "no output"
-    sub("check_ruvllm.sh passes", ruvllm_ok, summary)
+    ok_check = sub("check_ruvllm.sh passes", ruvllm_ok, summary)
 
     # --- Fail-closed behavior ---
     from ruvllm_adapter import is_ruvllm_binding_available, RuvLLMBinding
 
     binding_available = is_ruvllm_binding_available()
-    sub("RuvLLM binding available", binding_available,
+    ok_binding = sub("RuvLLM binding available", binding_available,
         "ruvllm_py installed" if binding_available else "not installed (expected on most systems)")
 
     if not binding_available:
         # Constructing RuvLLMBinding should raise ImportError
+        ok_failclosed = False
         try:
             RuvLLMBinding(model_path="fake.gguf")
-            sub("RuvLLMBinding raises ImportError when binding missing",
+            ok_failclosed = sub("RuvLLMBinding raises ImportError when binding missing",
                 False, "no error raised")
         except ImportError:
-            sub("RuvLLMBinding raises ImportError when binding missing",
+            ok_failclosed = sub("RuvLLMBinding raises ImportError when binding missing",
                 True, "fail-closed correctly")
         except Exception as e:
-            sub("RuvLLMBinding raises ImportError when binding missing",
+            ok_failclosed = sub("RuvLLMBinding raises ImportError when binding missing",
                 False, f"wrong exception: {type(e).__name__}")
+        ok_supports = True  # N/A when binding unavailable
     else:
         # If binding IS available, check SUPPORTS_INFERENCE
+        ok_failclosed = True  # N/A when binding available
+        ok_supports = False
         try:
             from ruvllm_py import SUPPORTS_INFERENCE
-            sub("SUPPORTS_INFERENCE flag exists", True,
+            ok_supports = sub("SUPPORTS_INFERENCE flag exists", True,
                 f"value={SUPPORTS_INFERENCE}")
         except ImportError:
-            sub("SUPPORTS_INFERENCE flag exists", False, "not exported")
+            ok_supports = sub("SUPPORTS_INFERENCE flag exists", False, "not exported")
 
     # --- HTTP sidecar path (always available as fallback) ---
     from ruvllm_adapter import RuvLLMHTTPBackend, TURBOQUANT_DEFAULT
@@ -1069,7 +1109,7 @@ async def phase_8_ruvllm() -> bool:
         turboquant=TURBOQUANT_DEFAULT,
     )
     cmd = backend.recommended_start_command()
-    sub("HTTP sidecar start command generated",
+    ok_cmd = sub("HTTP sidecar start command generated",
         isinstance(cmd, list) and len(cmd) > 0,
         f"cmd={' '.join(cmd)[:80]}" if isinstance(cmd, list) else f"cmd={cmd}")
 
@@ -1077,13 +1117,13 @@ async def phase_8_ruvllm() -> bool:
     # The binding check is the gate. If binding_available is False,
     # no code path should claim inference support.
     if not binding_available:
-        sub("No fake inference success claimed", True,
+        ok_no_fake = sub("No fake inference success claimed", True,
             "binding unavailable, inference not claimed")
     else:
-        sub("No fake inference success claimed", True,
+        ok_no_fake = sub("No fake inference success claimed", True,
             "binding available, inference supported")
 
-    ok = ruvllm_ok
+    ok = ok_check and ok_binding and ok_failclosed and ok_supports and ok_cmd and ok_no_fake
     record("Phase 8: RuvLLM", ok)
     return ok
 
@@ -1114,6 +1154,10 @@ async def phase_9_final_e2e() -> bool:
         # --- Step 1: Build + verify the scheduler ---
         from verifiers.code_verifier import CodeVerifier
         from sandbox import LocalSubprocessExecutor
+
+        # NOTE: LocalSubprocessExecutor is not a security sandbox.
+        # Used here only for benign generated code. See Phase 2 note.
+        executor = LocalSubprocessExecutor(timeout=10.0)
 
         scheduler_code = """
 import json, itertools
@@ -1206,14 +1250,13 @@ assert result3["proof"]["verified"] is False
 print("All tests passed")
 """
 
-        executor = LocalSubprocessExecutor(timeout=10.0)
         cv = CodeVerifier(timeout=10.0, executor=executor)
         result = await cv.verify(
             "Build a constrained scheduler package",
             scheduler_code,
             {"unit_tests": scheduler_tests},
         )
-        sub("Step 1: Scheduler built + tests pass in sandbox",
+        ok_step1 = sub("Step 1: Scheduler built + tests pass in sandbox",
             result.verified, f"method={result.method}")
 
         # --- Step 2: Verify the math invariant ---
@@ -1223,7 +1266,7 @@ print("All tests passed")
         result_math = await mv.verify(
             "Prove total nurse-shift assignments = 6",
             "6", {"expected_answer": "6"})
-        sub("Step 2: Math invariant verified (3×2=6)",
+        ok_step2 = sub("Step 2: Math invariant verified (3×2=6)",
             result_math.verified, f"score={result_math.score}")
 
         # --- Step 3: Store the verified trajectory ---
@@ -1235,7 +1278,7 @@ print("All tests passed")
             task_type="code",
             route_taken="specialist_clr",
         )
-        sub("Step 3: Verified solution stored in trajectory store",
+        ok_store = sub("Step 3: Verified solution stored in trajectory store",
             len(store.entries) >= 1, f"entries={len(store.entries)}")
 
         cache.insert(
@@ -1247,7 +1290,7 @@ print("All tests passed")
             verification_method="code_verifier",
             claim_count=5,
         )
-        sub("Step 3: Verified solution stored in CLR cache",
+        ok_cache = sub("Step 3: Verified solution stored in CLR cache",
             len(cache.entries) >= 1, f"entries={len(cache.entries)}")
 
         # --- Step 4: Solve a similar problem FASTER using memory ---
@@ -1258,7 +1301,7 @@ print("All tests passed")
             task_type="code",
         )
         retrieval_time = time.time() - t0
-        sub("Step 4: Similar trajectory retrieved",
+        ok_retrieval = sub("Step 4: Similar trajectory retrieved",
             len(trajectories) > 0,
             f"found={len(trajectories)}, time={retrieval_time:.3f}s")
 
@@ -1283,35 +1326,38 @@ print("All tests passed")
             scheduler_code,  # same code, different tests
             {"unit_tests": new_scheduler_tests},
         )
-        sub("Step 4: New problem solved + independently verified",
+        ok_new = sub("Step 4: New problem solved + independently verified",
             result_new.verified, f"method={result_new.method}")
 
         # --- Step 5: Memory improved speed without skipping verification ---
         # The retrieval was fast (vector search), and the result was still verified.
-        sub("Step 5: Memory used as context, not blindly trusted",
+        ok_memory = sub("Step 5: Memory used as context, not blindly trusted",
             result_new.verified and len(trajectories) > 0,
             "retrieved+verified" if result_new.verified else "verification failed")
 
         # --- Step 6: Inspect stored files ---
+        ok_traj_file = False
         if os.path.exists(traj_path):
             with open(traj_path) as f:
                 traj_data = json.load(f)
-            sub("Trajectory file has verified entries",
+            ok_traj_file = sub("Trajectory file has verified entries",
                 len(traj_data) > 0, f"entries={len(traj_data)}")
         else:
             sub("Trajectory file exists", False)
 
+        ok_cache_file = False
         if os.path.exists(cache_path):
             with open(cache_path) as f:
                 cache_data = json.load(f)
-            sub("Cache file has verified entries",
+            ok_cache_file = sub("Cache file has verified entries",
                 len(cache_data) > 0, f"entries={len(cache_data)}")
         else:
             sub("Cache file exists", False)
 
-        ok = (result.verified and result_math.verified
-              and len(store.entries) >= 1 and len(trajectories) > 0
-              and result_new.verified)
+        ok = (ok_step1 and ok_step2
+              and ok_store and ok_cache and ok_retrieval
+              and ok_new and ok_memory
+              and ok_traj_file and ok_cache_file)
     record("Phase 9: Final E2E", ok)
     return ok
 
