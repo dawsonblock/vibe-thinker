@@ -159,6 +159,7 @@ def _sandbox_network_mode(value: str):
     mapping = {
         "auto": None,
         "none": NetworkMode.DISABLED,
+        "disabled": NetworkMode.DISABLED,
         "best-effort-proxy": NetworkMode.BEST_EFFORT_PROXY,
         "enforced-gateway": NetworkMode.ENFORCED_GATEWAY,
     }
@@ -768,11 +769,11 @@ def build_argparser() -> argparse.ArgumentParser:
     # silently inferred from the allow-list.
     p.add_argument("--sandbox-network",
                    default=os.environ.get("VIBE_NETWORK_MODE", "auto"),
-                   choices=["auto", "none", "best-effort-proxy",
+                   choices=["auto", "none", "disabled", "best-effort-proxy",
                             "enforced-gateway"],
                    help="Sandbox network mode (default: auto). "
-                        "'none' = no network access (safest; ignores any "
-                        "allow-list). "
+                        "'none'/'disabled' = no network access (safest; "
+                        "ignores any allow-list). "
                         "'best-effort-proxy' = HTTP_PROXY/HTTPS_PROXY env "
                         "routing — NOT a security boundary (bypassable via "
                         "raw sockets / direct IP / clients that ignore proxy "

@@ -385,11 +385,33 @@ class JobQueue:
     # ----------------------- dispatcher ----------------------- #
     async def _dispatch_loop(self) -> None:
         """Main loop: pop highest-priority pending job, run it under the
-        concurrency semaphore."""
+        concurrency limit.
+
+        Task creation is bounded by ``max_concurrent``: the loop only
+        creates a new task when an execution slot is free, rather than
+        creating a task for every pending job and letting the semaphore
+        queue them. This prevents unbounded memory/coroutine growth when
+        a large batch of jobs is submitted at once.
+        """
         while self._running or self._pending:
             if not self._pending:
                 self._wakeup.clear()
                 await self._wakeup.wait()
+                continue
+
+            # Wait for a free execution slot before creating a task.
+            # _job_tasks tracks in-flight (scheduled + running) tasks.
+            while self._job_tasks and len(self._job_tasks) >= self.max_concurrent:
+                done, _ = await asyncio.wait(
+                    self._job_tasks, return_when=asyncio.FIRST_COMPLETED)
+                # done callbacks already removed finished tasks from
+                # _job_tasks; the wait is just to yield until a slot
+                # frees up. Break out if all tasks are done (e.g. during
+                # shutdown).
+                if not done:
+                    break
+
+            if not self._pending:
                 continue
 
             job = self._pending.pop(0)

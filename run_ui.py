@@ -16,30 +16,61 @@ Options are passed through to the orchestrator. Common ones:
   --sandbox-image IMAGE           Docker sandbox image
   --port PORT            UI server port (default: 8000)
   --host HOST            UI bind address (default: 127.0.0.1)
+  --redis-url URL        Redis URL for HA WebSocket fan-out
+  --api-key KEY          Require X-API-Key header on all HTTP requests
+  --allowed-origins ORIGINS  Comma-separated CORS origins (default: localhost)
+  --rate-limit-per-minute N   Max requests per IP per minute (0 = disabled)
+  --max-request-body-bytes N  Max request body size in bytes (0 = disabled)
 """
 
 import argparse
+import os
 import sys
 
-# Parse only the UI-specific flags here; pass the rest to the orchestrator.
-# We use parse_known_args so unknown args are forwarded to build_argparser.
+
+def _build_ui_parser() -> argparse.ArgumentParser:
+    """Argparse parser for UI-only flags.
+
+    Uses ``parse_known_args`` so every other flag (``--vibe``,
+    ``--generalist``, ``--sandbox-network``, …) is left in ``remaining``
+    and forwarded to the orchestrator's ``build_argparser``. This handles
+    both ``--port 8000`` and ``--port=8000`` forms correctly, unlike the
+    previous manual token walk.
+    """
+    p = argparse.ArgumentParser(
+        prog="run_ui.py",
+        description="Launch the vibe-thinker local web UI.",
+        add_help=False,
+    )
+    p.add_argument("--port", type=int,
+                   default=int(os.environ.get("VIBE_UI_PORT", "8000")),
+                   help="UI server port (default: 8000)")
+    p.add_argument("--host",
+                   default=os.environ.get("VIBE_UI_HOST", "127.0.0.1"),
+                   help="UI bind address (default: 127.0.0.1)")
+    p.add_argument("--redis-url",
+                   default=os.environ.get("VIBE_UI_REDIS_URL", ""),
+                   help="Redis URL for HA WebSocket fan-out")
+    p.add_argument("--api-key",
+                   default=os.environ.get("VIBE_THINKER_API_KEY", ""),
+                   help="Require X-API-Key header on all HTTP requests")
+    p.add_argument("--allowed-origins",
+                   default=os.environ.get("VIBE_UI_ALLOWED_ORIGINS", ""),
+                   help="Comma-separated CORS origins (default: localhost)")
+    p.add_argument("--rate-limit-per-minute", type=int,
+                   default=int(os.environ.get("VIBE_UI_RATE_LIMIT", "0")),
+                   help="Max requests per IP per minute (0 = disabled)")
+    p.add_argument("--max-request-body-bytes", type=int,
+                   default=int(os.environ.get("VIBE_UI_MAX_BODY_BYTES", "0")),
+                   help="Max request body size in bytes (0 = disabled)")
+    return p
+
+
 def main():
-    # First, extract --port and --host before the orchestrator argparser
-    # sees them (it doesn't know about these).
-    port = 8000
-    host = "127.0.0.1"
-    redis_url = ""
-    remaining = []
-    args = sys.argv[1:]
-    i = 0
-    while i < len(args):
-        if args[i] == "--port" and i + 1 < len(args):
-            port = int(args[i + 1]); i += 2; continue
-        if args[i] == "--host" and i + 1 < len(args):
-            host = args[i + 1]; i += 2; continue
-        if args[i] == "--redis-url" and i + 1 < len(args):
-            redis_url = args[i + 1]; i += 2; continue
-        remaining.append(args[i]); i += 1
+    # Parse the UI-specific flags; everything else is forwarded to the
+    # orchestrator argparser via parse_known_args.
+    ui_parser = _build_ui_parser()
+    ui_opts, remaining = ui_parser.parse_known_args()
 
     # Build the orchestrator argparser to parse the remaining flags.
     from rfsn_cli import (
@@ -103,11 +134,33 @@ def main():
     from web.app import create_app
     import uvicorn
 
-    app = create_app(orchestrator, redis_url=redis_url or None)
-    if redis_url:
-        print(f"[UI] HA WebSocket fan-out enabled: Redis Pub/Sub ({redis_url})")
-    print(f"\n  vibe-thinker UI running at  http://{host}:{port}\n")
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    # Resolve security options for the web layer.
+    api_key = ui_opts.api_key or None
+    allowed_origins = (
+        [o.strip() for o in ui_opts.allowed_origins.split(",") if o.strip()]
+        if ui_opts.allowed_origins else None
+    )
+    rate_limit = ui_opts.rate_limit_per_minute
+    max_body = ui_opts.max_request_body_bytes
+
+    app = create_app(
+        orchestrator,
+        redis_url=ui_opts.redis_url or None,
+        api_key=api_key,
+        allowed_origins=allowed_origins,
+        rate_limit_per_minute=rate_limit,
+        max_request_body_bytes=max_body,
+    )
+    if ui_opts.redis_url:
+        print(f"[UI] HA WebSocket fan-out enabled: Redis Pub/Sub ({ui_opts.redis_url})")
+    if api_key:
+        print("[UI] API key authentication enabled")
+    if rate_limit:
+        print(f"[UI] Rate limiting enabled: {rate_limit} req/min per IP")
+    if max_body:
+        print(f"[UI] Request body size limit: {max_body} bytes")
+    print(f"\n  vibe-thinker UI running at  http://{ui_opts.host}:{ui_opts.port}\n")
+    uvicorn.run(app, host=ui_opts.host, port=ui_opts.port, log_level="info")
 
 
 if __name__ == "__main__":

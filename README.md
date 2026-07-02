@@ -5,7 +5,7 @@ queries between a high-precision reasoning specialist and a generalist
 model, with deterministic verifiers, bi-temporal audit logging, and an
 interactive CLI.
 
-## Current status: ALPHA (v0.4.6a7)
+## Current status: ALPHA (v0.4.6a9)
 
 **Not production-safe.** This is alpha software. See `docs/roadmap.md`
 for the stabilization plan and frozen feature scope.

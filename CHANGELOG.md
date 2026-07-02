@@ -1,5 +1,57 @@
 # Changelog
 
+## v0.4.6a9
+
+Production-code fixes for the issues flagged in the build-44 audit. No new
+surface area — every change closes an existing gap.
+
+### Fixed
+- `run_ui.py` now uses a real `argparse.parse_known_args()` parser for
+  UI-specific flags instead of a manual token walk. `--port=8000`,
+  `--host=...`, and all equals-style args now work correctly. Unknown
+  args are forwarded to the orchestrator's `build_argparser`.
+- `run_ui.py` now exposes CLI flags for the web security layer:
+  `--api-key`, `--allowed-origins`, `--rate-limit-per-minute`, and
+  `--max-request-body-bytes` (with env-var fallbacks
+  `VIBE_THINKER_API_KEY`, `VIBE_UI_ALLOWED_ORIGINS`, `VIBE_UI_RATE_LIMIT`,
+  `VIBE_UI_MAX_BODY_BYTES`). These are passed through to
+  `web.app.create_app()`.
+- `web_security.py` body-size enforcement now guards the actual request
+  stream, not just the `Content-Length` header. A pure ASGI middleware
+  (`_BodySizeLimitMiddleware`) wraps the `receive` callable to count
+  real body bytes, catching chunked transfers and missing/lying
+  `Content-Length` headers. The previous `BaseHTTPMiddleware` approach
+  could not catch exceptions from the receive callable (Starlette task
+  machinery swallows them); the pure ASGI middleware propagates them
+  synchronously.
+- `VIBE_NETWORK_MODE=disabled` now maps explicitly to
+  `NetworkMode.DISABLED` in `_sandbox_network_mode()`, and `disabled`
+  is an accepted `--sandbox-network` choice. Previously `disabled` fell
+  through to `None` (auto behavior), which could become best-effort
+  proxy when an allow-list was present instead of hard network-off.
+  `profiles/mac-local.env` sets `VIBE_NETWORK_MODE=disabled`, so this
+  fixes a real silent-escalation bug.
+- Version drift: `README.md` and `AGENTS.md` now match `pyproject.toml`.
+- `rfsn_job_queue.py` `_dispatch_loop` now bounds task creation by
+  `max_concurrent` instead of creating a task for every pending job and
+  relying on the semaphore to queue execution. Submitting a large batch
+  no longer creates unbounded coroutines — only `max_concurrent` tasks
+  exist at any time. The semaphore inside `_run_job` is retained as a
+  safety net.
+
+### Added
+- `tests/test_web_security.py::test_body_size_limit_without_content_length`
+  — verifies the stream guard catches a lying `Content-Length` header
+  (header says 5 bytes, actual body is 100 bytes).
+- `tests/test_job_queue.py::test_task_creation_is_bounded` — verifies
+  that submitting 20 jobs with `max_concurrent=2` creates at most 2
+  in-flight tasks, not 20.
+
+### Verified
+- Full release gate matrix passes: core (280), broad local (1382),
+  federation/web (142), Docker sandbox (13), compose, embeddings (95),
+  RuvLLM Rust build, wheel install, ZIP release self-test (280).
+
 ## v0.4.6a8
 
 Fixes for the critical AgentDB cutover path, network enforcement, and UI option

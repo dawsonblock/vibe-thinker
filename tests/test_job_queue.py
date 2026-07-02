@@ -175,6 +175,27 @@ class TestConcurrency:
         assert max_seen <= 2
         assert max_seen == 2
 
+    @pytest.mark.asyncio
+    async def test_task_creation_is_bounded(self, log_path):
+        """Task creation must be bounded by max_concurrent, not just
+        execution. Submitting a large batch should not create a task
+        for every pending job — only up to max_concurrent tasks should
+        exist at any time. This prevents unbounded memory/coroutine
+        growth when a large batch is submitted at once.
+        """
+        orch = MockOrchestrator(delay=0.2)
+        q = JobQueue(orch, max_concurrent=2, audit_log=log_path)
+        await q.start()
+        # Submit 20 jobs — far more than max_concurrent.
+        jobs = [q.submit(f"q{i}", priority=1) for i in range(20)]
+        # Give the dispatcher one scheduling tick to create tasks.
+        await asyncio.sleep(0.05)
+        # At most max_concurrent tasks should be in flight.
+        assert len(q._job_tasks) <= 2, (
+            f"expected <= 2 in-flight tasks, got {len(q._job_tasks)}")
+        await asyncio.gather(*[q.wait_for(j.job_id, timeout=10) for j in jobs])
+        await q.stop()
+
 
 class TestShutdown:
     @pytest.mark.asyncio

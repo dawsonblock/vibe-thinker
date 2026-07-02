@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vibe-thinker"
-version = "0.4.6a8"
+version = "0.4.6a9"
 description = "Verifier-driven local reasoning engine with adaptive CLR, deterministic verifiers, and bi-temporal audit logging"
 readme = "README.md"
 license = "MIT"
